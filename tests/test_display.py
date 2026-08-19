@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from rich.console import Console
 
 from llm_usage.display import (
+    _fmt_countdown,
     _to_local_time,
     render_history,
     render_results,
@@ -33,6 +34,16 @@ def _local(s: str) -> str:
         .astimezone()
         .strftime("%Y-%m-%d %H:%M:%S")
     )
+
+
+class _FixedNow(datetime):
+    """datetime stand-in pinned to a fixed UTC "now" for deterministic countdowns."""
+
+    _fixed = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: ANN001 — mirror datetime.now() signature
+        return cls._fixed
 
 
 class TestDisplay:
@@ -60,7 +71,7 @@ class TestDisplay:
         assert "OK" in out
         assert "█" in out  # progress bar character
         assert "░" in out  # empty bar character
-        assert "66.7%" in out
+        assert "67%" in out  # percent label, rounded to integer
 
     def test_results_to_json_structure(self) -> None:
         e = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7, None, "%", False)
@@ -112,6 +123,67 @@ class TestDisplay:
         assert _to_local_time(None) is None
         # unparsable returns input unchanged
         assert _to_local_time("garbage") == "garbage"
+
+    def test_countdown_column_rendered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # reset ~1.5h after a fixed "now" -> countdown shows 小时/分;
+        # fixed now keeps the assertion deterministic
+        monkeypatch.setattr("llm_usage.display.datetime", _FixedNow)
+        future = _FixedNow._fixed + timedelta(hours=1, minutes=30)
+        e = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7,
+                       future.isoformat(), "%", False)
+        r = PlatformResult("kimi", "Kimi Code", entries=[e])
+        console, buf = _make_console()
+        render_results([r], console=console)
+        out = buf.getvalue()
+        assert "重置倒计时" in out
+        assert "1小时" in out and "分" in out
+
+    def test_fmt_countdown(self) -> None:
+        now = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
+        assert _fmt_countdown("2026-08-21T15:00:00Z", now) == "2天3小时"
+        assert _fmt_countdown("2026-08-19T17:20:00Z", now) == "5小时20分"
+        assert _fmt_countdown("2026-08-19T12:32:00Z", now) == "32分"
+        # past / missing / unparsable
+        assert _fmt_countdown("2026-08-19T11:59:00Z", now) == "已重置"
+        assert _fmt_countdown(None, now) == "-"
+        assert _fmt_countdown("", now) == "-"
+        assert _fmt_countdown("garbage", now) == "-"
+
+    def test_countdown_right_aligned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # the countdown column is right-aligned: values of different widths
+        # must share the same right edge
+        from llm_usage.display import COLS, COL_GAP
+
+        pos = 0
+        starts: dict[str, int] = {}
+        for key, _, width, _ in COLS:
+            starts[key] = pos
+            pos += width + COL_GAP
+        cd_start = starts["countdown"]
+        cd_width = next(w for k, _, w, _ in COLS if k == "countdown")
+        cd_end = cd_start + cd_width
+
+        monkeypatch.setattr("llm_usage.display.datetime", _FixedNow)
+        fixed = _FixedNow._fixed
+        e1 = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7,
+                        (fixed + timedelta(minutes=32)).isoformat(), "%", False)
+        e2 = UsageEntry("kimi", "每周", 10, 100, 90, 10.0,
+                        (fixed + timedelta(days=2, hours=3)).isoformat(), "%", False)
+        r = PlatformResult("kimi", "Kimi Code", entries=[e1, e2])
+        console, buf = _make_console()
+        render_results([r], console=console)
+        lines = buf.getvalue().splitlines()
+
+        def disp_width(s: str) -> int:
+            return sum(2 if ord(c) > 0x2E80 else 1 for c in s)
+
+        # both countdown values ("32分" / "2天2小时") end at the column's
+        # right edge, i.e. right-aligned with no trailing padding
+        for ln in lines:
+            cell = ln[cd_start:cd_end]
+            if cell.strip() not in ("32分", "2天2小时"):
+                continue
+            assert disp_width(cell.rstrip()) == cd_end - cd_start
 
 
 class TestStore:

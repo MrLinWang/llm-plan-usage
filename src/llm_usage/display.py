@@ -1,9 +1,10 @@
 """Rich rendering: usage overview, history, JSON output.
 
 Uses a manual text layout (not rich.Table) so a progress bar can span the
-columns below each data row up to the reset-time column (its right edge
-aligns with the seconds digit of the reset time).  CJK display width is handled via
-``_disp_width`` so columns align in terminals that render CJK as 2 columns.
+columns below each data row.  The bar + percentage label end at the right
+edge of the right-aligned status column, so the label sits under the
+countdown/status area.  CJK display width is handled via ``_disp_width`` so
+columns align in terminals that render CJK as 2 columns.
 """
 
 from __future__ import annotations
@@ -24,24 +25,33 @@ RED_THRESHOLD = 95.0
 YELLOW_THRESHOLD = 80.0
 
 # Column layout: (key, header, width, align)  — width in display columns.
-# CJK header widths: 平台=4, 窗口=4, 已用=4, 限额=4, 剩余=4, 重置时间=8, 状态=4
+# CJK header widths: 平台=4, 窗口=4, 已用=4, 限额=4, 剩余=4, 重置时间=8, 重置倒计时=10, 状态=4
 COLS = [
-    ("platform",  "平台",     22, "left"),
-    ("window",    "窗口",     6,  "left"),
-    ("used",      "已用",     10, "right"),
-    ("limit",     "限额",     10, "right"),
-    ("remaining", "剩余",     10, "right"),
-    ("reset",     "重置时间", 19, "left"),
-    ("status",    "状态",     4,  "left"),
+    ("platform",  "平台",       22, "left"),
+    ("window",    "窗口",       6,  "left"),
+    ("used",      "已用",       10, "right"),
+    ("limit",     "限额",       10, "right"),
+    ("remaining", "剩余",       10, "right"),
+    ("reset",     "重置时间",   19, "left"),
+    ("countdown", "重置倒计时", 12, "right"),
+    ("status",    "状态",       4,  "right"),
 ]
 # Inter-column gap (display columns).
 COL_GAP = 2
 N_COLS = len(COLS)
 
 PLATFORM_W = COLS[0][2]
-# Bar area after "platform": columns up to "重置时间" (excludes "状态"),
-# extended 8 cells so the bar tapers into the status area.
-BAR_SPAN_WIDTH = sum(w for _, _, w, _ in COLS[1:-1]) + COL_GAP * (N_COLS - 3) + 8
+# Bar area after "platform": the bar body ends at the countdown column's
+# right edge; the nominal span extends 8 cells further (+2+6); the label
+# ends 2 cells short of the far edge — flush with the status column's
+# right edge (so the label visually aligns with the countdown values above
+# it and with the OK status).
+_COUNTDOWN_COL_IDX = next(i for i, c in enumerate(COLS) if c[0] == "countdown")
+_COUNTDOWN_END = (
+    sum(w for _, _, w, _ in COLS[:_COUNTDOWN_COL_IDX + 1])
+    + COL_GAP * _COUNTDOWN_COL_IDX
+)
+BAR_SPAN_WIDTH = _COUNTDOWN_END - (PLATFORM_W + COL_GAP) + 2 + 6
 # Total display width of all columns + gaps.
 TOTAL_WIDTH = sum(w for _, _, w, _ in COLS) + COL_GAP * (N_COLS - 1)
 
@@ -118,6 +128,44 @@ def _to_local_time(value: str | None) -> str | None:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_utc(value: str) -> datetime | None:
+    """Parse a UTC/offset ISO timestamp into an aware datetime, else None."""
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _fmt_countdown(reset_at: str | None, now: datetime | None = None) -> str:
+    """Human-friendly time until ``reset_at``, e.g. "2天3小时", "5小时20分", "32分".
+
+    Returns "-" when there is no reset time or it is unparsable; "已重置"
+    when the reset time is already in the past.  Computed at render time so
+    the TUI countdown ticks with each Live refresh.  ``now`` is injectable
+    for deterministic tests.
+    """
+    if not reset_at:
+        return "-"
+    dt = _parse_utc(reset_at)
+    if dt is None:
+        return "-"
+    now = now or datetime.now(timezone.utc)
+    secs = int((dt - now).total_seconds())
+    if secs <= 0:
+        return "已重置"
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}天{hours}小时"
+    if hours:
+        return f"{hours}小时{minutes}分"
+    return f"{minutes}分"
+
+
 def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status: str) -> Text:
     """Build one data line (no bar) as a styled Text."""
     name = display_name if is_first else ""
@@ -129,9 +177,10 @@ def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status
         remaining = _fmt_value(entry.remaining, entry.unit) if entry.remaining is not None else "-"
 
     reset = _to_local_time(entry.reset_at) or "-"
+    countdown = _fmt_countdown(entry.reset_at)
 
-    values = [name, entry.label, used, limit, remaining, reset, status]
-    styles = ["bold" if is_first else "", "", "", "", "", "dim", ""]
+    values = [name, entry.label, used, limit, remaining, reset, countdown, status]
+    styles = ["bold" if is_first else "", "", "", "", "", "dim", "dim", ""]
     parts: list[tuple[str, str]] = []
     for i, ((_, _, width, align), val, style) in enumerate(zip(COLS, values, styles)):
         parts.append((_pad(val, width, align), style))
@@ -141,19 +190,21 @@ def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status
 
 
 def _make_bar_line(percent: float | None) -> Text:
-    """Build a progress bar spanning the columns after "平台" up to "重置时间".
+    """Build a progress bar spanning the columns after "平台".
 
-    The bar + label total exactly ``BAR_SPAN_WIDTH`` (reset column + 8 extra
-    cells) so all bars align.  The label is right-aligned in a fixed-width
-    slot, offset 2 cells left of the far edge.
+    The bar + label total exactly ``BAR_SPAN_WIDTH`` cells, with the label
+    right edge flush at the status column's right edge (see the
+    ``BAR_SPAN_WIDTH`` geometry above).  The label shows the percentage
+    rounded to an integer; the bar fill uses the raw percent so fill and
+    label can differ by one cell at most.
     """
     if percent is None:
         return Text(" " * (PLATFORM_W + COL_GAP + BAR_SPAN_WIDTH))
     color = _percent_color(percent)
 
-    label = f"{percent:g}%"
+    label = f"{percent:.0f}%"
     label_w = _disp_width(label)
-    label_slot = 7  # max label like "100.0%" fits; right-align within
+    label_slot = 7  # max label like "100%" fits; right-align within
     label_pad = label_slot - label_w
     if label_pad < 0:
         label_pad = 0
@@ -221,11 +272,11 @@ def render_results(
     """Render the main usage overview with full-width progress bars."""
     # Force a fixed width so CJK/box lines never wrap regardless of terminal.
     if console is None:
-        console = Console(width=TOTAL_WIDTH + 8)
+        console = Console(width=TOTAL_WIDTH + 4)
     else:
-        console = Console(file=console.file, width=TOTAL_WIDTH + 8)
+        console = Console(file=console.file, width=TOTAL_WIDTH + 4)
 
-    console.print(build_overview(results, width=TOTAL_WIDTH + 8))
+    console.print(build_overview(results, width=TOTAL_WIDTH + 4))
 
 
 def results_to_json(results: list[PlatformResult]) -> str:

@@ -55,7 +55,7 @@ llm-usage history --days 7 --platform kimi
 python -m llm_usage show        # equivalent to console script
 
 # Test
-python -m pytest tests/ -v       # 44 tests, ~0.1s
+python -m pytest tests/ -v       # 54 tests, ~0.1s
 
 # No lint/type-check/CI config exists. No Makefile, no lockfile.
 ```
@@ -71,6 +71,7 @@ python -m pytest tests/ -v       # 44 tests, ~0.1s
 - **Volcengine Agent Plan**: Backend returns **absolute values** (`Periods` with `Used`/`Total`/`Percent`/`ResetTimestamp`). Falls back to `AGENT_LIMITS` tier table when `Total` is absent (large/max unverified → `None`).
 - **SQLite reserved word**: The `snapshots` table quotes `"limit"` as a column name (it's a SQLite keyword) in schema, INSERT, and SELECT.
 - **Timezone convention**: `reset_at` (UsageEntry) and snapshot `ts` are stored as ISO 8601 **UTC** (`Z`/offset suffix; naive treated as UTC). All terminal display converts to the machine's local time via `display._to_local_time()` (panel title included); JSON output keeps the raw UTC values.
+- **Reset countdown**: The overview table's `重置倒计时` column (right-aligned) shows the time until `reset_at` via `display._fmt_countdown()` — computed from the system clock at render time so the TUI ticks live; past → `已重置`, missing/unparsable → `-`. The `BAR_SPAN_WIDTH` geometry puts the bar + percent label right edge at the right-aligned status column's right edge (see the comment above `BAR_SPAN_WIDTH`); the label shows the percent rounded to an integer.
 - **Manual providers**: `limit` of `0` or `None` → treated as unlimited (`limit=None`, `percent=None`). `is_manual=True` entries read from config, never hit the network.
 - **Display color thresholds**: `RED_THRESHOLD=95.0`, `YELLOW_THRESHOLD=80.0` — percent cell colored red/yellow/green accordingly.
 - **Naming**: Provider classes `XxxProvider`; test classes `TestXxx`; test methods `test_descriptive_snake_case`.
@@ -89,7 +90,7 @@ python -m pytest tests/ -v       # 44 tests, ~0.1s
 | `src/llm_usage/providers/manual.py` | `ManualProvider` base — reads config entries, zero/None limit → unlimited |
 | `src/llm_usage/config.py` | TOML load/save (`tomllib` read / `tomli_w` write), `EXAMPLE_CONFIG` template, `set_manual_entry` |
 | `src/llm_usage/store.py` | SQLite `snapshots` table, `save_snapshot` (skips errored), `query_history` (platform/days filters) |
-| `src/llm_usage/display.py` | `render_results` (rich Panel+Table), `results_to_json`, `render_history` |
+|`src/llm_usage/display.py` | `render_results` (rich Panel+Table), `results_to_json`, `render_history` — manual column layout (`COLS`/`BAR_SPAN_WIDTH`) so a progress bar spans under the data columns |
 | `src/llm_usage/__main__.py` | `python -m llm_usage` shim → `cli.main()` |
 | `pyproject.toml` | Sole build config — setuptools, deps, entry point, pytest config |
 
@@ -118,4 +119,4 @@ python -m pytest tests/ -v       # 44 tests, ~0.1s
 
 - **`test_providers.py`**: Kimi parsing (`used=limit-remaining`, epoch-ms resetTime→ISO, 404→`/usage` fallback, 401 hint); Volcengine OpenAPI V4 signing (Coding Plan percent-only → derived used via tier table; Agent Plan used/total; config `limits` override; error response with `ResponseMetadata.Error`; HTTP error); manual providers (defaults, config reads, zero-limit→unlimited); registry (all 5 keys, `env:` prefix resolution for `api_key`/`access_key`/`secret_key`, error isolation, disabled-platform skip, empty config).
 - **`test_config.py`**: init creates/refuses-overwrite/overwrites; load-missing→`{}`; roundtrip; `set_manual_entry` update/add/persist; `env:` prefix stored verbatim.
-- **`test_display.py`**: render contains platform names / error rows / manual marker; JSON structure; history empty + with-rows; local-time conversion of `reset_at`/history `ts` (UTC input → local display); store save/query/filter/two-snapshots/manual-flag-persisted/failed-not-saved.
+- **`test_display.py`**: render contains platform names / error rows / manual marker; JSON structure; history empty + with-rows; local-time conversion of `reset_at`/history `ts` (UTC input → local display); countdown formatting (`_fmt_countdown` incl. fixed-`now` determinism) + countdown column right-alignment; store save/query/filter/two-snapshots/manual-flag-persisted/failed-not-saved.

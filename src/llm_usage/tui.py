@@ -58,7 +58,7 @@ def _read_key(timeout: float) -> str | None:
 
 def run_tui(cfg: dict[str, Any], interval: float = DEFAULT_INTERVAL) -> None:
     """Run the interactive dashboard until the user presses ``q``."""
-    console = Console(width=TOTAL_WIDTH + 8)
+    console = Console(width=TOTAL_WIDTH + 4)
     interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
     last_fetch = 0.0
     results = []

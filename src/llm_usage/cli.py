@@ -76,6 +76,29 @@ def tui(interval: float) -> None:
         pass
 
 
+# --- web --------------------------------------------------------------------
+
+@main.command()
+@click.option("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
+@click.option("--port", default=8765, type=int, help="Bind port (default 8765).")
+@click.option("--interval", type=float, default=60,
+              help="Provider refresh interval in seconds (default 60).")
+def web(host: str, port: int, interval: float) -> None:
+    """Serve the web dashboard at http://<host>:<port>/ ."""
+    cfg = _load()
+    if not cfg.get("platforms"):
+        console.print("[yellow]未配置任何平台。运行 `llm-usage config --init` 生成模板。[/yellow]")
+        sys.exit(0)
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("[red]缺少依赖,请先安装:pip install llm-usage\\[web][/red]")
+        sys.exit(2)
+    from llm_usage.web import create_app
+
+    uvicorn.run(create_app(cfg, interval=interval), host=host, port=port)
+
+
 # --- config -----------------------------------------------------------------
 
 @main.command()

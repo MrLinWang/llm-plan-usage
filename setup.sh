@@ -10,8 +10,8 @@ VENV=".venv"
 echo "→ 创建虚拟环境 ($VENV) ..."
 uv venv "$VENV"
 
-echo "→ 安装依赖 (含 test extra) ..."
-uv pip install --python "$VENV/bin/python" -e ".[test]"
+echo "→ 安装依赖 (含 test/web extra) ..."
+uv pip install --python "$VENV/bin/python" -e ".[test,web]"
 
 echo
 echo "✓ 完成。激活方式:"
@@ -19,3 +19,4 @@ echo "  source $VENV/bin/activate"
 echo
 echo "运行测试:  pytest tests/ -v"
 echo "启动 CLI:  llm-usage show"
+echo "Web 仪表盘: llm-usage web"

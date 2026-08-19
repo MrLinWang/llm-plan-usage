@@ -279,9 +279,9 @@ def render_results(
     console.print(build_overview(results, width=TOTAL_WIDTH + 4))
 
 
-def results_to_json(results: list[PlatformResult]) -> str:
-    """Serialize results to a JSON string for scripting."""
-    payload = {
+def results_to_dict(results: list[PlatformResult]) -> dict[str, Any]:
+    """Serialize results to a plain dict (web API + JSON output share this shape)."""
+    return {
         "platforms": [
             {
                 "name": res.platform,
@@ -304,7 +304,11 @@ def results_to_json(results: list[PlatformResult]) -> str:
             for res in results
         ]
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def results_to_json(results: list[PlatformResult]) -> str:
+    """Serialize results to a JSON string for scripting."""
+    return json.dumps(results_to_dict(results), ensure_ascii=False, indent=2)
 
 
 def render_history(rows: list[dict[str, Any]], console: Console | None = None) -> None:

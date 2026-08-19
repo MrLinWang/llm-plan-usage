@@ -2,21 +2,24 @@
 
 ## Project Overview
 
-`llm-usage` is a Python 3.11+ CLI that unifies usage monitoring for multiple LLM coding-plan / token-plan platforms (Kimi Code, Volcengine Ark Coding + Agent plans, Ollama Cloud, OpenCode Go). Platforms with public APIs are fetched live via `httpx`; platforms without APIs (Ollama, OpenCode Go) are manually entered and stored in config. Results render as a color-coded `rich` table, with SQLite history snapshots and JSON output for scripting.
+`llm-usage` is a Python 3.11+ CLI that unifies usage monitoring for multiple LLM coding-plan / token-plan platforms (Kimi Code, Volcengine Ark Coding + Agent plans, Ollama Cloud, OpenCode Go). Platforms with public APIs are fetched live via `httpx`; platforms without APIs (Ollama, OpenCode Go) are manually entered and stored in config. Results render as a color-coded `rich` table, with SQLite history snapshots and JSON output for scripting. Three frontends share the same fetch pipeline: `show` (one-shot rich table), `tui` (live-refresh terminal dashboard), and `web` (FastAPI browser dashboard, per-platform cards).
 
 ## Architecture & Data Flow
 
 Flat layered design with one-way data flow:
 
 ```
-cli.py (click group)
+cli.py (click group: show/tui/web/add/config/history)
   → config.load_config()                    # TOML at ./config.toml (cwd)
   → providers.fetch_all(cfg)                 # ThreadPoolExecutor, one thread per enabled platform
       → _prepare_config() per platform       # inject _platform_key, resolve display_name, expand env: api_key
       → Provider.fetch(config_section)       # live: httpx sync; manual: reads config entries
           → returns PlatformResult(entries=[UsageEntry...], error=None|str)
-  → display.render_results() / results_to_json()   # rich Table+Panel or JSON
-  → store.save_snapshot(results)            # SQLite, skips errored platforms
+  → show: display.render_results() / results_to_json()   # rich Table+Panel or JSON
+    tui: display.build_overview() under rich.Live, cbreak key loop (q/r/+/-)
+    web: web.create_app() → FastAPI; UsageCache(TTL) wraps fetch_all;
+         /api/usage → display.results_to_dict(); / serves static/index.html
+  → store.save_snapshot(results)            # SQLite, skips errored platforms (show only)
 ```
 
 Key abstractions:
@@ -26,6 +29,8 @@ Key abstractions:
 - **Error isolation**: `fetch_all` wraps each `fetch` in `_run` which catches all exceptions → `PlatformResult(error="内部错误：...")`. A single platform failure never breaks the batch. Results re-sorted to registry order after `as_completed`.
 - **Concurrency**: `ThreadPoolExecutor` (sync `httpx.Client`), not asyncio — avoids asyncio dependency spread.
 - **Dependency injection**: `httpx.Client` is constructor-injected into live providers (`client=None` → own client created/closed per `fetch`). Tests pass `httpx.MockTransport`-backed clients.
+- **Shared serialization**: `display.results_to_dict()` is the single JSON shape consumed by both `--json` output (`results_to_json` wraps it) and the web API (`/api/usage`).
+- **Web TTL cache**: `web.UsageCache` refreshes `fetch_all` at most once per `interval` (clamped to `[5, 3600]`s), holding one lock across the fetch so concurrent requests share a result. The browser page re-fetches `/api/usage` on the same interval and ticks countdowns client-side every second.
 
 ## Key Directories
 
@@ -33,6 +38,7 @@ Key abstractions:
 |------|---------|
 | `src/llm_usage/` | All application source (flat, no subpackages except `providers/`) |
 | `src/llm_usage/providers/` | Provider implementations + registry/dispatch |
+| `src/llm_usage/static/` | Web dashboard assets (`index.html`; shipped via setuptools `package-data`) |
 | `tests/` | pytest suite (no subdirectories) |
 | `./config.toml` | Runtime config (cwd; overridable via `LLM_USAGE_CONFIG`) |
 | `./history.db` | SQLite snapshots (cwd; overridable via `LLM_USAGE_DB`) |
@@ -51,11 +57,13 @@ llm-usage add ollama --label "5小时" --used 60 --limit 100 --unit "次"
 llm-usage config --init         # generate template config
 llm-usage config --force        # overwrite existing
 llm-usage history --days 7 --platform kimi
+llm-usage tui                   # live terminal dashboard (q quit, r refresh, +/- interval)
+llm-usage web                   # FastAPI dashboard at http://127.0.0.1:8765 (needs [web] extra)
 
 python -m llm_usage show        # equivalent to console script
 
 # Test
-python -m pytest tests/ -v       # 54 tests, ~0.1s
+python -m pytest tests/ -v       # 62 tests, ~0.3s
 
 # No lint/type-check/CI config exists. No Makefile, no lockfile.
 ```
@@ -81,7 +89,10 @@ python -m pytest tests/ -v       # 54 tests, ~0.1s
 
 | File | Role |
 |------|------|
-| `src/llm_usage/cli.py` | `@click.group()` entry point — `show`/`add`/`config`/`history`; exit codes; `_load()` helper |
+| `src/llm_usage/cli.py` | `@click.group()` entry point — `show`/`tui`/`web`/`add`/`config`/`history`; exit codes; `_load()` helper |
+| `src/llm_usage/tui.py` | TUI dashboard — `rich.Live` auto-refresh, cbreak key handling, interval clamp `[5, 3600]`s |
+| `src/llm_usage/web.py` | FastAPI app factory `create_app(config, interval)` + `UsageCache` TTL cache; routes `/` (HTML) and `/api/usage` (JSON) |
+| `src/llm_usage/static/index.html` | Self-contained dashboard page (no JS deps) — theme toggle with localStorage, per-platform cards cloned from `<template id="entry-table">`, 1s countdown tick, auto-poll on server interval |
 | `src/llm_usage/models.py` | `UsageEntry`, `PlatformResult` dataclasses + `compute_remaining`/`compute_percent` |
 | `src/llm_usage/providers/__init__.py` | `PROVIDERS` registry, `fetch_all` concurrent dispatch, `_prepare_config`, `env:` key resolution |
 | `src/llm_usage/providers/base.py` | `Provider` Protocol definition |
@@ -90,22 +101,22 @@ python -m pytest tests/ -v       # 54 tests, ~0.1s
 | `src/llm_usage/providers/manual.py` | `ManualProvider` base — reads config entries, zero/None limit → unlimited |
 | `src/llm_usage/config.py` | TOML load/save (`tomllib` read / `tomli_w` write), `EXAMPLE_CONFIG` template, `set_manual_entry` |
 | `src/llm_usage/store.py` | SQLite `snapshots` table, `save_snapshot` (skips errored), `query_history` (platform/days filters) |
-|`src/llm_usage/display.py` | `render_results` (rich Panel+Table), `results_to_json`, `render_history` — manual column layout (`COLS`/`BAR_SPAN_WIDTH`) so a progress bar spans under the data columns |
+|`src/llm_usage/display.py` | `render_results` (rich Panel+Table), `build_overview` (TUI), `results_to_dict`/`results_to_json`, `render_history` — manual column layout (`COLS`/`BAR_SPAN_WIDTH`) so a progress bar spans under the data columns |
 | `src/llm_usage/__main__.py` | `python -m llm_usage` shim → `cli.main()` |
 | `pyproject.toml` | Sole build config — setuptools, deps, entry point, pytest config |
 
 ## Runtime/Tooling Preferences
 
 - **Python ≥3.11** required — uses stdlib `tomllib` for TOML reads. Writes use `tomli_w` (stdlib has no TOML writer).
-- **Runtime deps**: `httpx>=0.27`, `rich>=13.0`, `click>=8.1`, `tomli_w>=1.0` — pinned with `>=` floors only, no upper bounds.
+- **Runtime deps**: `httpx>=0.27`, `rich>=13.0`, `click>=8.1`, `tomli_w>=1.0` — pinned with `>=` floors only, no upper bounds. Optional extras: `test` (pytest), `web` (`fastapi>=0.110`, `uvicorn>=0.29`) — install via `pip install -e ".[test,web]"`.
 - **Package manager**: `pip` (editable install). `uv`/`uvx` available on the system as alternatives. No lockfile committed.
 - **Build backend**: `setuptools.build_meta` (`setuptools>=68.0`), src-layout (`packages.find where=["src"]`).
 - **Entry points**: console script `llm-usage = "llm_usage.cli:main"` and `python -m llm_usage` — both call the same `cli.main()`.
 
 ## Testing & QA
 
-- **Framework**: pytest ≥7.0 (optional dependency via `[project.optional-dependencies] test`). Configured in `pyproject.toml` with `testpaths = ["tests"]`.
-- **Run**: `python -m pytest tests/ -v` — 44 tests, ~0.1s, no network.
+- **Framework**: pytest ≥7.0 (optional dependency via `[project.optional-dependencies] test`; `test_web.py` additionally needs the `web` extra and is skipped without fastapi). Configured in `pyproject.toml` with `testpaths = ["tests"]`.
+- **Run**: `python -m pytest tests/ -v` — 62 tests, ~0.3s, no network.
 - **No coverage config, no markers, no tox/CI.**
 
 ### Test isolation patterns
@@ -120,3 +131,4 @@ python -m pytest tests/ -v       # 54 tests, ~0.1s
 - **`test_providers.py`**: Kimi parsing (`used=limit-remaining`, epoch-ms resetTime→ISO, 404→`/usage` fallback, 401 hint); Volcengine OpenAPI V4 signing (Coding Plan percent-only → derived used via tier table; Agent Plan used/total; config `limits` override; error response with `ResponseMetadata.Error`; HTTP error); manual providers (defaults, config reads, zero-limit→unlimited); registry (all 5 keys, `env:` prefix resolution for `api_key`/`access_key`/`secret_key`, error isolation, disabled-platform skip, empty config).
 - **`test_config.py`**: init creates/refuses-overwrite/overwrites; load-missing→`{}`; roundtrip; `set_manual_entry` update/add/persist; `env:` prefix stored verbatim.
 - **`test_display.py`**: render contains platform names / error rows / manual marker; JSON structure; history empty + with-rows; local-time conversion of `reset_at`/history `ts` (UTC input → local display); countdown formatting (`_fmt_countdown` incl. fixed-`now` determinism) + countdown column right-alignment; store save/query/filter/two-snapshots/manual-flag-persisted/failed-not-saved.
+- **`test_web.py`**: index HTML contains the static hooks the page JS needs (`#platforms` card container, `#entry-table` template, theme toggle); `/api/usage` payload shape; errored platforms included with empty entries; `UsageCache` TTL (one fetch within interval, refetch after expiry); interval clamping. `fetch_all` is monkeypatched with a counting fake.

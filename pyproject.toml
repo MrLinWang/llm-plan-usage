@@ -18,12 +18,16 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 llm-usage = "llm_usage.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+llm_usage = ["static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>登录 - LLM 用量总览</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --fg: #d7dae0;
+    --dim: #7a7f8a;
+    --sep: #3a3f4a;
+    --green: #4caf50;
+    --yellow: #ffb300;
+    --red: #ef5350;
+    --cyan: #56b6c2;
+    --track: #2c313c;
+    --surface: #1c2027;
+    --hover: rgba(255, 255, 255, 0.035);
+    --glow: #1b2230;
+    --shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  }
+  /* 浅色主题:覆盖同名变量,强调色取深一档以保证白底对比度 */
+  html[data-theme="light"] {
+    --bg: #f5f6f8;
+    --fg: #24292f;
+    --dim: #6e7781;
+    --sep: #d0d7de;
+    --green: #1a7f37;
+    --yellow: #9a6700;
+    --red: #cf222e;
+    --cyan: #0a7ea4;
+    --track: #e2e5ea;
+    --surface: #ffffff;
+    --hover: rgba(0, 0, 0, 0.03);
+    --glow: #e9edf3;
+    --shadow: 0 10px 30px rgba(27, 31, 36, 0.1);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px;
+    min-height: 100vh;
+    background: radial-gradient(1100px 520px at 78% -8%, var(--glow), var(--bg) 62%);
+    background-attachment: fixed;
+    color: var(--fg);
+    font-family: "Sarasa Mono SC", "Noto Sans Mono CJK SC", "PingFang SC",
+                 "Microsoft YaHei", Consolas, "Courier New", monospace;
+    font-size: 14px;
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }
+  #app { max-width: 420px; margin: 10vh auto 0; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--sep);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 14px 18px 12px;
+    transition: background-color 0.25s ease, border-color 0.25s ease;
+  }
+  .card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 12px;
+  }
+  #theme-toggle, .pill-btn {
+    flex: none;
+    padding: 5px 16px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--dim);
+    background: transparent;
+    border: 1px solid var(--sep);
+    border-radius: 999px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: color 0.2s ease, border-color 0.2s ease,
+                background-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  #theme-toggle:hover, .pill-btn:hover {
+    color: var(--fg);
+    border-color: var(--dim);
+    background: var(--hover);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  #theme-toggle:focus-visible, .pill-btn:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: 2px;
+  }
+  .title {
+    font-weight: bold;
+    font-size: 17px;
+    letter-spacing: 0.02em;
+    margin-bottom: 6px;
+    background: linear-gradient(90deg, var(--cyan), var(--green));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .status { color: var(--dim); font-size: 13px; }
+  .dim { color: var(--dim); }
+  form { display: grid; gap: 12px; padding-bottom: 6px; }
+  label { display: grid; gap: 5px; color: var(--dim); font-size: 13px; }
+  input[type="text"], input[type="password"] {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--sep);
+    border-radius: 8px;
+    padding: 7px 10px;
+    width: 100%;
+  }
+  input[type="text"]:focus, input[type="password"]:focus {
+    outline: none;
+    border-color: var(--cyan);
+  }
+  .btn {
+    justify-self: start;
+    padding: 7px 22px;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--bg);
+    background: var(--cyan);
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: filter 0.2s ease;
+  }
+  .btn:hover { filter: brightness(1.12); }
+  .btn:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  .form-err { color: var(--red); font-size: 13px; min-height: 1.2em; }
+</style>
+<script>
+// 首屏前确定主题,避免闪烁:localStorage 优先,其次系统偏好,默认深色。
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("llm-usage-theme"); } catch (_) {}
+  if (t !== "light" && t !== "dark") {
+    t = (window.matchMedia &&
+         matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+  }
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+</head>
+<body>
+<div id="app">
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <div id="title" class="title">登录</div>
+        <div class="status">LLM 用量总览</div>
+      </div>
+      <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+    </div>
+    <form id="auth-form">
+      <label>用户名
+        <input id="username" type="text" autocomplete="username" required>
+      </label>
+      <label>密码
+        <input id="password" type="password" autocomplete="current-password" required>
+      </label>
+      <div id="error" class="form-err"></div>
+      <button id="submit" class="btn" type="submit">登录</button>
+    </form>
+  </div>
+</div>
+<script>
+"use strict";
+
+// ---- 主题切换(与 index.html 一致) ----
+var THEME_KEY = "llm-usage-theme";
+
+function syncThemeButton() {
+  var light = document.documentElement.dataset.theme === "light";
+  document.getElementById("theme-toggle").textContent = light ? "深色" : "浅色";
+}
+
+document.getElementById("theme-toggle").addEventListener("click", function () {
+  var light = document.documentElement.dataset.theme === "light";
+  var next = light ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+  syncThemeButton();
+});
+syncThemeButton();
+
+// ---- 登录 / 初始化 ----
+// needs_setup(无用户)时本页兼任首个管理员创建页。
+var needsSetup = false;
+var titleEl = document.getElementById("title");
+var submitEl = document.getElementById("submit");
+var errorEl = document.getElementById("error");
+
+fetch("/api/auth/state").then(function (r) { return r.json(); }).then(function (s) {
+  needsSetup = !!s.needs_setup;
+  if (needsSetup) {
+    titleEl.textContent = "创建管理员";
+    submitEl.textContent = "创建并登录";
+    document.getElementById("password").autocomplete = "new-password";
+  }
+});
+
+document.getElementById("auth-form").addEventListener("submit", async function (ev) {
+  ev.preventDefault();
+  errorEl.textContent = "";
+  submitEl.disabled = true;
+  try {
+    var r = await fetch(needsSetup ? "/api/auth/setup" : "/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+      }),
+    });
+    var data = null;
+    try { data = await r.json(); } catch (_) { /* 非 JSON 响应 */ }
+    if (!r.ok) {
+      errorEl.textContent = (data && data.detail) || ("HTTP " + r.status);
+      return;
+    }
+    location.href = "/";
+  } catch (e) {
+    errorEl.textContent = "网络错误:" + String((e && e.message) || e);
+  } finally {
+    submitEl.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

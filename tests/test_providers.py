@@ -22,7 +22,11 @@ from llm_usage.providers import (
     _resolve_api_key,
     fetch_all,
 )
-from llm_usage.providers.kimi import KimiProvider, _parse_usage_payload
+from llm_usage.providers.kimi import (
+    KimiProvider,
+    _parse_usage_payload,
+    _window_label,
+)
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
 from llm_usage.providers.volcengine import (
@@ -86,6 +90,56 @@ class TestKimiParsing:
 
     def test_empty_payload_returns_no_entries(self) -> None:
         assert _parse_usage_payload({}, "kimi") == []
+
+    def test_nested_detail_shape_parsed(self) -> None:
+        """Live API shape: limits[] items nest numbers under ``detail``."""
+        payload = {
+            "usage": {
+                "limit": "100",
+                "used": "27",
+                "remaining": "73",
+                "resetTime": "2026-08-19T16:48:27.482983Z",
+            },
+            "limits": [
+                {
+                    "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                    "detail": {
+                        "limit": "100",
+                        "used": "68",
+                        "remaining": "32",
+                        "resetTime": "2026-08-19T10:48:27.482983Z",
+                    },
+                }
+            ],
+        }
+        entries = _parse_usage_payload(payload, "kimi")
+        assert len(entries) == 2
+        e5h = entries[0]
+        assert e5h.label == "5小时"  # derived from window duration
+        assert e5h.used == 68.0  # 100 - 32, string numbers accepted
+        assert e5h.limit == 100.0
+        assert e5h.remaining == 32.0
+        assert e5h.reset_at == "2026-08-19T10:48:27.482983Z"
+
+    @pytest.mark.parametrize(
+        ("duration", "unit", "label"),
+        [
+            (300, "TIME_UNIT_MINUTE", "5小时"),
+            (45, "TIME_UNIT_MINUTE", "45分钟"),
+            (12, "TIME_UNIT_HOUR", "12小时"),
+            (1, "TIME_UNIT_DAY", "1天"),
+            (7, "TIME_UNIT_DAY", "7天"),
+        ],
+    )
+    def test_window_label_derivation(
+        self, duration: int, unit: str, label: str
+    ) -> None:
+        assert _window_label({"duration": duration, "timeUnit": unit}) == label
+
+    def test_window_label_unknown_unit_returns_none(self) -> None:
+        assert _window_label({"duration": 5, "timeUnit": "TIME_UNIT_SECOND"}) is None
+        assert _window_label(None) is None
+        assert _window_label({}) is None
 
 
 # ---------------------------------------------------------------------------

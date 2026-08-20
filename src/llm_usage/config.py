@@ -99,3 +99,14 @@ def init_config(path: Path | None = None, overwrite: bool = False) -> Path:
 def get_platform_config(config: dict[str, Any], platform: str) -> dict[str, Any]:
     """Return a platform section or ``{}`` if absent."""
     return config.get("platforms", {}).get(platform, {}) or {}
+
+
+def update_platform_config(
+    platform: str, updates: dict[str, Any], path: Path | None = None
+) -> dict[str, Any]:
+    """Merge ``updates`` into [platforms.<platform>], save TOML, return the full updated config."""
+    cfg = load_config(path)
+    section = cfg.setdefault("platforms", {}).setdefault(platform, {})
+    section.update(updates)
+    save_config(cfg, path)
+    return cfg

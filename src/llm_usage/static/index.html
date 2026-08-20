@@ -84,7 +84,7 @@
   .platform-name { font-weight: bold; }
   .platform-err, .platform-empty { padding: 2px 0; }
   .platform-err { color: var(--red); }
-  #theme-toggle {
+  #theme-toggle, .pill-btn {
     flex: none;
     padding: 5px 16px;
     font: inherit;
@@ -94,19 +94,21 @@
     border: 1px solid var(--sep);
     border-radius: 999px;
     cursor: pointer;
+    text-decoration: none;
     transition: color 0.2s ease, border-color 0.2s ease,
                 background-color 0.2s ease, box-shadow 0.2s ease;
   }
-  #theme-toggle:hover {
+  #theme-toggle:hover, .pill-btn:hover {
     color: var(--fg);
     border-color: var(--dim);
     background: var(--hover);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
   }
-  #theme-toggle:focus-visible {
+  #theme-toggle:focus-visible, .pill-btn:focus-visible {
     outline: 2px solid var(--cyan);
     outline-offset: 2px;
   }
+  .head-nav { display: flex; gap: 8px; flex: none; align-items: center; }
   .title {
     font-weight: bold;
     font-size: 17px;
@@ -212,7 +214,12 @@
         <div id="title" class="title">LLM 用量总览</div>
         <div id="status" class="status">加载中…</div>
       </div>
-      <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+      <div class="head-nav">
+        <a id="nav-users" class="pill-btn" href="/users" hidden>用户管理</a>
+        <a id="nav-config" class="pill-btn" href="/config" hidden>供应商配置</a>
+        <button id="logout" class="pill-btn" type="button">退出</button>
+        <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+      </div>
     </div>
   </div>
   <div id="platforms"></div>
@@ -264,6 +271,21 @@ function toggleTheme() {
 
 document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
 syncThemeButton();
+
+// ---- 会话状态 ----
+// 未登录 → /login;管理员显示「用户管理/供应商配置」入口;退出按钮结束会话。
+fetch("/api/auth/state").then(function (r) { return r.json(); }).then(function (s) {
+  if (!s.authenticated) { location.href = "/login"; return; }
+  if (s.user && s.user.is_admin) {
+    document.getElementById("nav-users").hidden = false;
+    document.getElementById("nav-config").hidden = false;
+  }
+});
+
+document.getElementById("logout").addEventListener("click", async function () {
+  await fetch("/api/auth/logout", { method: "POST" });
+  location.href = "/login";
+});
 
 // ---- 格式化 ----
 // 以下函数对应 display.py 中的实现：_fmt_value / _to_local_time / _fmt_countdown。
@@ -465,6 +487,7 @@ async function refresh() {
   if (!lastFetchedLocal && !errorState) statusEl.textContent = "加载中…";
   try {
     var r = await fetch("/api/usage");
+    if (r.status === 401) { location.href = "/login"; return; }  // 会话失效
     var data = null;
     try { data = await r.json(); } catch (_) { /* 非 JSON 响应 */ }
     if (!r.ok) throw new Error((data && data.error) || ("HTTP " + r.status));

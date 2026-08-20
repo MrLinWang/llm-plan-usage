@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>用户管理 - LLM 用量总览</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --fg: #d7dae0;
+    --dim: #7a7f8a;
+    --sep: #3a3f4a;
+    --green: #4caf50;
+    --yellow: #ffb300;
+    --red: #ef5350;
+    --cyan: #56b6c2;
+    --track: #2c313c;
+    --surface: #1c2027;
+    --hover: rgba(255, 255, 255, 0.035);
+    --glow: #1b2230;
+    --shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  }
+  /* 浅色主题:覆盖同名变量,强调色取深一档以保证白底对比度 */
+  html[data-theme="light"] {
+    --bg: #f5f6f8;
+    --fg: #24292f;
+    --dim: #6e7781;
+    --sep: #d0d7de;
+    --green: #1a7f37;
+    --yellow: #9a6700;
+    --red: #cf222e;
+    --cyan: #0a7ea4;
+    --track: #e2e5ea;
+    --surface: #ffffff;
+    --hover: rgba(0, 0, 0, 0.03);
+    --glow: #e9edf3;
+    --shadow: 0 10px 30px rgba(27, 31, 36, 0.1);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px;
+    min-height: 100vh;
+    background: radial-gradient(1100px 520px at 78% -8%, var(--glow), var(--bg) 62%);
+    background-attachment: fixed;
+    color: var(--fg);
+    font-family: "Sarasa Mono SC", "Noto Sans Mono CJK SC", "PingFang SC",
+                 "Microsoft YaHei", Consolas, "Courier New", monospace;
+    font-size: 14px;
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }
+  #app { max-width: 760px; margin: 0 auto; display: grid; gap: 12px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--sep);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 14px 18px 12px;
+    transition: background-color 0.25s ease, border-color 0.25s ease;
+  }
+  .card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .head-nav { display: flex; gap: 8px; flex: none; align-items: center; }
+  .section-title {
+    font-weight: bold;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--sep);
+  }
+  #theme-toggle, .pill-btn {
+    flex: none;
+    padding: 5px 16px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--dim);
+    background: transparent;
+    border: 1px solid var(--sep);
+    border-radius: 999px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: color 0.2s ease, border-color 0.2s ease,
+                background-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  #theme-toggle:hover, .pill-btn:hover {
+    color: var(--fg);
+    border-color: var(--dim);
+    background: var(--hover);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  #theme-toggle:focus-visible, .pill-btn:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: 2px;
+  }
+  .pill-btn.danger:hover { color: var(--red); border-color: var(--red); }
+  .pill-btn.small { padding: 2px 12px; font-size: 12px; }
+  .title {
+    font-weight: bold;
+    font-size: 17px;
+    letter-spacing: 0.02em;
+    margin-bottom: 6px;
+    background: linear-gradient(90deg, var(--cyan), var(--green));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .status { color: var(--dim); font-size: 13px; }
+  .dim { color: var(--dim); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  th {
+    text-align: left;
+    color: var(--dim);
+    font-weight: normal;
+    font-size: 12px;
+    padding: 6px 14px 4px 0;
+    border-bottom: 1px solid var(--sep);
+  }
+  td { padding: 6px 14px 6px 0; vertical-align: middle; }
+  th:last-child, td:last-child { padding-right: 0; }
+  tbody tr:hover td { background: var(--hover); }
+  td.ops { display: flex; gap: 8px; }
+  form { display: grid; gap: 12px; padding-bottom: 6px; }
+  label { display: grid; gap: 5px; color: var(--dim); font-size: 13px; }
+  label.check { display: flex; align-items: center; gap: 8px; }
+  label.check input { width: auto; }
+  input[type="text"], input[type="password"] {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--sep);
+    border-radius: 8px;
+    padding: 7px 10px;
+    width: 100%;
+    max-width: 320px;
+  }
+  input[type="text"]:focus, input[type="password"]:focus {
+    outline: none;
+    border-color: var(--cyan);
+  }
+  .btn {
+    justify-self: start;
+    padding: 7px 22px;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--bg);
+    background: var(--cyan);
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: filter 0.2s ease;
+  }
+  .btn:hover { filter: brightness(1.12); }
+  .btn:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  .form-err { color: var(--red); font-size: 13px; min-height: 1.2em; }
+  .form-ok { color: var(--green); font-size: 13px; min-height: 1.2em; }
+</style>
+<script>
+// 首屏前确定主题,避免闪烁:localStorage 优先,其次系统偏好,默认深色。
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("llm-usage-theme"); } catch (_) {}
+  if (t !== "light" && t !== "dark") {
+    t = (window.matchMedia &&
+         matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+  }
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+</head>
+<body>
+<div id="app">
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <div class="title">用户管理</div>
+        <div class="status">LLM 用量总览</div>
+      </div>
+      <div class="head-nav">
+        <a class="pill-btn" href="/">仪表盘</a>
+        <a class="pill-btn" href="/config">供应商配置</a>
+        <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">用户列表</div>
+    <table>
+      <thead>
+        <tr><th>用户名</th><th>角色</th><th>创建时间</th><th>操作</th></tr>
+      </thead>
+      <tbody id="user-rows"></tbody>
+    </table>
+    <div id="list-err" class="form-err"></div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">新增用户</div>
+    <form id="create-form">
+      <label>用户名
+        <input id="new-username" type="text" autocomplete="off" required>
+      </label>
+      <label>密码(至少 6 位)
+        <input id="new-password" type="password" autocomplete="new-password" required>
+      </label>
+      <label class="check">
+        <input id="new-is-admin" type="checkbox"> 设为管理员
+      </label>
+      <div id="create-err" class="form-err"></div>
+      <button class="btn" type="submit">创建用户</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="section-title">修改我的密码</div>
+    <form id="password-form">
+      <label>原密码
+        <input id="old-password" type="password" autocomplete="current-password" required>
+      </label>
+      <label>新密码(至少 6 位)
+        <input id="my-new-password" type="password" autocomplete="new-password" required>
+      </label>
+      <div id="pw-err" class="form-err"></div>
+      <div id="pw-ok" class="form-ok"></div>
+      <button class="btn" type="submit">修改密码</button>
+    </form>
+  </div>
+</div>
+<script>
+"use strict";
+
+// ---- 主题切换(与 index.html 一致) ----
+var THEME_KEY = "llm-usage-theme";
+
+function syncThemeButton() {
+  var light = document.documentElement.dataset.theme === "light";
+  document.getElementById("theme-toggle").textContent = light ? "深色" : "浅色";
+}
+
+document.getElementById("theme-toggle").addEventListener("click", function () {
+  var light = document.documentElement.dataset.theme === "light";
+  var next = light ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+  syncThemeButton();
+});
+syncThemeButton();
+
+// ---- 工具 ----
+var me = null;  // 当前登录用户名(用于隐藏自己行的删除按钮)
+
+// 任何 401 都说明会话已失效,回登录页
+async function api(url, opts) {
+  var r = await fetch(url, opts);
+  if (r.status === 401) { location.href = "/login"; throw new Error("未登录"); }
+  return r;
+}
+
+async function detailOf(r) {
+  var data = null;
+  try { data = await r.json(); } catch (_) { /* 非 JSON 响应 */ }
+  return (data && data.detail) || ("HTTP " + r.status);
+}
+
+function p2(n) { return String(n).padStart(2, "0"); }
+
+// ISO(UTC naive 或带时区)→ 本地 YYYY-MM-DD HH:MM:SS
+function fmtLocal(iso) {
+  if (!iso) return "-";
+  var v = String(iso).trim();
+  if (!/[Zz]$/.test(v) && !/[+-]\d{2}:?\d{2}$/.test(v)) v += "Z";
+  var d = new Date(v);
+  if (isNaN(d.getTime())) return iso;
+  return d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate()) +
+         " " + p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
+}
+
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// ---- 用户列表 ----
+var rowsEl = document.getElementById("user-rows");
+var listErr = document.getElementById("list-err");
+
+async function loadUsers() {
+  listErr.textContent = "";
+  try {
+    var r = await api("/api/users");
+    if (!r.ok) { listErr.textContent = await detailOf(r); return; }
+    renderUsers(await r.json());
+  } catch (e) {
+    if (e && e.message !== "未登录") listErr.textContent = String(e.message || e);
+  }
+}
+
+function renderUsers(users) {
+  rowsEl.textContent = "";
+  users.forEach(function (u) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "", u.username));
+    tr.appendChild(el("td", u.is_admin ? "" : "dim", u.is_admin ? "管理员" : "用户"));
+    tr.appendChild(el("td", "dim", fmtLocal(u.created_at)));
+    var ops = el("td", "ops");
+    var reset = el("button", "pill-btn small", "重置密码");
+    reset.type = "button";
+    reset.addEventListener("click", function () { resetPassword(u.username); });
+    ops.appendChild(reset);
+    if (u.username !== me) {  // 当前登录用户不显示删除
+      var del = el("button", "pill-btn small danger", "删除");
+      del.type = "button";
+      del.addEventListener("click", function () { deleteUser(u.username); });
+      ops.appendChild(del);
+    }
+    tr.appendChild(ops);
+    rowsEl.appendChild(tr);
+  });
+}
+
+async function resetPassword(username) {
+  var pw = window.prompt("为用户 " + username + " 设置新密码(至少 6 位):");
+  if (pw === null) return;
+  listErr.textContent = "";
+  var r = await api("/api/users/" + encodeURIComponent(username) + "/password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: pw }),
+  });
+  if (!r.ok) listErr.textContent = await detailOf(r);
+}
+
+async function deleteUser(username) {
+  if (!window.confirm("确定删除用户 " + username + " ?其所有登录会话将失效。")) return;
+  listErr.textContent = "";
+  var r = await api("/api/users/" + encodeURIComponent(username), { method: "DELETE" });
+  if (!r.ok) { listErr.textContent = await detailOf(r); return; }
+  loadUsers();
+}
+
+// ---- 新增用户 ----
+document.getElementById("create-form").addEventListener("submit", async function (ev) {
+  ev.preventDefault();
+  var errEl = document.getElementById("create-err");
+  errEl.textContent = "";
+  var r = await api("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: document.getElementById("new-username").value,
+      password: document.getElementById("new-password").value,
+      is_admin: document.getElementById("new-is-admin").checked,
+    }),
+  });
+  if (!r.ok) { errEl.textContent = await detailOf(r); return; }
+  document.getElementById("new-username").value = "";
+  document.getElementById("new-password").value = "";
+  document.getElementById("new-is-admin").checked = false;
+  loadUsers();
+});
+
+// ---- 修改我的密码 ----
+document.getElementById("password-form").addEventListener("submit", async function (ev) {
+  ev.preventDefault();
+  var errEl = document.getElementById("pw-err");
+  var okEl = document.getElementById("pw-ok");
+  errEl.textContent = "";
+  okEl.textContent = "";
+  var r = await api("/api/auth/password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      old_password: document.getElementById("old-password").value,
+      new_password: document.getElementById("my-new-password").value,
+    }),
+  });
+  if (!r.ok) { errEl.textContent = await detailOf(r); return; }
+  document.getElementById("old-password").value = "";
+  document.getElementById("my-new-password").value = "";
+  okEl.textContent = "密码已修改,其他登录会话已失效";
+});
+
+// ---- 启动 ----
+api("/api/auth/state").then(function (r) { return r.json(); }).then(function (s) {
+  if (!s.authenticated) { location.href = "/login"; return; }
+  if (!s.user || !s.user.is_admin) { location.href = "/"; return; }
+  me = s.user.username;
+  loadUsers();
+});
+</script>
+</body>
+</html>

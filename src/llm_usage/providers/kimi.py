@@ -3,12 +3,18 @@
 Endpoint: ``GET {base_url}/usages``  (404 → fallback ``/usage``)
 Auth:     ``Authorization: Bearer <sk-kimi-xxx>``
 
-Response shape (from kimi-code-usage ``_parse_usage_payload``):
+Response shape (verified against the live API, 2026-08):
   {
-    "limits": [{"name": "5小时", "limit": N, "remaining": M, "resetTime": <ms or ISO>}],
-    "usage":   {"limit": N, "remaining": M, "resetTime": <ms or ISO>}   # weekly
+    "limits": [{
+      "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+      "detail": {"limit": "100", "used": "68", "remaining": "32",
+                 "resetTime": "<ISO or epoch-ms>"}
+    }],
+    "usage": {"limit": "100", "used": "27", "remaining": "73",
+              "resetTime": "<ISO or epoch-ms>"}    # weekly
   }
-``used = limit - remaining``; ``percent = used / limit * 100``.
+Legacy flat ``limits[]`` items (``{"name", "limit", "remaining", ...}``)
+are also accepted. Numbers may be JSON strings. ``used = limit - remaining``.
 """
 
 from __future__ import annotations
@@ -54,6 +60,29 @@ def _parse_reset_time(value: Any) -> str | None:
     return None
 
 
+def _window_label(window: Any) -> str | None:
+    """Derive a Chinese label from a ``{"duration", "timeUnit"}`` window."""
+    if not isinstance(window, dict):
+        return None
+    duration = window.get("duration")
+    if not isinstance(duration, (int, float)):
+        return None
+    unit = window.get("timeUnit")
+    if unit == "TIME_UNIT_MINUTE":
+        minutes = duration
+    elif unit == "TIME_UNIT_HOUR":
+        minutes = duration * 60
+    elif unit == "TIME_UNIT_DAY":
+        minutes = duration * 1440
+    else:
+        return None
+    if minutes % 1440 == 0:
+        return f"{int(minutes // 1440)}天"
+    if minutes % 60 == 0:
+        return f"{int(minutes // 60)}小时"
+    return f"{int(minutes)}分钟"
+
+
 def _parse_usage_payload(
     payload: dict[str, Any], platform: str
 ) -> list[UsageEntry]:
@@ -65,15 +94,20 @@ def _parse_usage_payload(
     entries: list[UsageEntry] = []
 
     for item in payload.get("limits", []) or []:
-        limit = item.get("limit")
-        remaining = item.get("remaining")
+        # Live API nests the numbers under "detail"; legacy shape was flat.
+        detail = item.get("detail")
+        data = detail if isinstance(detail, dict) else item
+        limit = data.get("limit")
+        remaining = data.get("remaining")
         if limit is None or remaining is None:
             # not enough data; skip
             continue
         limit_f = float(limit)
         remaining_f = float(remaining)
         used = limit_f - remaining_f
-        label = str(item.get("name") or "窗口")
+        label = str(
+            item.get("name") or _window_label(item.get("window")) or "窗口"
+        )
         entries.append(
             UsageEntry(
                 platform=platform,
@@ -82,7 +116,7 @@ def _parse_usage_payload(
                 limit=limit_f,
                 remaining=compute_remaining(used, limit_f),
                 percent=compute_percent(used, limit_f),
-                reset_at=_parse_reset_time(item.get("resetTime")),
+                reset_at=_parse_reset_time(data.get("resetTime")),
                 unit="%",
             )
         )

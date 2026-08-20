@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>供应商配置 - LLM 用量总览</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --fg: #d7dae0;
+    --dim: #7a7f8a;
+    --sep: #3a3f4a;
+    --green: #4caf50;
+    --yellow: #ffb300;
+    --red: #ef5350;
+    --cyan: #56b6c2;
+    --track: #2c313c;
+    --surface: #1c2027;
+    --hover: rgba(255, 255, 255, 0.035);
+    --glow: #1b2230;
+    --shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  }
+  /* 浅色主题:覆盖同名变量,强调色取深一档以保证白底对比度 */
+  html[data-theme="light"] {
+    --bg: #f5f6f8;
+    --fg: #24292f;
+    --dim: #6e7781;
+    --sep: #d0d7de;
+    --green: #1a7f37;
+    --yellow: #9a6700;
+    --red: #cf222e;
+    --cyan: #0a7ea4;
+    --track: #e2e5ea;
+    --surface: #ffffff;
+    --hover: rgba(0, 0, 0, 0.03);
+    --glow: #e9edf3;
+    --shadow: 0 10px 30px rgba(27, 31, 36, 0.1);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px;
+    min-height: 100vh;
+    background: radial-gradient(1100px 520px at 78% -8%, var(--glow), var(--bg) 62%);
+    background-attachment: fixed;
+    color: var(--fg);
+    font-family: "Sarasa Mono SC", "Noto Sans Mono CJK SC", "PingFang SC",
+                 "Microsoft YaHei", Consolas, "Courier New", monospace;
+    font-size: 14px;
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }
+  #app { max-width: 1200px; margin: 0 auto; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--sep);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 14px 18px 12px;
+    transition: background-color 0.25s ease, border-color 0.25s ease;
+  }
+  .card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .head-nav { display: flex; gap: 8px; flex: none; align-items: center; }
+  /* 平台卡片网格:够宽时两列,窄屏自动单列 */
+  #platforms {
+    margin-top: 12px;
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 560px), 1fr));
+  }
+  .platform-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 8px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--sep);
+  }
+  .platform-name { font-weight: bold; }
+  #theme-toggle, .pill-btn {
+    flex: none;
+    padding: 5px 16px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--dim);
+    background: transparent;
+    border: 1px solid var(--sep);
+    border-radius: 999px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: color 0.2s ease, border-color 0.2s ease,
+                background-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  #theme-toggle:hover, .pill-btn:hover {
+    color: var(--fg);
+    border-color: var(--dim);
+    background: var(--hover);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  #theme-toggle:focus-visible, .pill-btn:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: 2px;
+  }
+  .title {
+    font-weight: bold;
+    font-size: 17px;
+    letter-spacing: 0.02em;
+    margin-bottom: 6px;
+    background: linear-gradient(90deg, var(--cyan), var(--green));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .status { color: var(--dim); font-size: 13px; }
+  .dim { color: var(--dim); }
+  .fields { display: grid; gap: 12px; }
+  label { display: grid; gap: 5px; color: var(--dim); font-size: 13px; }
+  label.check { display: flex; align-items: center; gap: 8px; }
+  label.check input { width: auto; }
+  input[type="text"], input[type="password"] {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--sep);
+    border-radius: 8px;
+    padding: 7px 10px;
+    width: 100%;
+  }
+  input[type="text"]:focus, input[type="password"]:focus {
+    outline: none;
+    border-color: var(--cyan);
+  }
+  .hint { font-size: 12px; color: var(--dim); }
+  .card-foot { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .btn {
+    padding: 7px 22px;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--bg);
+    background: var(--cyan);
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: filter 0.2s ease;
+  }
+  .btn:hover { filter: brightness(1.12); }
+  .btn:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  .form-err { color: var(--red); font-size: 13px; }
+  .form-ok { color: var(--green); font-size: 13px; }
+</style>
+<script>
+// 首屏前确定主题,避免闪烁:localStorage 优先,其次系统偏好,默认深色。
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("llm-usage-theme"); } catch (_) {}
+  if (t !== "light" && t !== "dark") {
+    t = (window.matchMedia &&
+         matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+  }
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+</head>
+<body>
+<div id="app">
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <div class="title">供应商配置</div>
+        <div id="status" class="status">加载中…</div>
+      </div>
+      <div class="head-nav">
+        <a class="pill-btn" href="/">仪表盘</a>
+        <a class="pill-btn" href="/users">用户管理</a>
+        <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+      </div>
+    </div>
+  </div>
+  <div id="platforms"></div>
+</div>
+<script>
+"use strict";
+
+// ---- 主题切换(与 index.html 一致) ----
+var THEME_KEY = "llm-usage-theme";
+
+function syncThemeButton() {
+  var light = document.documentElement.dataset.theme === "light";
+  document.getElementById("theme-toggle").textContent = light ? "深色" : "浅色";
+}
+
+document.getElementById("theme-toggle").addEventListener("click", function () {
+  var light = document.documentElement.dataset.theme === "light";
+  var next = light ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+  syncThemeButton();
+});
+syncThemeButton();
+
+// ---- 工具 ----
+var platformsEl = document.getElementById("platforms");
+var statusEl = document.getElementById("status");
+
+// 任何 401 都说明会话已失效,回登录页
+async function api(url, opts) {
+  var r = await fetch(url, opts);
+  if (r.status === 401) { location.href = "/login"; throw new Error("未登录"); }
+  return r;
+}
+
+async function detailOf(r) {
+  var data = null;
+  try { data = await r.json(); } catch (_) { /* 非 JSON 响应 */ }
+  return (data && data.detail) || ("HTTP " + r.status);
+}
+
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// 凭证输入框 placeholder:env 引用原样显示;已设置的字面量显示脱敏提示;否则未设置
+function placeholderOf(cred) {
+  if (cred.env) return "当前: " + cred.env;
+  if (cred.set) return "已设置 (" + cred.hint + ")";
+  return "未设置";
+}
+
+// ---- 平台卡片 ----
+// 每张卡片:标题(display_name + key)、启用 checkbox、凭证输入框、保存按钮。
+// 凭证输入留空 = 不修改;保存后服务端使缓存失效,下次刷新生效。
+
+function platformCard(p) {
+  var card = el("div", "card platform");
+
+  var head = el("div", "platform-head");
+  head.appendChild(el("span", "platform-name", p.display_name));
+  head.appendChild(el("span", "dim", p.key));
+  card.appendChild(head);
+
+  var fields = el("div", "fields");
+
+  var enableLabel = el("label", "check");
+  var enableBox = document.createElement("input");
+  enableBox.type = "checkbox";
+  enableBox.checked = !!p.enabled;
+  enableLabel.appendChild(enableBox);
+  enableLabel.appendChild(document.createTextNode("启用"));
+  fields.appendChild(enableLabel);
+
+  var inputs = {};  // field -> input 元素
+  Object.keys(p.credentials).forEach(function (field) {
+    var cred = p.credentials[field];
+    var label = el("label", "", field);
+    var input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.placeholder = placeholderOf(cred);
+    inputs[field] = input;
+    label.appendChild(input);
+    fields.appendChild(label);
+  });
+
+  fields.appendChild(el("div", "hint", "留空保持不变;支持 env:VARNAME 引用环境变量"));
+  card.appendChild(fields);
+
+  var foot = el("div", "card-foot");
+  var save = el("button", "btn", "保存");
+  save.type = "button";
+  var errEl = el("span", "form-err");
+  var okEl = el("span", "form-ok");
+  save.addEventListener("click", async function () {
+    errEl.textContent = "";
+    okEl.textContent = "";
+    save.disabled = true;
+    try {
+      var body = { enabled: enableBox.checked };
+      Object.keys(inputs).forEach(function (field) { body[field] = inputs[field].value; });
+      var r = await api("/api/config/platforms/" + encodeURIComponent(p.key), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { errEl.textContent = await detailOf(r); return; }
+      var updated = await r.json();
+      // 用服务端返回的视图刷新输入框(清空 + 新 placeholder)
+      Object.keys(updated.credentials).forEach(function (field) {
+        inputs[field].value = "";
+        inputs[field].placeholder = placeholderOf(updated.credentials[field]);
+      });
+      enableBox.checked = !!updated.enabled;
+      okEl.textContent = "已保存,下次刷新生效";
+    } catch (e) {
+      if (e && e.message !== "未登录") errEl.textContent = String(e.message || e);
+    } finally {
+      save.disabled = false;
+    }
+  });
+  foot.appendChild(save);
+  foot.appendChild(okEl);
+  foot.appendChild(errEl);
+  card.appendChild(foot);
+  return card;
+}
+
+async function load() {
+  try {
+    var r = await api("/api/config");
+    if (!r.ok) { statusEl.textContent = await detailOf(r); return; }
+    var data = await r.json();
+    platformsEl.textContent = "";
+    (data.platforms || []).forEach(function (p) {
+      platformsEl.appendChild(platformCard(p));
+    });
+    statusEl.textContent = "修改将写入 config.toml";
+  } catch (e) {
+    if (e && e.message !== "未登录") statusEl.textContent = String(e.message || e);
+  }
+}
+
+// ---- 启动 ----
+api("/api/auth/state").then(function (r) { return r.json(); }).then(function (s) {
+  if (!s.authenticated) { location.href = "/login"; return; }
+  if (!s.user || !s.user.is_admin) { location.href = "/"; return; }
+  load();
+});
+</script>
+</body>
+</html>

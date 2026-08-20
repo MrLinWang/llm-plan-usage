@@ -32,6 +32,30 @@ llm-usage web                # 浏览器仪表盘（默认 http://127.0.0.1:8765
 llm-usage history --days 7   # 查看历史快照
 ```
 
+## Docker
+
+镜像由 GitHub Actions 自动构建并发布到 GHCR（`main` 分支 → `latest`，tag `v*` → 对应版本号，多架构 amd64/arm64）：
+
+```bash
+docker run -d --name llm-usage \
+  -p 8765:8765 \
+  -v llm-usage-data:/data \
+  ghcr.io/<owner>/llm-usage:latest
+```
+
+打开 http://127.0.0.1:8765/ ，首次访问创建管理员账号；之后在「供应商配置」页填写各平台凭证（写回 `/data/config.toml`），或直接注入环境变量：
+
+```bash
+docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
+  -e KIMI_API_KEY=sk-... -e TZ=Asia/Shanghai \
+  ghcr.io/<owner>/llm-usage:latest
+```
+
+- `/data` 卷持久化配置与历史数据库（含用户/会话）；推荐命名卷。bind mount 宿主目录时需对 uid 1000 可写。
+- 改端口用 `-e PORT=9000 -p 9000:9000`（healthcheck 跟随 `$PORT`）。
+- 首次推送后 GHCR 包默认为 private，需在 GitHub 包设置中改为 public，否则 `docker pull` 要先 `docker login ghcr.io`。
+- 本地构建：`docker build -t llm-usage:dev .`
+
 ## 支持的平台
 
 | 平台 | 方式 | 说明 |

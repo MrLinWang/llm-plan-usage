@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+tests
+dist
+*.egg-info
+config.toml
+history.db
+Dockerfile
+.dockerignore

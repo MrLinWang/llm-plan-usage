@@ -224,6 +224,11 @@ def _make_bar_line(percent: float | None) -> Text:
     )
 
 
+def _make_plan_line(plan: str) -> Text:
+    """套餐分区行:套餐名从窗口列起始,置于该套餐所有数据行之前。"""
+    return Text.assemble((" " * (PLATFORM_W + COL_GAP), ""), (plan, "bold dim"))
+
+
 def _make_error_line(display_name: str, error: str) -> Text:
     name = _pad(display_name, PLATFORM_W, "left")
     return Text.assemble(
@@ -254,14 +259,56 @@ def build_overview(results: list[PlatformResult], width: int | None = None) -> P
             lines.append(Text.assemble((name, "bold"), ("无数据", "dim")))
             continue
 
+        if res.warning:
+            lines.append(Text.assemble((" " * (PLATFORM_W + COL_GAP), ""),
+                                        (f"提示：{res.warning}", "yellow")))
+
+        prev_plan: str | None = None
         for i, entry in enumerate(res.entries):
             status = "OK" if i == 0 else ""
+            if entry.plan and entry.plan != prev_plan:
+                lines.append(_make_plan_line(entry.plan))
             lines.append(_make_data_line(entry, is_first=(i == 0),
                                          display_name=res.display_name, status=status))
             lines.append(_make_bar_line(entry.percent))
+            prev_plan = entry.plan
 
     title = f"LLM 用量总览 ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
     return Panel(Group(*lines), title=title, border_style="cyan")
+
+
+def render_key_breakdown(results: list[PlatformResult], console: Console | None = None) -> None:
+    """Render per-key usage detail for entries that aggregate multiple API keys.
+
+    Only entries with a non-empty ``key_breakdown`` (more than one key) are
+    shown; entries without a breakdown (or with just one key) are skipped.
+    """
+    console = console or Console()
+    any_rows = False
+    for res in results:
+        if res.error or not res.entries:
+            continue
+        for entry in res.entries:
+            if not entry.key_breakdown or len(entry.key_breakdown) < 2:
+                continue
+            any_rows = True
+            table = Table(title=f"{res.display_name} · {entry.label} · Key 明细")
+            table.add_column("#", justify="right")
+            table.add_column("已用", justify="right")
+            table.add_column("状态")
+            for item in entry.key_breakdown:
+                number = str(item.get("number", "-"))
+                if item.get("ok"):
+                    used = _fmt_value(item.get("used"), entry.unit)
+                    status = "[green]OK[/green]"
+                else:
+                    used = "-"
+                    error = item.get("error") or "失败"
+                    status = f"[red]{error}[/red]"
+                table.add_row(number, used, status)
+            console.print(table)
+    if not any_rows:
+        console.print("[dim]没有多 Key 分组的用量明细[/dim]")
 
 
 def render_results(
@@ -287,6 +334,7 @@ def results_to_dict(results: list[PlatformResult]) -> dict[str, Any]:
                 "name": res.platform,
                 "display_name": res.display_name,
                 "error": res.error,
+                "warning": res.warning,
                 "entries": [
                     {
                         "label": e.label,
@@ -297,6 +345,8 @@ def results_to_dict(results: list[PlatformResult]) -> dict[str, Any]:
                         "reset_at": e.reset_at,
                         "unit": e.unit,
                         "is_manual": e.is_manual,
+                        "plan": e.plan,
+                        "key_breakdown": e.key_breakdown,
                     }
                     for e in res.entries
                 ],
@@ -321,6 +371,7 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
     table = Table(title="LLM 用量历史")
     table.add_column("时间", style="dim")
     table.add_column("平台")
+    table.add_column("套餐")
     table.add_column("窗口")
     table.add_column("已用", justify="right")
     table.add_column("限额", justify="right")
@@ -336,6 +387,7 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
         table.add_row(
             ts,
             str(r.get("platform", "")),
+            str(r.get("plan") or "-"),
             str(r.get("label", "")),
             str(r.get("used", "")),
             limit_str,

@@ -357,41 +357,54 @@ class TestWebAuth:
 
 
 class TestWebConfig:
-    def test_get_config_credential_views(
+    def test_get_config_credential_slots(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
         tmp_config_path: Path,
     ) -> None:
         init_config(tmp_config_path)
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         platforms = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}
-        # 模板中的 env: 引用原样出现在 env 字段
-        kimi = platforms["kimi"]["credentials"]["api_key"]
-        assert kimi == {"set": True, "env": "env:KIMI_API_KEY", "hint": None}
-        volc = platforms["volcengine-coding"]["credentials"]
+        # 模板中的 env: 引用原样出现在槽 0 的 env 字段
+        kimi_slots = platforms["kimi"]["credential_slots"]
+        assert kimi_slots == [{
+            "index": 0,
+            "name": None,
+            "credentials": {"api_key": {"set": True, "env": "env:KIMI_API_KEY",
+                                        "hint": None}},
+        }]
+        volc = platforms["volcengine-coding"]["credential_slots"][0]["credentials"]
         assert volc["access_key"]["env"] == "env:VOLCENGINE_ACCESS_KEY"
         assert volc["secret_key"]["env"] == "env:VOLCENGINE_SECRET_KEY"
         # 字面量密钥 → 脱敏 hint,env 为 null
         update_platform_config("kimi", {"api_key": "sk-kimi-secret-key"})
         kimi = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
             "kimi"
-        ]["credentials"]["api_key"]
+        ]["credential_slots"][0]["credentials"]["api_key"]
         assert kimi == {"set": True, "env": None, "hint": "sk-k…ey"}
         # 短密钥无法取头尾 → 固定掩码
         update_platform_config("kimi", {"api_key": "short"})
         kimi = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
             "kimi"
-        ]["credentials"]["api_key"]
+        ]["credential_slots"][0]["credentials"]["api_key"]
         assert kimi["hint"] == "••••"
-        # 未设置字段 → set 为 False
+        # 未设置字段 → 无凭证槽(页面渲染默认空槽,placeholder「未设置」)
         cfg = load_config()
         del cfg["platforms"]["ollama"]["api_key"]
         from llm_usage.config import save_config
 
         save_config(cfg)
-        ollama = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
+        ollama_slots = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
             "ollama"
-        ]["credentials"]["api_key"]
-        assert ollama == {"set": False, "env": None, "hint": None}
+        ]["credential_slots"]
+        assert ollama_slots == []
+        # 平台无任何凭证 → 空槽列表(页面渲染默认空槽)
+        cfg = load_config()
+        del cfg["platforms"]["kimi"]["api_key"]
+        save_config(cfg)
+        kimi_slots = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
+            "kimi"
+        ]["credential_slots"]
+        assert kimi_slots == []
 
     def test_put_enabled_invalidates_cache(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
@@ -408,6 +421,299 @@ class TestWebConfig:
         # 缓存在 interval 内仍触发新的 fetch → 配置保存后缓存已失效
         client.get("/api/usage")
         assert calls[0] == 2
+
+    def test_put_gateway_groups_persist_and_view(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "enabled": True,
+            "base_url": "http://gw.internal:9090",
+            "groups": [{"name": "组1", "daily_limit": 50, "api_keys": ["sk-g1-12345"]}],
+        })
+        assert resp.status_code == 200
+        assert resp.json()["base_url"] == "http://gw.internal:9090"
+        group = resp.json()["groups"][0]
+        assert group["name"] == "组1"
+        assert group["daily_limit"] == 50
+        assert group["api_keys"] == [{"set": True, "env": None, "hint": "sk-g…45"}]
+        # 磁盘持久化:groups 写入且 use_groups 被置为 true
+        section = load_config()["platforms"]["llm-gateway"]
+        assert section["base_url"] == "http://gw.internal:9090"
+        assert section["groups"] == [
+            {"name": "组1", "daily_limit": 50, "api_keys": ["sk-g1-12345"]}
+        ]
+        assert section["use_groups"] is True
+        # 重复分组名 → 400
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [
+                {"name": "组1", "api_keys": ["sk-a"]},
+                {"name": "组1", "api_keys": ["sk-b"]},
+            ],
+        })
+        assert resp.status_code == 400
+        # 留空 key = 保留已保存的值 → 200(未改动)
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{"name": "组1", "daily_limit": None, "api_keys": [{"index": 0, "value": ""}]}],
+        })
+        assert resp.status_code == 200
+        # 空 daily_limit = 不设限;key 留空 = 保留已保存的值
+        assert load_config()["platforms"]["llm-gateway"]["groups"] == [
+            {"name": "组1", "api_keys": ["sk-g1-12345"]}
+        ]
+
+    def test_put_gateway_legacy_single_key_migrates(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        # 去掉模板默认组,模拟纯旧单 Key 配置
+        cfg = load_config()
+        del cfg["platforms"]["llm-gateway"]["groups"]
+        from llm_usage.config import save_config
+
+        save_config(cfg)
+        update_platform_config("llm-gateway", {"api_key": "sk-legacy-123"})
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        # 视图把旧单 Key 合成一组展示
+        gateway = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
+            "llm-gateway"
+        ]
+        assert gateway["groups"] == [{
+            "index": 0,
+            "name": "组1",
+            "daily_limit": None,
+            "api_keys": [{"set": True, "env": None, "hint": "sk-l…23"}],
+        }]
+        # 保存时留空 key = 保留旧值 → 迁移为 groups
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{
+                "index": 0, "name": "组1", "daily_limit": None,
+                "api_keys": [{"index": 0, "value": ""}],
+            }],
+        })
+        assert resp.status_code == 200
+        section = load_config()["platforms"]["llm-gateway"]
+        assert section["groups"] == [{"name": "组1", "api_keys": ["sk-legacy-123"]}]
+        assert section["use_groups"] is True
+
+    def test_put_gateway_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        # 空 groups → 400(纯组式至少一组)
+        resp = client.put("/api/config/platforms/llm-gateway", json={"groups": []})
+        assert resp.status_code == 400
+        assert "至少需要一个分组" in resp.json()["detail"]
+        # 顶层 daily_limit / use_groups 已从编辑面移除 → 未知字段 400
+        resp = client.put("/api/config/platforms/llm-gateway", json={"daily_limit": 50})
+        assert resp.status_code == 400
+        resp = client.put(
+            "/api/config/platforms/llm-gateway", json={"use_groups": True}
+        )
+        assert resp.status_code == 400
+        # groups 提交到其他平台 → 400
+        resp = client.put("/api/config/platforms/kimi", json={
+            "groups": [{"name": "组1", "api_keys": ["sk-kimi"]}],
+        })
+        assert resp.status_code == 400
+        # 无任何既有 key 时空 key 串 → 400(留空 = 保留,但无值可保留)
+        cfg = load_config()
+        del cfg["platforms"]["llm-gateway"]["groups"]
+        cfg["platforms"]["llm-gateway"].pop("api_key", None)
+        from llm_usage.config import save_config
+
+        save_config(cfg)
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{"name": "组1", "api_keys": [""]}],
+        })
+        assert resp.status_code == 400
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{"name": "组1", "api_keys": [{"index": 0, "value": ""}]}],
+        })
+        assert resp.status_code == 400
+
+    def test_put_credential_slots_persist_and_migrate(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """基于模板 env 槽 0 保留 + 新增槽 → 写 credentials 并清除顶层凭证。"""
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [
+                {"index": 0, "name": None, "api_key": ""},     # 保留 env:KIMI_API_KEY
+                {"index": None, "name": "套餐B", "api_key": "sk-b-12345"},
+            ],
+        })
+        assert resp.status_code == 200
+        section = load_config()["platforms"]["kimi"]
+        assert section["credentials"] == [
+            {"name": "套餐1", "api_key": "env:KIMI_API_KEY"},
+            {"name": "套餐B", "api_key": "sk-b-12345"},
+        ]
+        assert "api_key" not in section  # 顶层凭证已删除
+        slots = resp.json()["credential_slots"]
+        assert len(slots) == 2
+        assert slots[0]["name"] == "套餐1"
+        assert slots[0]["credentials"]["api_key"]["env"] == "env:KIMI_API_KEY"
+        assert slots[1]["name"] == "套餐B"
+        assert slots[1]["credentials"]["api_key"]["hint"] == "sk-b…45"
+
+    def test_put_credential_slots_keep_and_replace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [{"index": None, "name": "套餐A", "api_key": "sk-a-123"}],
+        })
+        assert resp.status_code == 200
+        # 留空 name/key → 保留既有值
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [{"index": 0, "name": "", "api_key": ""}],
+        })
+        assert resp.status_code == 200
+        assert load_config()["platforms"]["kimi"]["credentials"] == [
+            {"name": "套餐A", "api_key": "sk-a-123"}
+        ]
+        # 填新值 → 替换
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [{"index": 0, "name": "套餐A2", "api_key": "sk-a2-456"}],
+        })
+        assert resp.status_code == 200
+        assert load_config()["platforms"]["kimi"]["credentials"] == [
+            {"name": "套餐A2", "api_key": "sk-a2-456"}
+        ]
+
+    def test_put_credential_slots_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        # 空数组 → 400
+        resp = client.put("/api/config/platforms/kimi", json={"credential_slots": []})
+        assert resp.status_code == 400
+        assert "至少需要一个凭证" in resp.json()["detail"]
+        # 重复 name → 400
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [
+                {"name": "套餐A", "api_key": "sk-a-123"},
+                {"name": "套餐A", "api_key": "sk-b-456"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "凭证名称重复" in resp.json()["detail"]
+        # 新槽 api_key 留空(无既有值)→ 400
+        cfg = load_config()
+        del cfg["platforms"]["kimi"]["api_key"]
+        from llm_usage.config import save_config
+
+        save_config(cfg)
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [{"index": None, "api_key": ""}],
+        })
+        assert resp.status_code == 400
+        assert "缺少 api_key" in resp.json()["detail"]
+        # volcengine 槽缺 secret_key(且无既有值)→ 400
+        cfg = load_config()
+        del cfg["platforms"]["volcengine-coding"]["access_key"]
+        del cfg["platforms"]["volcengine-coding"]["secret_key"]
+        from llm_usage.config import save_config
+
+        save_config(cfg)
+        resp = client.put("/api/config/platforms/volcengine-coding", json={
+            "credential_slots": [{"name": "套餐A", "access_key": "AKLT-x"}],
+        })
+        assert resp.status_code == 400
+        assert "缺少 secret_key" in resp.json()["detail"]
+        # gateway 提交 credential_slots → 400
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "credential_slots": [{"name": "套餐A", "api_key": "sk-x"}],
+        })
+        assert resp.status_code == 400
+        assert "不支持字段" in resp.json()["detail"]
+        # 旧字段名 credentials → 未知字段 400
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credentials": [{"name": "套餐A", "api_key": "sk-a-123"}],
+        })
+        assert resp.status_code == 400
+        assert "未知字段" in resp.json()["detail"]
+        # 非 list → 400;含未知键 → 400;index 非法 → 400
+        resp = client.put("/api/config/platforms/kimi", json={"credential_slots": "x"})
+        assert resp.status_code == 400
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [{"name": "套餐A", "api_key": "sk-a", "daily_limit": 5}],
+        })
+        assert resp.status_code == 400
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [{"index": True, "api_key": "sk-a"}],
+        })
+        assert resp.status_code == 400
+
+    def test_put_credential_slots_volcengine_roundtrip(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """volcengine 槽保存 AK/SK,视图脱敏;凭证数组可被 fetch 消费。"""
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.put("/api/config/platforms/volcengine-agent", json={
+            "credential_slots": [{"index": None, "name": "套餐X",
+                                  "access_key": "AKLT-new", "secret_key": "sk-new-1"}],
+        })
+        assert resp.status_code == 200
+        section = load_config()["platforms"]["volcengine-agent"]
+        assert section["credentials"] == [
+            {"name": "套餐X", "access_key": "AKLT-new", "secret_key": "sk-new-1"}
+        ]
+        assert "access_key" not in section and "secret_key" not in section
+        slot = resp.json()["credential_slots"][0]
+        assert slot["credentials"]["access_key"]["hint"] == "AKLT…ew"
+        assert slot["credentials"]["secret_key"]["hint"] == "sk-n…-1"
+
+    def test_get_config_gateway_base_url_view(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """gateway 视图返回 base_url(模板值);其他平台无该字段。"""
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        platforms = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}
+        assert platforms["llm-gateway"]["base_url"] == "http://127.0.0.1:18080"
+        assert "base_url" not in platforms["kimi"]
+
+    def test_put_gateway_base_url_keep_and_replace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """base_url 留空 = 保留;非空 = 替换;其他平台提交 → 400。"""
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        # 留空 = 不修改
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "base_url": "", "groups": [{"name": "组1", "api_keys": ["sk-a-123"]}],
+        })
+        assert resp.status_code == 200
+        assert load_config()["platforms"]["llm-gateway"]["base_url"] == "http://127.0.0.1:18080"
+        # 非空 → 写回
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "base_url": "http://gw.new:8080",
+            "groups": [{"name": "组1", "api_keys": ["sk-a-123"]}],
+        })
+        assert resp.status_code == 200
+        assert resp.json()["base_url"] == "http://gw.new:8080"
+        assert load_config()["platforms"]["llm-gateway"]["base_url"] == "http://gw.new:8080"
+        # 其他平台提交 base_url → 400
+        resp = client.put("/api/config/platforms/kimi", json={"base_url": "http://x"})
+        assert resp.status_code == 400
+        assert "base_url" in resp.json()["detail"]
 
     def test_put_credentials(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
@@ -426,7 +732,7 @@ class TestWebConfig:
         )
         assert resp.status_code == 200
         assert load_config()["platforms"]["kimi"]["api_key"] == "sk-new-key-123"
-        assert resp.json()["credentials"]["api_key"]["hint"] == "sk-n…23"
+        assert resp.json()["credential_slots"][0]["credentials"]["api_key"]["hint"] == "sk-n…23"
 
     def test_put_validation(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
@@ -452,6 +758,7 @@ class TestWebConfig:
         assert calls[0] == 1
         new_order = [
             "opencode-go", "ollama", "volcengine-agent", "volcengine-coding", "kimi",
+            "llm-gateway",
         ]
         resp = client.put("/api/config/order", json={"order": new_order})
         assert resp.status_code == 200
@@ -478,6 +785,7 @@ class TestWebConfig:
         assert resp.status_code == 200
         assert resp.json()["order"] == [
             "ollama", "kimi", "volcengine-coding", "volcengine-agent", "opencode-go",
+            "llm-gateway",
         ]
 
     def test_config_page_has_drag_handle(

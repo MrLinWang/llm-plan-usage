@@ -66,12 +66,71 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | 火山方舟 Agent Plan | 自动 API | Volcengine OpenAPI `GetAFPUsage`，AK/SK + V4 签名 |
 | Ollama Cloud | 自动 API | `GET /api/usage`，Bearer |
 | OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer |
+| LLM Gateway（本地 Sub2API 网关） | 自动 API | `GET /v1/usage`，Bearer；显示今日 `actual_cost` USD |
 
 ## 配置
 
 配置文件位于 `./config.toml`（当前目录）。API 密钥支持 `env:VARNAME` 前缀，
 从环境变量读取，避免明文存储在磁盘上。运行 `llm-usage config --init` 生成模板。
-可用 `LLM_USAGE_CONFIG` 环境变量覆盖路径（历史数据库用 `LLM_USAGE_DB`）。
+LLM Gateway 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填；
+`usage.today.actual_cost` 是今日自然日实际扣费，`cost` 仅作为旧接口无
+`actual_cost` 时的回退。API keys 以**组**为单位配置：每组共享一个每日额度，
+组内所有成功 Key 的 `actual_cost` 之和为该组用量，每组单独显示和保存历史。
+模板默认生成一组（`组1`，`env:LLM_GATEWAY_API_KEY`）：
+
+```toml
+[platforms.llm-gateway]
+enabled = true
+base_url = "http://127.0.0.1:18080"
+
+[[platforms.llm-gateway.groups]]
+name = "组1"
+# daily_limit = 100
+api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"]
+```
+
+Key 直接写在 config.toml 即可，也支持 `env:VARNAME` 引用环境变量。组内部分 Key 请求失败时，成功 Key 仍会
+聚合，但结果会带提示；带提示的部分聚合不会写入历史快照，以免把不完整数据当成完整用量。
+同一个 Key 不应配置到多个分组。可用
+`LLM_USAGE_CONFIG` 环境变量覆盖路径（历史数据库用 `LLM_USAGE_DB`）。
+
+旧的顶层单 Key 形式（`api_key` + 可选 `daily_limit` + `use_groups`）仍被
+provider 兼容，可手工编辑 `config.toml` 使用；Web 端会把这种配置当作一组展示，
+保存时自动迁移为 `groups` 并置 `use_groups = true`。
+
+### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go）
+
+除 LLM Gateway 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
+**不同计费套餐**。每个凭证彼此完全独立——各自 fetch、各自展示、无共享限额、
+不合并数值；仪表盘按套餐分区展示同一平台的用量（`show`/`tui`/`web` 一致）。
+与 Gateway 的 groups（共享额度、聚合求和）不同。
+
+Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go 为
+`api_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
+（火山为「添加 AK/SK」）即可增加新套餐；「套餐名」留空时服务端自动命名
+`套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后写回
+`credentials` 数组并清除顶层单凭证字段（旧单 Key 形式首次保存即自动迁移）。
+手工配置同样支持：
+
+```toml
+[platforms.kimi]
+enabled = true
+# base_url = "https://api.kimi.com/coding/v1"
+
+[[platforms.kimi.credentials]]
+name = "套餐A"
+api_key = "env:KIMI_API_KEY_A"
+
+[[platforms.kimi.credentials]]
+name = "套餐B"
+api_key = "sk-kimi-xxx"
+```
+
+每个凭证 = 一个独立计费套餐：`show`/`tui`/`web` 的同一平台卡片内按套餐分块
+显示各自的数据行（套餐名标头）；历史快照记录套餐列；JSON 输出的每个 entry
+带 `plan` 字段。同一平台的部分凭证失败时该平台整体仍显示成功部分并附提示
+（不写历史快照）；全部失败才显示错误。没有 `credentials` 数组的旧配置
+（顶层单凭证）行为完全不变。
 
 ## Web 仪表盘
 
@@ -116,12 +175,21 @@ PBKDF2-SHA256（60 万次迭代、随机盐）哈希存储，不落明文；站�
 
 ### 供应商配置
 
-管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证字段
-（kimi/ollama/opencode-go 为 `api_key`；火山两个平台为 `access_key` + `secret_key`）。
-凭证永远不回显明文：已保存的值显示为掩码（如 `已设置 (sk-k…ey)`），
-`env:VARNAME` 引用原样显示；**输入留空表示不修改**。保存立即写回
-`./config.toml` 并使服务端用量缓存失效（下次刷新生效）。
-`base_url`、`tier`、`limits` 等高级字段仍需手工编辑 `config.toml`。
+管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证
+（kimi/ollama/opencode-go 为 `api_key`；火山两个平台为 `access_key` + `secret_key`；
+llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go
+以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
+命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
+（火山「添加 AK/SK」）追加新套餐槽。LLM Gateway 以**组**为单位编辑：
+默认一组「组1」，每组一个 API key 输入框 + 一个每日限额输入框（留空 = 不设限），
+组内可点「添加共享 Key」追加共享同一额度的 key，底部「添加组」新增分组；
+同组 Key 的今日用量会合并计算。凭证永远不回显明文：已保存的值显示为掩码
+（如 `已设置 (sk-k…ey)`），`env:VARNAME` 引用原样显示；凭证值留空表示保留
+已保存的值，删除整个槽才会移除该凭证。保存立即写回 `./config.toml` 并使服务端
+用量缓存失效（下次刷新生效）：槽式保存写 `credentials` 数组并清除顶层凭证
+字段；LLM Gateway 的分组保存写 `groups` 并置 `use_groups = true`。LLM Gateway
+的 `base_url` 也在同一页直接编辑（留空 = 不修改）；`usage_path` 等高级字段
+仍需手工编辑 `config.toml`。
 
 ## 时间显示
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from llm_usage.display import (
     _fmt_countdown,
     _to_local_time,
     render_history,
+    render_key_breakdown,
     render_results,
     results_to_json,
 )
@@ -73,6 +75,43 @@ class TestDisplay:
         assert "░" in out  # empty bar character
         assert "67%" in out  # percent label, rounded to integer
 
+
+class TestKeyBreakdown:
+    def test_multi_key_entry_renders_a_table(self) -> None:
+        e = UsageEntry(
+            "llm-gateway", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
+            key_breakdown=[
+                {"number": 1, "used": 1.25, "ok": True, "error": None},
+                {"number": 2, "used": None, "ok": False, "error": "认证失败(401)"},
+            ],
+        )
+        r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
+        console, buf = _make_console()
+        render_key_breakdown([r], console=console)
+        out = buf.getvalue()
+        assert "team-a" in out
+        assert "1.25" in out
+        assert "认证失败" in out
+
+    def test_single_key_entry_is_skipped(self) -> None:
+        e = UsageEntry(
+            "llm-gateway", "今日", 1.94, None, None, None, None, "$", False,
+            key_breakdown=[{"number": 1, "used": 1.94, "ok": True, "error": None}],
+        )
+        r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
+        console, buf = _make_console()
+        render_key_breakdown([r], console=console)
+        assert "没有多 Key 分组的用量明细" in buf.getvalue()
+
+    def test_entry_without_breakdown_is_skipped(self) -> None:
+        e = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7, None, "%", False)
+        r = PlatformResult("kimi", "Kimi Code", entries=[e])
+        console, buf = _make_console()
+        render_key_breakdown([r], console=console)
+        assert "没有多 Key 分组的用量明细" in buf.getvalue()
+
+
+class TestDisplaySerialization:
     def test_results_to_json_structure(self) -> None:
         e = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7, None, "%", False)
         r = PlatformResult("kimi", "Kimi Code", entries=[e])
@@ -82,7 +121,86 @@ class TestDisplay:
         assert len(data["platforms"]) == 2
         assert data["platforms"][0]["name"] == "kimi"
         assert data["platforms"][0]["entries"][0]["used"] == 80
+        assert data["platforms"][0]["entries"][0]["key_breakdown"] is None
         assert data["platforms"][1]["error"] == "bad"
+
+    def test_results_to_json_includes_key_breakdown(self) -> None:
+        e = UsageEntry(
+            "llm-gateway", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
+            key_breakdown=[
+                {"number": 1, "used": 1.25, "ok": True, "error": None},
+                {"number": 2, "used": None, "ok": False, "error": "认证失败(401)"},
+            ],
+        )
+        r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
+        data = json.loads(results_to_json([r]))
+        breakdown = data["platforms"][0]["entries"][0]["key_breakdown"]
+        assert breakdown == [
+            {"number": 1, "used": 1.25, "ok": True, "error": None},
+            {"number": 2, "used": None, "ok": False, "error": "认证失败(401)"},
+        ]
+
+    def test_results_to_json_includes_plan(self) -> None:
+        e = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7, None, "%", False,
+                       plan="套餐A")
+        r = PlatformResult("kimi", "Kimi Code", entries=[e])
+        data = json.loads(results_to_json([r]))
+        assert data["platforms"][0]["entries"][0]["plan"] == "套餐A"
+        # 无 plan 的 legacy entry 序列化为 null
+        e2 = UsageEntry("ollama", "5小时", 1, 2, 1, 50.0, None, "%", True)
+        data2 = json.loads(results_to_json([PlatformResult("ollama", "O", entries=[e2])]))
+        assert data2["platforms"][0]["entries"][0]["plan"] is None
+
+    def test_multi_plan_overview_renders_plan_lines(self) -> None:
+        """不同 plan 的 entries 之间渲染套餐分区行。"""
+        e1 = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7, None, "%", False,
+                        plan="套餐A")
+        e2 = UsageEntry("kimi", "每周", 10, 100, 90, 10.0, None, "%", False,
+                        plan="套餐A")
+        e3 = UsageEntry("kimi", "5小时", 50, 120, 70, 41.7, None, "%", False,
+                        plan="套餐B")
+        r = PlatformResult("kimi", "Kimi Code", entries=[e1, e2, e3])
+        console, buf = _make_console()
+        render_results([r], console=console)
+        out = buf.getvalue()
+        assert "套餐A" in out
+        assert "套餐B" in out
+        # 套餐行在对应数据行之前
+        assert out.index("套餐A") < out.index("5小时")
+        assert out.index("套餐B") > out.index("每周")
+        # 平台名仍只在首个 entry 行出现
+        assert out.count("Kimi Code") == 1
+
+    def test_multi_plan_single_plan_renders_plan_line(self) -> None:
+        """单一 plan 也渲染分区行(与编辑器一致);plan=None 不渲染。"""
+        e1 = UsageEntry("kimi", "5小时", 80, 100, 20, 80.0, None, "%", False,
+                        plan="套餐1")
+        r = PlatformResult("kimi", "Kimi Code", entries=[e1])
+        console, buf = _make_console()
+        render_results([r], console=console)
+        assert "套餐1" in buf.getvalue()
+
+        e2 = UsageEntry("kimi", "5小时", 80, 100, 20, 80.0, None, "%", False)
+        r2 = PlatformResult("kimi", "Kimi Code", entries=[e2])
+        console, buf = _make_console()
+        render_results([r2], console=console)
+        assert "套餐1" not in buf.getvalue()
+
+    def test_render_history_plan_column(self) -> None:
+        rows = [
+            {"ts": "2026-08-18T09:00:00+00:00", "platform": "kimi", "plan": "套餐A",
+             "label": "5小时", "used": 80, "limit": 120, "remaining": 40,
+             "percent": 66.7, "reset_at": None, "unit": "%", "is_manual": 0},
+            {"ts": "2026-08-18T09:00:00+00:00", "platform": "kimi", "plan": None,
+             "label": "每周", "used": 10, "limit": 100, "remaining": 90,
+             "percent": 10.0, "reset_at": None, "unit": "%", "is_manual": 0},
+        ]
+        console, buf = _make_console()
+        render_history(rows, console=console)
+        out = buf.getvalue()
+        assert "套餐A" in out
+        assert "套餐" in out  # 表头列
+        assert "-" in out     # 无 plan 行显示 "-"
 
     def test_render_history_empty(self) -> None:
         console, buf = _make_console()
@@ -223,6 +341,46 @@ class TestStore:
         e = UsageEntry("ollama", "5小时", 60, 100, 40, 60.0, None, "次", True)
         save_snapshot([PlatformResult("ollama", "O", entries=[e])])
         assert query_history()[0]["is_manual"] == 1
+
+    def test_plan_persisted(self, tmp_db_path: Path) -> None:
+        e = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7, None, "%", False,
+                       plan="套餐A")
+        save_snapshot([PlatformResult("kimi", "Kimi Code", entries=[e])])
+        rows = query_history()
+        assert rows[0]["plan"] == "套餐A"
+        # 无 plan 的 legacy entry → None
+        e2 = UsageEntry("kimi", "每周", 10, 100, 90, 10.0, None, "%", False)
+        save_snapshot([PlatformResult("kimi", "Kimi Code", entries=[e2])])
+        assert query_history()[1]["plan"] is None
+
+    def test_snapshots_table_migrated(self, tmp_db_path: Path) -> None:
+        """旧库(无 plan 列)经 _connect 自动 ALTER;旧行 plan 为 None。"""
+        p = tmp_db_path
+        conn = sqlite3.connect(str(p))
+        conn.executescript(
+            "CREATE TABLE snapshots ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, "
+            "platform TEXT NOT NULL, label TEXT NOT NULL, used REAL, "
+            "\"limit\" REAL, remaining REAL, percent REAL, reset_at TEXT, "
+            "unit TEXT, is_manual INTEGER DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO snapshots (ts, platform, label, used, \"limit\", "
+            "remaining, percent, reset_at, unit, is_manual) "
+            "VALUES ('2026-08-18T09:00:00+00:00', 'kimi', '5小时', 80, 120, "
+            "40, 66.7, NULL, '%', 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        e = UsageEntry("kimi", "每周", 10, 100, 90, 10.0, None, "%", False,
+                       plan="套餐B")
+        save_snapshot([PlatformResult("kimi", "Kimi Code", entries=[e])])
+        rows = query_history()
+        assert len(rows) == 2
+        by_label = {r["label"]: r for r in rows}
+        assert by_label["每周"]["plan"] == "套餐B"
+        assert by_label["5小时"]["plan"] is None  # 旧行无 plan
 
     def test_settings_roundtrip(self, tmp_db_path: Path) -> None:
         assert get_setting("registration_enabled") is None

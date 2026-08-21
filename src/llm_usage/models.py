@@ -21,6 +21,14 @@ class UsageEntry:
             display converts it to local time; stored/JSON values stay UTC.
         unit: display unit: ``"%"``, ``"次"``, ``"$"``, ``"tokens"``.
         is_manual: True for manually-entered values (no live API fetch).
+        plan: billing-plan name for multi-credential platforms (each
+            credential under one platform is its own independent plan);
+            ``None`` = legacy single-credential shape, no partitioning.
+        key_breakdown: optional per-key usage detail for entries aggregated
+            from multiple API keys (e.g. a gateway's shared-quota groups).
+            Each item is a dict: ``{"number": int, "used": float | None,
+            "ok": bool, "error": str | None}``.  ``None`` for entries that
+            are not a multi-key aggregate.
     """
 
     platform: str
@@ -32,6 +40,8 @@ class UsageEntry:
     reset_at: str | None
     unit: str
     is_manual: bool = False
+    plan: str | None = None
+    key_breakdown: list[dict] | None = None
 
 
 @dataclass
@@ -42,6 +52,7 @@ class PlatformResult:
     display_name: str
     entries: list[UsageEntry] = field(default_factory=list)
     error: str | None = None
+    warning: str | None = None
 
     @property
     def ok(self) -> bool:

@@ -29,5 +29,5 @@ def _clear_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure no stray env API keys leak into provider tests."""
     for var in ("KIMI_API_KEY", "VOLCENGINE_API_KEY",
                 "VOLCENGINE_ACCESS_KEY", "VOLCENGINE_SECRET_KEY",
-                "OLLAMA_API_KEY", "OPENCODE_GO_API_KEY"):
+                "OLLAMA_API_KEY", "OPENCODE_GO_API_KEY", "LLM_GATEWAY_API_KEY"):
         monkeypatch.delenv(var, raising=False)

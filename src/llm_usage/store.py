@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
   percent REAL,
   reset_at TEXT,
   unit TEXT,
-  is_manual INTEGER DEFAULT 0
+  is_manual INTEGER DEFAULT 0,
+  plan TEXT
 );
 CREATE TABLE IF NOT EXISTS users (
   username TEXT PRIMARY KEY,
@@ -66,6 +67,10 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p))
     conn.executescript(_SCHEMA)
+    # 平滑迁移既有库:snapshots 缺 plan 列则补上(SQLite 无 IF NOT EXISTS 的 ADD COLUMN)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
+    if "plan" not in cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN plan TEXT")
     return conn
 
 
@@ -77,20 +82,24 @@ def save_snapshot(
     results: list[PlatformResult],
     path: Path | None = None,
 ) -> int:
-    """Persist all entries from successful platforms. Returns row count."""
+    """Persist entries from complete successful platforms. Returns row count.
+
+    A warning means a grouped provider returned only a partial aggregate, so it
+    is deliberately not written as a normal historical snapshot.
+    """
     conn = _connect(path)
     ts = _now_iso()
     rows = 0
     try:
         for res in results:
-            if not res.ok or not res.entries:
+            if not res.ok or res.warning or not res.entries:
                 continue
             for e in res.entries:
                 conn.execute(
                     "INSERT INTO snapshots "
                     "(ts, platform, label, used, \"limit\", remaining, percent, "
-                    "reset_at, unit, is_manual) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "reset_at, unit, is_manual, plan) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         ts,
                         res.platform,
@@ -102,6 +111,7 @@ def save_snapshot(
                         e.reset_at,
                         e.unit,
                         1 if e.is_manual else 0,
+                        e.plan,
                     ),
                 )
                 rows += 1
@@ -123,7 +133,7 @@ def query_history(
     conn = _connect(path)
     try:
         sql = "SELECT ts, platform, label, used, \"limit\", remaining, percent, " \
-              "reset_at, unit, is_manual FROM snapshots"
+              "reset_at, unit, is_manual, plan FROM snapshots"
         clauses: list[str] = []
         params: list[Any] = []
         if platform:

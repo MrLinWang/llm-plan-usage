@@ -42,11 +42,16 @@ CREDENTIAL_FIELDS: dict[str, list[str]] = {
     "volcengine-agent": ["access_key", "secret_key"],
     "ollama": ["api_key"],
     "opencode-go": ["api_key"],
+    "llm-gateway": [],  # 纯组式:凭证以 groups[].api_keys 配置,无顶层凭证字段
 }
 
-# PUT /api/config/platforms/{key} 允许的字段超集
-_CONFIG_FIELDS = {"enabled", "display_name", "api_key", "access_key", "secret_key"}
+_CONFIG_FIELDS = {
+    "enabled", "display_name", "base_url", "api_key", "access_key", "secret_key",
+    "groups",
+}
 _CREDENTIAL_NAMES = {"api_key", "access_key", "secret_key"}
+_GATEWAY_GROUP_FIELDS = {"index", "name", "daily_limit", "api_keys"}
+_GATEWAY_KEY_FIELDS = {"index", "value"}
 
 # PUT /api/settings 允许的字段(站点策略,存 history.db settings 表)
 _SETTINGS_KEYS = {"registration_enabled"}
@@ -156,18 +161,336 @@ def _credential_view(raw: Any) -> dict[str, Any]:
     return {"set": True, "env": None, "hint": hint}
 
 
+def _gateway_group_key_values(group: dict[str, Any]) -> list[Any]:
+    """Read the supported group key aliases and return their raw values."""
+    values = group.get("api_keys")
+    if values is None:
+        values = group.get("keys")
+    if isinstance(values, str):
+        return [values]
+    if isinstance(values, list):
+        return values
+    envs = group.get("api_key_envs")
+    if isinstance(envs, str):
+        return [f"env:{envs}"]
+    if isinstance(envs, list):
+        return [f"env:{value}" for value in envs if isinstance(value, str)]
+    return []
+
+
+def _gateway_groups_view(section: dict[str, Any]) -> list[dict[str, Any]]:
+    groups = section.get("groups")
+    if not isinstance(groups, list):
+        groups = []
+    if not groups and isinstance(section.get("api_key"), str) and section["api_key"].strip():
+        # 兼容旧单 Key 配置:合成一组,Web 保存时即完成迁移
+        return [{
+            "index": 0,
+            "name": "组1",
+            "daily_limit": section.get("daily_limit"),
+            "api_keys": [_credential_view(section["api_key"])],
+        }]
+    views: list[dict[str, Any]] = []
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            continue
+        name = group.get("name") or group.get("label") or f"组{index + 1}"
+        views.append({
+            "index": index,
+            "name": str(name),
+            "daily_limit": group.get("daily_limit"),
+            "api_keys": [
+                _credential_view(value)
+                for value in _gateway_group_key_values(group)
+            ],
+        })
+    return views
+
+
+def _gateway_existing_group(
+    existing_groups: list[Any], index: Any, position: int,
+) -> dict[str, Any]:
+    source_index = index if isinstance(index, int) and not isinstance(index, bool) else position
+    if source_index < 0 or source_index >= len(existing_groups):
+        return {}
+    group = existing_groups[source_index]
+    return group if isinstance(group, dict) else {}
+
+
+def _gateway_preserved_key(old_keys: list[Any], index: Any) -> str:
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise ValueError("api_keys 的 index 必须是非负整数")
+    if index < 0 or index >= len(old_keys) or not isinstance(old_keys[index], str):
+        raise ValueError("要保留的 API key 不存在")
+    return old_keys[index]
+
+
+def _gateway_key_value(value: Any, old_keys: list[Any], position: int) -> str:
+    # null 或 {"index": n, "value": null} 表示保留已保存的 key；这样 Web
+    # 页面不需要把 literal secret 回传到浏览器或请求体。
+    if value is None:
+        return _gateway_preserved_key(old_keys, position)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return _gateway_preserved_key(old_keys, position)
+        if value == "env:" or value.startswith("env:") and not value[4:].strip():
+            raise ValueError("API key 的 env 引用不能为空")
+        return value
+    if not isinstance(value, dict):
+        raise ValueError("api_keys 中每项必须是字符串或对象")
+    extra = sorted(set(value) - _GATEWAY_KEY_FIELDS)
+    if extra:
+        raise ValueError("api_keys 未知字段: " + ", ".join(extra))
+    key_index = value.get("index", position)
+    raw_value = value.get("value")
+    if raw_value is None:
+        return _gateway_preserved_key(old_keys, key_index)
+    return _gateway_key_value(raw_value, old_keys, position)
+
+
+def _validate_gateway_groups(
+    raw_groups: Any, current_section: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Validate and canonicalize the Web groups payload without exposing keys."""
+    if not isinstance(raw_groups, list):
+        raise ValueError("groups 必须是数组")
+    if not raw_groups:
+        raise ValueError("至少需要一个分组")
+    existing = current_section.get("groups")
+    existing_groups = existing if isinstance(existing, list) else []
+    if not existing_groups and (
+        isinstance(current_section.get("api_key"), str)
+        and current_section["api_key"].strip()
+    ):
+        # 旧单 Key 配置:合成一组作为 keep/留空 的解析来源,首次保存即迁移
+        existing_groups = [{
+            "name": "组1",
+            "daily_limit": current_section.get("daily_limit"),
+            "api_keys": [current_section["api_key"]],
+        }]
+    names: set[str] = set()
+    seen_keys: set[str] = set()
+    groups: list[dict[str, Any]] = []
+    for position, raw_group in enumerate(raw_groups):
+        if not isinstance(raw_group, dict):
+            raise ValueError("groups 中每项必须是对象")
+        extra = sorted(set(raw_group) - _GATEWAY_GROUP_FIELDS)
+        if extra:
+            raise ValueError("group 未知字段: " + ", ".join(extra))
+        group_index = raw_group.get("index")
+        if group_index is not None and (
+            isinstance(group_index, bool) or not isinstance(group_index, int)
+            or group_index < 0
+        ):
+            raise ValueError("group 的 index 必须是非负整数")
+        name = raw_group.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
+            raise ValueError("分组名称需为 1-100 个字符")
+        name = name.strip()
+        if name in names:
+            raise ValueError(f"分组名称重复：{name}")
+        names.add(name)
+        old_group = _gateway_existing_group(existing_groups, raw_group.get("index"), position)
+        old_keys = _gateway_group_key_values(old_group)
+
+        canonical: dict[str, Any] = {"name": name}
+        if "daily_limit" in raw_group:
+            limit = raw_group["daily_limit"]
+            if limit is not None and (
+                isinstance(limit, bool) or not isinstance(limit, (int, float))
+                or not math.isfinite(float(limit)) or not float(limit) >= 0
+            ):
+                raise ValueError("daily_limit 必须是非负数字或 null")
+            if limit is not None:
+                canonical["daily_limit"] = limit
+        elif "daily_limit" in old_group and old_group["daily_limit"] is not None:
+            canonical["daily_limit"] = old_group["daily_limit"]
+
+        if "api_keys" not in raw_group:
+            raw_keys = old_keys
+            if not raw_keys:
+                raise ValueError(f"分组 {name} 至少需要一个 API key")
+            keys = []
+            for value in raw_keys:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"分组 {name} 包含无效 API key")
+                keys.append(value.strip())
+        else:
+            raw_keys = raw_group["api_keys"]
+            if not isinstance(raw_keys, list) or not raw_keys:
+                raise ValueError(f"分组 {name} 至少需要一个 API key")
+            keys = [_gateway_key_value(value, old_keys, key_position)
+                    for key_position, value in enumerate(raw_keys)]
+        for key in keys:
+            if key in seen_keys:
+                raise ValueError("同一个 API key 不能属于多个分组或重复配置")
+            seen_keys.add(key)
+        canonical["api_keys"] = keys
+        groups.append(canonical)
+    return groups
+
+
+def _credential_slots_view(section: dict[str, Any], fields: list[str]) -> list[dict[str, Any]]:
+    """凭证槽视图:每个槽 = 一个独立计费套餐的凭证,不返回明文。
+
+    - ``credentials`` 非空列表 → 每项一槽(index = 数组下标)。
+    - 否则顶层凭证字段任一非空 → 合成单槽(index 0, 无名称):
+      legacy 单 Key 以槽 0 呈现,Web 首次保存即迁移为 credentials 数组。
+    - 否则空列表(页面渲染默认一个空槽)。
+    """
+    slots = section.get("credentials")
+    if isinstance(slots, list) and slots:
+        views: list[dict[str, Any]] = []
+        for index, slot in enumerate(slots):
+            if not isinstance(slot, dict):
+                continue
+            views.append({
+                "index": index,
+                "name": slot.get("name") or None,
+                "credentials": {f: _credential_view(slot.get(f)) for f in fields},
+            })
+        return views
+    if any(
+        isinstance(section.get(f), str) and section.get(f).strip() for f in fields
+    ):
+        return [{
+            "index": 0,
+            "name": None,
+            "credentials": {f: _credential_view(section.get(f)) for f in fields},
+        }]
+    return []
+
+
+def _clear_top_level_credentials(key: str) -> dict[str, Any]:
+    """删除平台 section 的顶层凭证字段并保存,返回最终完整配置。
+
+    在 credentials 数组已写盘之后调用(先写后删,避免中间态);
+    cache.set_config 使用返回的最终配置。
+    """
+    from llm_usage.config import save_config
+
+    cfg = load_config()
+    section = cfg.get("platforms", {}).get(key)
+    if isinstance(section, dict):
+        for field in _CREDENTIAL_NAMES:
+            section.pop(field, None)
+        save_config(cfg)
+    return cfg
+
+
+def _existing_slot(
+    current_section: dict[str, Any], index: Any, position: int,
+) -> dict[str, Any]:
+    """取某槽的既有值来源:credentials[index],或 legacy 顶层凭证(仅 index 0)。"""
+    slots = current_section.get("credentials")
+    if isinstance(slots, list) and slots:
+        if not isinstance(index, int) or isinstance(index, bool):
+            return {}
+        if index < 0 or index >= len(slots) or not isinstance(slots[index], dict):
+            return {}
+        return slots[index]
+    if index == 0 or (index is None and position == 0):
+        return {
+            "name": None,
+            "api_key": current_section.get("api_key"),
+            "access_key": current_section.get("access_key"),
+            "secret_key": current_section.get("secret_key"),
+        }
+    return {}
+
+
+def _validate_credential_slots(
+    raw_slots: Any, current_section: dict[str, Any], fields: list[str],
+) -> list[dict[str, Any]]:
+    """Validate and canonicalize the Web credential slots payload.
+
+    Each slot = one independent billing plan.  Empty field values mean
+    "keep the existing value" (no value to keep → 400).  The canonical
+    output has no ``index`` and no empty values.
+    """
+    if not isinstance(raw_slots, list):
+        raise ValueError("credential_slots 必须是数组")
+    if not raw_slots:
+        raise ValueError("至少需要一个凭证")
+    allowed = {"index", "name"} | set(fields)
+    names: set[str] = set()
+    canonical: list[dict[str, Any]] = []
+    for position, raw_slot in enumerate(raw_slots):
+        if not isinstance(raw_slot, dict):
+            raise ValueError("credential_slots 中每项必须是对象")
+        extra = sorted(set(raw_slot) - allowed)
+        if extra:
+            raise ValueError("凭证未知字段: " + ", ".join(extra))
+        slot_index = raw_slot.get("index")
+        if slot_index is not None and (
+            isinstance(slot_index, bool) or not isinstance(slot_index, int)
+            or slot_index < 0
+        ):
+            raise ValueError("凭证的 index 必须是非负整数")
+        existing = _existing_slot(current_section, slot_index, position)
+
+        name = raw_slot.get("name")
+        if name is None or (isinstance(name, str) and not name.strip()):
+            # 留空 = 保留既有名称;无既有 → 默认 套餐N
+            name = existing.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = None
+        else:
+            if not isinstance(name, str):
+                raise ValueError("凭证名称需为字符串")
+            name = name.strip()
+            if not 1 <= len(name) <= 100:
+                raise ValueError("凭证名称需为 1-100 个字符")
+        if not name:
+            name = f"套餐{position + 1}"
+        if name in names:
+            raise ValueError(f"凭证名称重复：{name}")
+        names.add(name)
+
+        out_slot: dict[str, Any] = {"name": name}
+        for field in fields:
+            value = raw_slot.get(field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                # 留空 = 保留既有值
+                keep = existing.get(field)
+                if not isinstance(keep, str) or not keep.strip():
+                    raise ValueError(f"凭证 {name} 缺少 {field}")
+                out_slot[field] = keep
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"{field} 需为字符串")
+            value = value.strip()
+            if value.startswith("env:") and not value[4:].strip():
+                raise ValueError(f"{field} 的 env 引用不能为空")
+            out_slot[field] = value
+        # 完整性:每槽必须凭证齐全
+        if "api_key" in fields and not (out_slot.get("api_key") or "").strip():
+            raise ValueError(f"凭证 {name} 需要 API key")
+        if "access_key" in fields and "secret_key" in fields:
+            if not (out_slot.get("access_key") or "").strip() \
+                    or not (out_slot.get("secret_key") or "").strip():
+                raise ValueError(f"凭证 {name} 需要 AK/SK")
+        canonical.append(out_slot)
+    return canonical
+
+
 def _platform_view(key: str) -> dict[str, Any]:
     """从磁盘读最新配置,返回单个平台的可编辑视图。"""
     section = get_platform_config(load_config(), key)
-    return {
+    view = {
         "key": key,
         "display_name": section.get("display_name") or DISPLAY_NAMES[key],
         "enabled": section.get("enabled", True),
-        "credentials": {
-            field: _credential_view(section.get(field))
-            for field in CREDENTIAL_FIELDS[key]
-        },
     }
+    if CREDENTIAL_FIELDS[key]:
+        view["credential_slots"] = _credential_slots_view(
+            section, CREDENTIAL_FIELDS[key]
+        )
+    if key == "llm-gateway":
+        view["base_url"] = section.get("base_url")
+        view["groups"] = _gateway_groups_view(section)
+    return view
 
 
 def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
@@ -441,10 +764,22 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     ) -> dict[str, Any]:
         if key not in PROVIDERS:
             raise HTTPException(status_code=404, detail="未知平台")
-        extra = sorted(set(body) - _CONFIG_FIELDS)
+        extra = sorted(set(body) - _CONFIG_FIELDS - {"credential_slots"})
         if extra:
             raise HTTPException(
                 status_code=400, detail="未知字段: " + ", ".join(extra)
+            )
+        if "groups" in body and key != "llm-gateway":
+            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
+        if "base_url" in body and key != "llm-gateway":
+            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
+        if "credential_slots" in body and key == "llm-gateway":
+            raise HTTPException(
+                status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
+            )
+        if "credential_slots" in body and not CREDENTIAL_FIELDS[key]:
+            raise HTTPException(
+                status_code=400, detail=f"平台 {key} 不支持字段: credential_slots"
             )
         for field in _CREDENTIAL_NAMES & set(body):
             if field not in CREDENTIAL_FIELDS[key]:
@@ -457,13 +792,39 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         display_name = body.get("display_name")
         if isinstance(display_name, str) and display_name.strip():
             updates["display_name"] = display_name.strip()
+        if key == "llm-gateway":
+            base_url = body.get("base_url")
+            # 留空 = 不修改;仅非空字符串写回(与凭证字段约定一致)
+            if isinstance(base_url, str) and base_url.strip():
+                updates["base_url"] = base_url.strip()
         for field in CREDENTIAL_FIELDS[key]:
             value = body.get(field)
             # 留空 = 不修改;仅非空字符串写回
             if isinstance(value, str) and value.strip():
                 updates[field] = value.strip()
+        if "credential_slots" in body:
+            current_section = get_platform_config(load_config(), key)
+            try:
+                updates["credentials"] = _validate_credential_slots(
+                    body["credential_slots"], current_section, CREDENTIAL_FIELDS[key]
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if "groups" in body:
+            current_section = get_platform_config(load_config(), key)
+            try:
+                updates["groups"] = _validate_gateway_groups(
+                    body["groups"], current_section
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # 覆盖历史遗留的 use_groups=false:保存后 fetch 一定走分组模式
+            updates["use_groups"] = True
         if updates:
             new_config = update_platform_config(key, updates)
+            if "credential_slots" in body:
+                # 槽式保存后清除顶层凭证字段,避免双写不一致(先写后删,避免中间态)
+                new_config = _clear_top_level_credentials(key)
             cache.set_config(new_config)
         return _platform_view(key)
 

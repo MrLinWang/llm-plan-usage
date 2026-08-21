@@ -27,6 +27,10 @@ from llm_usage.providers.kimi import (
     _parse_usage_payload,
     _window_label,
 )
+from llm_usage.providers.llm_gateway import (
+    LlmGatewayProvider,
+    _parse_daily_usage,
+)
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
 from llm_usage.providers.volcengine import (
@@ -476,13 +480,270 @@ class TestOpenCodeGoHttp:
 
 
 # ---------------------------------------------------------------------------
+# LLM Gateway (local Sub2API-compatible gateway)
+# ---------------------------------------------------------------------------
+
+def _gateway_usage_payload() -> dict:
+    return {
+        "usage": {
+            "today": {
+                "requests": 64,
+                "input_tokens": 372417,
+                "output_tokens": 13854,
+                "cache_read_tokens": 3217408,
+                "total_tokens": 3603679,
+                "cost": "3.88",
+                "actual_cost": "1.94",
+                "remaining": "997859.27",
+            },
+            "daily_usage": [
+                {"date": "2026-08-19", "actual_cost": "0.51"},
+                {"date": "2026-08-20", "actual_cost": "1.94"},
+            ],
+        }
+    }
+
+
+class TestGatewayParsing:
+    def test_today_uses_actual_cost_not_list_price(self) -> None:
+        entries = _parse_daily_usage(_gateway_usage_payload(), "llm-gateway")
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry.label == "今日"
+        assert entry.used == 1.94
+        assert entry.unit == "$"
+        assert entry.limit is None
+        assert entry.percent is None
+
+    def test_daily_usage_is_fallback_when_today_missing(self) -> None:
+        entries = _parse_daily_usage(
+            {"usage": {"daily_usage": [{"actual_cost": "0.51"}, {"actual_cost": "1.94"}]}},
+            "llm-gateway",
+        )
+        assert entries[0].used == 1.94
+
+    def test_top_level_daily_usage_is_fallback(self) -> None:
+        entries = _parse_daily_usage(
+            {"usage": {}, "daily_usage": [{"actual_cost": "1.94"}]}, "llm-gateway"
+        )
+        assert entries[0].used == 1.94
+
+    def test_cost_is_fallback_for_older_payload(self) -> None:
+        entries = _parse_daily_usage(
+            {"usage": {"today": {"cost": "3.88"}}}, "llm-gateway"
+        )
+        assert entries[0].used == 3.88
+
+    def test_missing_cost_returns_no_entries(self) -> None:
+        assert _parse_daily_usage({"usage": {"today": {}}}, "llm-gateway") == []
+
+
+class TestGatewayHttp:
+    def test_fetch_reads_top_level_api_key_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GATEWAY_TEST_KEY", "secret")
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.path == "/v1/usage"
+            assert req.headers["Authorization"] == "Bearer secret"
+            return httpx.Response(200, json=_gateway_usage_payload())
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "api_key": "env:GATEWAY_TEST_KEY",
+            "base_url": "http://llm-gateway.test",
+            "_platform_key": "llm-gateway",
+            "display_name": "LLM Gateway",
+        })
+        assert result.ok
+        assert result.entries[0].used == 1.94
+
+    def test_fetch_uses_explicit_config_overrides(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.path == "/custom-usage"
+            assert req.headers["Authorization"] == "Bearer explicit"
+            return httpx.Response(200, json=_gateway_usage_payload())
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "api_key": "explicit",
+            "base_url": "http://llm-gateway.test",
+            "usage_path": "/custom-usage",
+        })
+        assert result.ok
+
+    def test_fetch_401_gives_hint(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"code": "INVALID_API_KEY"})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "api_key": "invalid",
+            "base_url": "http://llm-gateway.test",
+        })
+        assert not result.ok
+        assert "401" in result.error
+        assert "LLM_GATEWAY_API_KEY" in result.error
+
+    def test_no_key_returns_unconfigured(self) -> None:
+        result = LlmGatewayProvider().fetch({"base_url": "http://llm-gateway.test"})
+        assert not result.ok
+        assert result.error == "未配置 API key"
+
+    def test_no_base_url_returns_error(self) -> None:
+        result = LlmGatewayProvider().fetch({"api_key": "secret"})
+        assert not result.ok
+        assert result.error == "未配置 base_url"
+
+    def test_groups_sum_actual_cost_across_keys(self) -> None:
+        seen_auth: list[str] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen_auth.append(req.headers["Authorization"])
+            cost = "1.25" if req.headers["Authorization"] == "Bearer key-a" else "0.75"
+            return httpx.Response(200, json={"usage": {"today": {"actual_cost": cost}}})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [
+                {"name": "team-a", "daily_limit": 10, "api_keys": ["key-a", "key-b"]},
+            ],
+        })
+        assert result.ok
+        assert result.entries[0].label == "team-a"
+        assert result.entries[0].used == 2.0
+        assert result.entries[0].limit == 10.0
+        assert sorted(seen_auth) == ["Bearer key-a", "Bearer key-b"]
+
+    def test_groups_partial_failure_keeps_successful_sum_with_warning(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.headers["Authorization"] == "Bearer bad":
+                return httpx.Response(401)
+            return httpx.Response(200, json={"usage": {"today": {"actual_cost": "2"}}})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{"name": "team", "api_keys": ["good", "bad"]}],
+        })
+        assert result.ok
+        assert result.entries[0].used == 2.0
+        assert result.warning is not None
+        assert "team" in result.warning
+
+    def test_groups_all_keys_fail_sets_error(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(401)
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{"name": "team", "api_keys": ["bad-a", "bad-b"]}],
+        })
+        assert not result.ok
+        assert result.entries == []
+
+    def test_duplicate_key_across_groups_is_a_config_error(self) -> None:
+        provider = LlmGatewayProvider(client=_mock_client(lambda req: httpx.Response(200, json={})))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [
+                {"name": "a", "api_keys": ["shared"]},
+                {"name": "b", "api_keys": ["shared"]},
+            ],
+        })
+        assert not result.ok
+        assert "多个分组" in result.error
+
+    def test_groups_key_breakdown_records_each_key(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            auth = req.headers["Authorization"]
+            if auth == "Bearer key-b":
+                return httpx.Response(401)
+            cost = "1.25" if auth == "Bearer key-a" else "0.75"
+            return httpx.Response(200, json={"usage": {"today": {"actual_cost": cost}}})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{
+                "name": "team-a", "daily_limit": 10,
+                "api_keys": ["key-a", "key-b", "key-c"],
+            }],
+        })
+        assert result.ok
+        breakdown = result.entries[0].key_breakdown
+        assert breakdown is not None
+        by_number = {item["number"]: item for item in breakdown}
+        assert by_number[1] == {"number": 1, "used": 1.25, "ok": True, "error": None}
+        assert by_number[2]["ok"] is False
+        assert by_number[2]["used"] is None
+        assert "401" in by_number[2]["error"]
+        assert by_number[3] == {"number": 3, "used": 0.75, "ok": True, "error": None}
+
+    def test_single_key_entry_has_one_item_breakdown(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.94"}}})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({"base_url": "http://llm-gateway.test", "api_key": "solo"})
+        assert result.ok
+        breakdown = result.entries[0].key_breakdown
+        assert breakdown == [{"number": 1, "used": 1.94, "ok": True, "error": None}]
+
+    def test_use_groups_true_ignores_single_key(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.headers["Authorization"] == "Bearer group-key"
+            return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.25"}}})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        # api_key 已配置但被忽略:显式分组模式只走 groups
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "api_key": "solo-key",
+            "use_groups": True,
+            "groups": [{"name": "team", "api_keys": ["group-key"]}],
+        })
+        assert result.ok
+        assert result.entries[0].label == "team"
+
+    def test_use_groups_true_without_groups_is_error(self) -> None:
+        provider = LlmGatewayProvider(client=_mock_client(lambda req: httpx.Response(200, json={})))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test", "api_key": "solo",
+            "use_groups": True,
+        })
+        assert not result.ok
+        assert "分组" in result.error
+
+    def test_use_groups_false_ignores_stored_groups(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.headers["Authorization"] == "Bearer solo-key"
+            return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.94"}}})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        # 磁盘上还留着分组,但显式单 Key 模式忽略它们
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "api_key": "solo-key",
+            "use_groups": False,
+            "groups": [{"name": "team", "api_keys": ["group-key"]}],
+        })
+        assert result.ok
+        assert result.entries[0].label == "今日"
+        assert result.entries[0].used == 1.94
+
+
+# ---------------------------------------------------------------------------
 # Registry / dispatch
 # ---------------------------------------------------------------------------
 
 class TestRegistry:
-    def test_all_five_providers_registered(self) -> None:
+    def test_all_six_providers_registered(self) -> None:
         assert set(PROVIDERS.keys()) == {
-            "kimi", "volcengine-coding", "volcengine-agent", "ollama", "opencode-go"
+            "kimi", "volcengine-coding", "volcengine-agent", "ollama", "opencode-go", "llm-gateway"
         }
 
     def test_env_prefix_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -552,3 +813,151 @@ class TestRegistry:
             "platform_order": ["ghost", "ollama"],
         }
         assert [r.platform for r in fetch_all(cfg)] == ["ollama", "kimi", "opencode-go"]
+
+
+class TestRegistryCredentialFanout:
+    """credentials 数组 → 每凭证独立 fetch,合并为一个 PlatformResult 并标注 plan。"""
+
+    def _kimi_with_handler(self, handler) -> KimiProvider:
+        return KimiProvider(client=_mock_client(handler))
+
+    def test_fetch_all_credentials_fanout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """两凭证各自 fetch(不同 Authorization),entries 按凭证标注 plan。"""
+        seen_auth: list[str] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen_auth.append(req.headers["Authorization"])
+            return httpx.Response(200, json=_kimi_payload_5h_and_week())
+
+        monkeypatch.setattr(
+            "llm_usage.providers.PROVIDERS",
+            {"kimi": self._kimi_with_handler(handler)},
+        )
+        cfg = {
+            "platforms": {
+                "kimi": {
+                    "enabled": True,
+                    "credentials": [
+                        {"name": "套餐A", "api_key": "key-a"},
+                        {"name": "套餐B", "api_key": "key-b"},
+                    ],
+                }
+            }
+        }
+        results = fetch_all(cfg)
+        assert len(results) == 1
+        res = results[0]
+        assert res.ok
+        assert sorted(seen_auth) == ["Bearer key-a", "Bearer key-b"]
+        assert len(res.entries) == 4  # 每凭证 2 条
+        assert {e.plan for e in res.entries} == {"套餐A", "套餐B"}
+        # 合并顺序 = 凭证配置顺序
+        assert [e.plan for e in res.entries] == ["套餐A", "套餐A", "套餐B", "套餐B"]
+
+    def test_fetch_all_credentials_partial_failure(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """部分凭证失败 → result 仍 OK,失败以 warning 呈现,plan 只标成功方。"""
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.headers["Authorization"] == "Bearer key-b":
+                return httpx.Response(401)
+            return httpx.Response(200, json=_kimi_payload_5h_and_week())
+
+        monkeypatch.setattr(
+            "llm_usage.providers.PROVIDERS",
+            {"kimi": self._kimi_with_handler(handler)},
+        )
+        cfg = {
+            "platforms": {
+                "kimi": {
+                    "enabled": True,
+                    "credentials": [
+                        {"name": "套餐A", "api_key": "key-a"},
+                        {"name": "套餐B", "api_key": "key-b"},
+                    ],
+                }
+            }
+        }
+        results = fetch_all(cfg)
+        assert len(results) == 1
+        res = results[0]
+        assert res.ok
+        assert res.warning is not None
+        assert "套餐B" in res.warning
+        assert len(res.entries) == 2
+        assert {e.plan for e in res.entries} == {"套餐A"}
+
+    def test_fetch_all_credentials_all_failed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """全部失败 → error 汇总各凭证的失败原因。"""
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(401)
+
+        monkeypatch.setattr(
+            "llm_usage.providers.PROVIDERS",
+            {"kimi": self._kimi_with_handler(handler)},
+        )
+        cfg = {
+            "platforms": {
+                "kimi": {
+                    "enabled": True,
+                    "credentials": [
+                        {"name": "套餐A", "api_key": "key-a"},
+                        {"name": "套餐B", "api_key": "key-b"},
+                    ],
+                }
+            }
+        }
+        results = fetch_all(cfg)
+        assert len(results) == 1
+        res = results[0]
+        assert not res.ok
+        assert "套餐A" in res.error and "套餐B" in res.error
+
+    def test_fetch_all_credentials_default_name(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """槽无 name → plan 缺省为 套餐N。"""
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_kimi_payload_5h_and_week())
+
+        monkeypatch.setattr(
+            "llm_usage.providers.PROVIDERS",
+            {"kimi": self._kimi_with_handler(handler)},
+        )
+        cfg = {
+            "platforms": {
+                "kimi": {
+                    "enabled": True,
+                    "credentials": [{"api_key": "key-a"}],
+                }
+            }
+        }
+        results = fetch_all(cfg)
+        assert len(results) == 1
+        assert {e.plan for e in results[0].entries} == {"套餐1"}
+
+    def test_fetch_all_credentials_empty_list_uses_legacy_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """空 credentials 列表 → 顶层单凭证路径,plan 为 None。"""
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.headers["Authorization"] == "Bearer top-key"
+            return httpx.Response(200, json=_kimi_payload_5h_and_week())
+
+        monkeypatch.setattr(
+            "llm_usage.providers.PROVIDERS",
+            {"kimi": self._kimi_with_handler(handler)},
+        )
+        cfg = {
+            "platforms": {
+                "kimi": {"enabled": True, "api_key": "top-key", "credentials": []},
+            }
+        }
+        results = fetch_all(cfg)
+        assert len(results) == 1
+        res = results[0]
+        assert res.ok
+        assert len(res.entries) == 2
+        assert all(e.plan is None for e in res.entries)

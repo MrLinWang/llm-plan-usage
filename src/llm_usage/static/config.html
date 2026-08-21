@@ -124,7 +124,7 @@
   label { display: grid; gap: 5px; color: var(--dim); font-size: 13px; }
   label.check { display: flex; align-items: center; gap: 8px; }
   label.check input { width: auto; }
-  input[type="text"], input[type="password"] {
+  input[type="text"], input[type="password"], input[type="number"] {
     font: inherit;
     color: var(--fg);
     background: var(--bg);
@@ -133,9 +133,53 @@
     padding: 7px 10px;
     width: 100%;
   }
-  input[type="text"]:focus, input[type="password"]:focus {
+  input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus {
     outline: none;
     border-color: var(--cyan);
+  }
+  .groups-editor {
+    display: grid;
+    gap: 9px;
+    margin-top: 2px;
+    padding-top: 12px;
+    border-top: 1px solid var(--sep);
+  }
+  .group-editor {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--sep);
+    border-radius: 9px;
+    background: var(--hover);
+  }
+  .group-head, .group-actions, .key-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .group-head label { flex: 1; }
+  .group-head label.limit { max-width: 180px; }
+  .key-row input { flex: 1; }
+  .key-row button, .group-actions button {
+    flex: none;
+    padding: 5px 10px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--dim);
+    background: transparent;
+    border: 1px solid var(--sep);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .key-row button:hover, .group-actions button:hover {
+    color: var(--fg);
+    border-color: var(--dim);
+  }
+  .group-actions { justify-content: space-between; }
+  .group-actions .danger { color: var(--red); }
+  @media (max-width: 620px) {
+    .group-head { align-items: stretch; flex-direction: column; }
+    .group-head label.limit { max-width: none; }
   }
   .hint { font-size: 12px; color: var(--dim); }
   .card-foot { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
@@ -236,14 +280,25 @@ function el(tag, cls, text) {
 
 // 凭证输入框 placeholder:env 引用原样显示;已设置的字面量显示脱敏提示;否则未设置
 function placeholderOf(cred) {
+  if (!cred) return "未设置";
   if (cred.env) return "当前: " + cred.env;
   if (cred.set) return "已设置 (" + cred.hint + ")";
   return "未设置";
 }
 
+// 各平台凭证槽字段(与服务端 CREDENTIAL_FIELDS 一致);每个槽 = 一个独立计费套餐
+var SLOT_FIELDS = {
+  "kimi": ["api_key"],
+  "volcengine-coding": ["access_key", "secret_key"],
+  "volcengine-agent": ["access_key", "secret_key"],
+  "ollama": ["api_key"],
+  "opencode-go": ["api_key"],
+};
+
 // ---- 平台卡片 ----
-// 每张卡片:标题(display_name + key)、启用 checkbox、凭证输入框、保存按钮。
-// 凭证输入留空 = 不修改;保存后服务端使缓存失效,下次刷新生效。
+// 每张卡片:标题(display_name + key)、启用 checkbox、凭证编辑区、保存按钮。
+// 非 gateway 平台 = 凭证槽编辑器(每槽一个套餐);gateway = base_url 输入 + 分组编辑器。
+// 输入留空 = 不修改;保存后服务端使缓存失效,下次刷新生效。
 
 function platformCard(p) {
   var card = el("div", "card platform");
@@ -270,21 +325,230 @@ function platformCard(p) {
   enableLabel.appendChild(document.createTextNode("启用"));
   fields.appendChild(enableLabel);
 
-  var inputs = {};  // field -> input 元素
-  Object.keys(p.credentials).forEach(function (field) {
-    var cred = p.credentials[field];
-    var label = el("label", "", field);
-    var input = document.createElement("input");
-    input.type = "text";
-    input.autocomplete = "off";
-    input.placeholder = placeholderOf(cred);
-    inputs[field] = input;
-    label.appendChild(input);
-    fields.appendChild(label);
-  });
+  var slotEditors = [];
+  var slotFields = SLOT_FIELDS[p.key] || null;
 
-  fields.appendChild(el("div", "hint", "留空保持不变;支持 env:VARNAME 引用环境变量"));
-  card.appendChild(fields);
+  var renderSlots = function (slots) {
+    if (!slotFields) return;
+    if (!Array.isArray(slots) || !slots.length) {
+      slots = [{ index: null, name: null, credentials: {} }];
+    }
+    slotEditors = [];
+    slotsEditor.textContent = "";
+    slots.forEach(function (slot, position) {
+      var box = el("div", "group-editor");
+      var head = el("div", "group-head");
+      var nameLabel = el("label", "", "套餐名");
+      var nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.autocomplete = "off";
+      nameInput.placeholder = "套餐名（可选）";
+      if (slot.name) nameInput.value = slot.name;
+      nameLabel.appendChild(nameInput);
+      head.appendChild(nameLabel);
+      box.appendChild(head);
+
+      var slotFieldsEl = el("div", "fields");
+      var slotInputs = {};
+      slotFields.forEach(function (field) {
+        var cred = (slot.credentials || {})[field];
+        var label = el("label", "", field);
+        var input = document.createElement("input");
+        input.type = "text";
+        input.autocomplete = "off";
+        input.placeholder = placeholderOf(cred);
+        slotInputs[field] = input;
+        label.appendChild(input);
+        slotFieldsEl.appendChild(label);
+      });
+      box.appendChild(slotFieldsEl);
+
+      var actions = el("div", "group-actions");
+      var removeSlot = el("button", "danger", "删除此凭证");
+      removeSlot.type = "button";
+      removeSlot.addEventListener("click", function () {
+        box.remove();
+        slotEditors = slotEditors.filter(function (item) { return item.box !== box; });
+      });
+      actions.appendChild(removeSlot);
+      box.appendChild(actions);
+      slotsEditor.appendChild(box);
+
+      slotEditors.push({
+        box: box,
+        originalIndex: slot.index,
+        nameInput: nameInput,
+        inputs: slotInputs,
+      });
+    });
+    var addSlot = el("button", "", addSlotLabel);
+    addSlot.type = "button";
+    addSlot.addEventListener("click", function () {
+      var current = slotEditorsToSlots();
+      current.push({ index: null, name: null, credentials: {} });
+      renderSlots(current);
+    });
+    slotsEditor.appendChild(addSlot);
+  };
+
+  // 当前编辑器内容 → 槽数组(每字段空串 → null = 保留)
+  function slotEditorsToSlots() {
+    return slotEditors.map(function (editor) {
+      var slot = { index: editor.originalIndex, name: null };
+      if (editor.nameInput && editor.nameInput.value.trim()) {
+        slot.name = editor.nameInput.value.trim();
+      }
+      slotFields.forEach(function (field) {
+        var value = editor.inputs[field].value.trim();
+        slot[field] = value || null;
+      });
+      return slot;
+    });
+  }
+
+  var groupEditors = [];
+  var renderGroups = function () {};
+  var slotsEditor = null;
+  var addSlotLabel = "添加凭证";
+  var baseUrlInput = null;
+  if (slotFields) {
+    if (p.key === "volcengine-coding" || p.key === "volcengine-agent") {
+      addSlotLabel = "添加 AK/SK";
+    }
+    slotsEditor = el("div", "groups-editor");
+    fields.appendChild(slotsEditor);
+    renderSlots(p.credential_slots || []);
+  } else if (p.key === "llm-gateway") {
+    // base_url 是 gateway 的必填配置,直接在此编辑
+    var baseUrlLabel = el("label", "", "base_url");
+    baseUrlInput = document.createElement("input");
+    baseUrlInput.type = "text";
+    baseUrlInput.autocomplete = "off";
+    baseUrlInput.placeholder = "http://127.0.0.1:18080";
+    if (p.base_url) baseUrlInput.value = p.base_url;
+    baseUrlLabel.appendChild(baseUrlInput);
+    fields.appendChild(baseUrlLabel);
+    var serverGroups = p.groups || [];
+    var groupsEditor = el("div", "groups-editor");
+    fields.appendChild(groupsEditor);
+    renderGroups = function (groups) {
+      if (!Array.isArray(groups) || !groups.length) {
+        // 默认一组:一个 key 输入框 + 每日限额
+        groups = [{ name: "组1", daily_limit: null, api_keys: [] }];
+      }
+      groupEditors = [];
+      groupsEditor.textContent = "";
+      groups.forEach(function (group, position) {
+        var box = el("div", "group-editor");
+        var head = el("div", "group-head");
+        var nameLabel = el("label", "", "分组名称");
+        var nameInput = document.createElement("input");
+        nameInput.type = "text";
+        nameInput.value = group.name || ("组" + (position + 1));
+        nameInput.autocomplete = "off";
+        nameLabel.appendChild(nameInput);
+        head.appendChild(nameLabel);
+
+        var limitLabel = el("label", "limit", "每日限额 ($)");
+        var limitInput = document.createElement("input");
+        limitInput.type = "number";
+        limitInput.min = "0";
+        limitInput.step = "any";
+        limitInput.value = group.daily_limit === null || group.daily_limit === undefined
+          ? "" : String(group.daily_limit);
+        limitLabel.appendChild(limitInput);
+        head.appendChild(limitLabel);
+        box.appendChild(head);
+
+        var keysEl = el("div", "fields");
+        var rows = [];
+        function addKey(cred, existingIndex, initialValue) {
+          if (cred && Object.prototype.hasOwnProperty.call(cred, "value")) {
+            existingIndex = cred.index;
+            initialValue = cred.value || "";
+            cred = null;
+          }
+          var row = el("div", "key-row");
+          var input = document.createElement("input");
+          input.type = "text";
+          input.autocomplete = "off";
+          input.placeholder = cred ? placeholderOf(cred) : "API key 或 env:VARNAME";
+          if (initialValue) input.value = initialValue;
+          var remove = el("button", "", "删除");
+          remove.type = "button";
+          remove.addEventListener("click", function () {
+            row.remove();
+            var rowIndex = rows.indexOf(row);
+            if (rowIndex >= 0) rows.splice(rowIndex, 1);
+          });
+          row.appendChild(input);
+          row.appendChild(remove);
+          keysEl.appendChild(row);
+          rows.push({ row: row, input: input, existingIndex: existingIndex });
+        }
+        var groupKeys = Array.isArray(group.api_keys) ? group.api_keys : [];
+        if (groupKeys.length) {
+          groupKeys.forEach(function (cred, keyIndex) { addKey(cred, keyIndex); });
+        } else {
+          addKey(null, null);  // 每组默认一个 API key 输入框
+        }
+        var addKeyButton = el("button", "", "添加共享 Key");
+        addKeyButton.type = "button";
+        addKeyButton.addEventListener("click", function () { addKey(null, null); });
+        keysEl.appendChild(addKeyButton);
+        box.appendChild(keysEl);
+
+        var actions = el("div", "group-actions");
+        var removeGroup = el("button", "danger", "删除此分组");
+        removeGroup.type = "button";
+        removeGroup.addEventListener("click", function () {
+          box.remove();
+          groupEditors = groupEditors.filter(function (item) { return item.box !== box; });
+        });
+        actions.appendChild(removeGroup);
+        box.appendChild(actions);
+        groupsEditor.appendChild(box);
+
+        groupEditors.push({
+          box: box,
+          originalIndex: group.index,
+          nameInput: nameInput,
+          limitInput: limitInput,
+          rows: rows,
+        });
+      });
+      var addGroup = el("button", "", "添加组");
+      addGroup.type = "button";
+      addGroup.addEventListener("click", function () {
+        var current = groupEditors.map(function (editor) {
+          var currentGroup = {
+            name: editor.nameInput.value.trim(),
+            daily_limit: editor.limitInput.value.trim() === ""
+              ? null : Number(editor.limitInput.value),
+            api_keys: editor.rows.map(function (row) {
+              var value = row.input.value.trim();
+              if (row.existingIndex !== null && row.existingIndex !== undefined) {
+                return { index: row.existingIndex, value: value || null };
+              }
+              return value ? { index: null, value: value } : null;
+            }).filter(function (value) { return value !== null; }),
+          };
+          if (editor.originalIndex !== null && editor.originalIndex !== undefined) {
+            currentGroup.index = editor.originalIndex;
+          }
+          return currentGroup;
+        });
+        current.push({
+          name: "组" + (current.length + 1), daily_limit: null, api_keys: [], index: null,
+        });
+        renderGroups(current);
+      });
+      groupsEditor.appendChild(addGroup);
+    };
+    renderGroups(serverGroups);
+  }
+
+  fields.appendChild(el("div", "hint", "留空保持不变；支持 env:VARNAME 引用环境变量"));  card.appendChild(fields);
 
   var foot = el("div", "card-foot");
   var save = el("button", "btn", "保存");
@@ -297,7 +561,34 @@ function platformCard(p) {
     save.disabled = true;
     try {
       var body = { enabled: enableBox.checked };
-      Object.keys(inputs).forEach(function (field) { body[field] = inputs[field].value; });
+      if (slotFields) {
+        body.credential_slots = slotEditorsToSlots();
+      }
+      if (p.key === "llm-gateway") {
+        if (baseUrlInput && baseUrlInput.value.trim()) {
+          body.base_url = baseUrlInput.value.trim();
+        }
+        body.groups = groupEditors.map(function (editor) {
+          var group = { name: editor.nameInput.value.trim(), api_keys: [] };
+          if (editor.originalIndex !== null && editor.originalIndex !== undefined) {
+            group.index = editor.originalIndex;
+          }
+          var limit = editor.limitInput.value.trim();
+          group.daily_limit = limit === "" ? null : Number(limit);
+          editor.rows.forEach(function (row) {
+            var value = row.input.value.trim();
+            if (row.existingIndex === null || row.existingIndex === undefined) {
+              if (value) group.api_keys.push(value);
+            } else {
+              group.api_keys.push({
+                index: row.existingIndex,
+                value: value || null,
+              });
+            }
+          });
+          return group;
+        });
+      }
       var r = await api("/api/config/platforms/" + encodeURIComponent(p.key), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -305,13 +596,20 @@ function platformCard(p) {
       });
       if (!r.ok) { errEl.textContent = await detailOf(r); return; }
       var updated = await r.json();
-      // 用服务端返回的视图刷新输入框(清空 + 新 placeholder)
-      Object.keys(updated.credentials).forEach(function (field) {
-        inputs[field].value = "";
-        inputs[field].placeholder = placeholderOf(updated.credentials[field]);
-      });
+      // 用服务端返回的视图刷新(清空输入 + 新 placeholder)
+      if (slotFields) {
+        renderSlots(updated.credential_slots || []);
+      }
+      if (p.key === "llm-gateway") {
+        serverGroups = updated.groups || [];
+        renderGroups(serverGroups);
+        if (baseUrlInput) {
+          baseUrlInput.value = "";
+          baseUrlInput.placeholder = updated.base_url || "http://127.0.0.1:18080";
+        }
+      }
       enableBox.checked = !!updated.enabled;
-      okEl.textContent = "已保存,下次刷新生效";
+      okEl.textContent = "已保存，下次刷新生效";
     } catch (e) {
       if (e && e.message !== "未登录") errEl.textContent = String(e.message || e);
     } finally {

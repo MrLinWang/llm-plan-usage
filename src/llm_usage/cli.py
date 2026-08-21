@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.syntax import Syntax
 
 from llm_usage import config as config_mod
-from llm_usage.display import render_history, render_results, results_to_json
+from llm_usage.display import render_history, render_key_breakdown, render_results, results_to_json
 from llm_usage.models import PlatformResult
 from llm_usage.providers import PROVIDERS, fetch_all
 from llm_usage.store import query_history, save_snapshot
@@ -39,7 +39,9 @@ def main() -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output JSON for scripting.")
 @click.option("--plain", is_flag=True, help="Plain text table (no box).")
 @click.option("--no-save", is_flag=True, help="Do not persist a snapshot to history.")
-def show(as_json: bool, plain: bool, no_save: bool) -> None:
+@click.option("--keys", "show_keys", is_flag=True,
+              help="Also show per-key usage detail for multi-key groups (e.g. llm-gateway).")
+def show(as_json: bool, plain: bool, no_save: bool, show_keys: bool) -> None:
     """Fetch all platforms and display current usage."""
     cfg = _load()
     if not cfg.get("platforms"):
@@ -50,6 +52,8 @@ def show(as_json: bool, plain: bool, no_save: bool) -> None:
         click.echo(results_to_json(results))
     else:
         render_results(results, console=console, plain=plain)
+        if show_keys:
+            render_key_breakdown(results, console=console)
     if not no_save:
         save_snapshot(results)
     # exit 1 if any platform errored

@@ -85,6 +85,7 @@
   .platform-name { font-weight: bold; }
   .platform-err, .platform-empty { padding: 2px 0; }
   .platform-err { color: var(--red); }
+  .platform-warning { padding: 2px 0 8px; color: var(--yellow); }
   .pill-btn {
     flex: none;
     padding: 5px 16px;
@@ -215,7 +216,9 @@
   tbody tr:not(.bar-row):hover td { background: var(--hover); }
   .bold { font-weight: bold; }
   .dim { color: var(--dim); }
+  .plan-head td { padding-top: 8px; font-weight: 600; }
   .red { color: var(--red); }
+  .yellow { color: var(--yellow); }
   .ok { color: var(--green); font-weight: 600; }
   .bar-row td { padding-top: 0; padding-bottom: 5px; }
   .bar-wrap { display: flex; align-items: center; gap: 10px; }
@@ -513,8 +516,8 @@ function platformCard(p) {
   var name = el("span", "platform-name");
   name.textContent = p.display_name;
   head.appendChild(name);
-  var state = el("span", p.error ? "red" : "ok");
-  state.textContent = p.error ? "错误" : "OK";
+  var state = el("span", p.error ? "red" : p.warning ? "yellow" : "ok");
+  state.textContent = p.error ? "错误" : p.warning ? "提示" : "OK";
   head.appendChild(state);
   card.appendChild(head);
   if (p.error) {
@@ -522,6 +525,11 @@ function platformCard(p) {
     err.textContent = p.error;
     card.appendChild(err);
     return card;
+  }
+  if (p.warning) {
+    var warning = el("div", "platform-warning");
+    warning.textContent = "提示：" + p.warning;
+    card.appendChild(warning);
   }
   if (!p.entries || p.entries.length === 0) {
     var empty = el("div", "platform-empty dim");
@@ -531,9 +539,16 @@ function platformCard(p) {
   }
   var frag = entryTableTpl.content.cloneNode(true);
   var body = frag.querySelector("tbody");
+  var prevPlan = null;
   p.entries.forEach(function (entry) {
+    if (entry.plan && entry.plan !== prevPlan) {
+      var planRow = el("tr", "plan-head");
+      planRow.appendChild(td(entry.plan, "dim", 6));
+      body.appendChild(planRow);
+    }
     body.appendChild(dataRow(entry));
     body.appendChild(barRow(entry.percent));
+    prevPlan = entry.plan;
   });
   card.appendChild(frag);
   return card;

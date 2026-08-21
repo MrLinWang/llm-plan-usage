@@ -31,6 +31,11 @@ EXAMPLE_CONFIG = """\
 enabled = true
 api_key = "env:KIMI_API_KEY"            # or "sk-kimi-xxx"
 base_url = "https://api.kimi.com/coding/v1"
+# 多计费套餐:同一平台可有多个独立凭证(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.kimi.credentials]]
+# name = "套餐A"
+# api_key = "env:KIMI_API_KEY_A"
 
 [platforms.volcengine-coding]
 enabled = true
@@ -39,6 +44,12 @@ secret_key = "env:VOLCENGINE_SECRET_KEY"   # 火山引擎 SK
 plan_type = "coding"                       # coding | agent
 tier = "pro"                                # lite | pro
 # limits = { "session" = 6000, "weekly" = 45000, "monthly" = 90000 }
+# 多计费套餐:同一平台可有多个独立 AK/SK(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.volcengine-coding.credentials]]
+# name = "套餐A"
+# access_key = "env:VOLCENGINE_ACCESS_KEY_A"
+# secret_key = "env:VOLCENGINE_SECRET_KEY_A"
 
 [platforms.volcengine-agent]
 enabled = true
@@ -47,14 +58,40 @@ secret_key = "env:VOLCENGINE_SECRET_KEY"
 plan_type = "agent"
 tier = "medium"                             # small | medium | large | max
 # limits = { "5h" = 6000, "weekly" = 45000, "monthly" = 90000 }
+# 多计费套餐:同一平台可有多个独立 AK/SK(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.volcengine-agent.credentials]]
+# name = "套餐A"
+# access_key = "env:VOLCENGINE_ACCESS_KEY_A"
+# secret_key = "env:VOLCENGINE_SECRET_KEY_A"
 
 [platforms.ollama]
 enabled = true
 api_key = "env:OLLAMA_API_KEY"           # Ollama Cloud API key
+# 多计费套餐:同一平台可有多个独立凭证(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.ollama.credentials]]
+# name = "套餐A"
+# api_key = "env:OLLAMA_API_KEY_A"
 
 [platforms.opencode-go]
 enabled = true
 api_key = "env:OPENCODE_GO_API_KEY"       # OpenCode Go API key
+# 多计费套餐:同一平台可有多个独立凭证(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.opencode-go.credentials]]
+# name = "套餐A"
+# api_key = "env:OPENCODE_GO_API_KEY_A"
+
+[platforms.llm-gateway]
+enabled = true
+base_url = "http://127.0.0.1:18080"      # gateway base URL
+# API keys 以组为单位配置,每组共享一个每日限额;可在 Web「供应商配置」页维护,
+# 或手工编辑:
+[[platforms.llm-gateway.groups]]
+name = "组1"
+# daily_limit = 100
+api_keys = ["env:LLM_GATEWAY_API_KEY"]
 """
 
 

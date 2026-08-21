@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>登录 - LLM 用量总览</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20x='1.5'%20y='12'%20width='3'%20height='6'%20rx='1'%20fill='%2356b6c2'/%3E%3Crect%20x='6'%20y='9'%20width='3'%20height='9'%20rx='1'%20fill='%23ffb300'/%3E%3Crect%20x='10.5'%20y='6'%20width='3'%20height='12'%20rx='1'%20fill='%234caf50'/%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #16181d;
@@ -133,6 +134,9 @@
   .btn:hover { filter: brightness(1.12); }
   .btn:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
   .form-err { color: var(--red); font-size: 13px; min-height: 1.2em; }
+  .switch { margin-top: 2px; padding-bottom: 6px; }
+  .switch a { color: var(--cyan); text-decoration: none; font-size: 13px; }
+  #switch-wrap[hidden] { display: none; }
 </style>
 <script>
 // 首屏前确定主题,避免闪烁:localStorage 优先,其次系统偏好,默认深色。
@@ -166,6 +170,7 @@
       </label>
       <div id="error" class="form-err"></div>
       <button id="submit" class="btn" type="submit">登录</button>
+      <div id="switch-wrap" class="switch" hidden><a id="switch-mode" href="#">没有账号?注册</a></div>
     </form>
   </div>
 </div>
@@ -192,16 +197,41 @@ syncThemeButton();
 // ---- 登录 / 初始化 ----
 // needs_setup(无用户)时本页兼任首个管理员创建页。
 var needsSetup = false;
+var registerMode = false;
+var registrationEnabled = false;
 var titleEl = document.getElementById("title");
 var submitEl = document.getElementById("submit");
 var errorEl = document.getElementById("error");
+var switchWrap = document.getElementById("switch-wrap");
+var switchMode = document.getElementById("switch-mode");
+var passwordEl = document.getElementById("password");
 
 fetch("/api/auth/state").then(function (r) { return r.json(); }).then(function (s) {
   needsSetup = !!s.needs_setup;
+  registrationEnabled = !!s.registration_enabled;
   if (needsSetup) {
     titleEl.textContent = "创建管理员";
     submitEl.textContent = "创建并登录";
-    document.getElementById("password").autocomplete = "new-password";
+    passwordEl.autocomplete = "new-password";
+  } else if (registrationEnabled) {
+    switchWrap.hidden = false;
+  }
+});
+
+switchMode.addEventListener("click", function (ev) {
+  ev.preventDefault();
+  registerMode = !registerMode;
+  errorEl.textContent = "";
+  if (registerMode) {
+    titleEl.textContent = "注册";
+    submitEl.textContent = "注册并登录";
+    passwordEl.autocomplete = "new-password";
+    switchMode.textContent = "已有账号?登录";
+  } else {
+    titleEl.textContent = "登录";
+    submitEl.textContent = "登录";
+    passwordEl.autocomplete = "current-password";
+    switchMode.textContent = "没有账号?注册";
   }
 });
 
@@ -210,7 +240,7 @@ document.getElementById("auth-form").addEventListener("submit", async function (
   errorEl.textContent = "";
   submitEl.disabled = true;
   try {
-    var r = await fetch(needsSetup ? "/api/auth/setup" : "/api/auth/login", {
+    var r = await fetch(needsSetup ? "/api/auth/setup" : registerMode ? "/api/auth/register" : "/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>用户管理 - LLM 用量总览</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20x='1.5'%20y='12'%20width='3'%20height='6'%20rx='1'%20fill='%2356b6c2'/%3E%3Crect%20x='6'%20y='9'%20width='3'%20height='9'%20rx='1'%20fill='%23ffb300'/%3E%3Crect%20x='10.5'%20y='6'%20width='3'%20height='12'%20rx='1'%20fill='%234caf50'/%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #16181d;
@@ -222,6 +223,14 @@
   </div>
 
   <div class="card">
+    <div class="section-title">注册设置</div>
+    <label class="check">
+      <input id="reg-enabled" type="checkbox"> 允许访客在登录页注册账号(注册账号均为普通用户)
+    </label>
+    <div id="reg-err" class="form-err"></div>
+  </div>
+
+  <div class="card">
     <div class="section-title">修改我的密码</div>
     <form id="password-form">
       <label>原密码
@@ -392,12 +401,38 @@ document.getElementById("password-form").addEventListener("submit", async functi
   okEl.textContent = "密码已修改,其他登录会话已失效";
 });
 
+// ---- 注册开关:勾选即保存(与仪表盘 interval 下拉的即时生效模式一致) ----
+var regBox = document.getElementById("reg-enabled");
+var regErr = document.getElementById("reg-err");
+
+async function loadSettings() {
+  var r = await api("/api/settings");
+  if (!r.ok) { regErr.textContent = await detailOf(r); return; }
+  regBox.checked = !!(await r.json()).registration_enabled;
+}
+
+regBox.addEventListener("change", async function () {
+  regErr.textContent = "";
+  regBox.disabled = true;
+  try {
+    var r = await api("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ registration_enabled: regBox.checked }),
+    });
+    if (!r.ok) { regErr.textContent = await detailOf(r); regBox.checked = !regBox.checked; }  // 失败回退
+  } finally {
+    regBox.disabled = false;
+  }
+});
+
 // ---- 启动 ----
 api("/api/auth/state").then(function (r) { return r.json(); }).then(function (s) {
   if (!s.authenticated) { location.href = "/login"; return; }
   if (!s.user || !s.user.is_admin) { location.href = "/"; return; }
   me = s.user.username;
   loadUsers();
+  loadSettings();
 });
 </script>
 </body>

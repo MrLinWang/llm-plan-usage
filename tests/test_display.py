@@ -17,7 +17,7 @@ from llm_usage.display import (
     results_to_json,
 )
 from llm_usage.models import PlatformResult, UsageEntry
-from llm_usage.store import query_history, save_snapshot
+from llm_usage.store import get_setting, query_history, save_snapshot, set_setting
 
 
 def _make_console(width: int = 120) -> tuple[Console, "io.StringIO"]:
@@ -223,3 +223,10 @@ class TestStore:
         e = UsageEntry("ollama", "5小时", 60, 100, 40, 60.0, None, "次", True)
         save_snapshot([PlatformResult("ollama", "O", entries=[e])])
         assert query_history()[0]["is_manual"] == 1
+
+    def test_settings_roundtrip(self, tmp_db_path: Path) -> None:
+        assert get_setting("registration_enabled") is None
+        set_setting("registration_enabled", "1")
+        assert get_setting("registration_enabled") == "1"
+        set_setting("registration_enabled", "0")
+        assert get_setting("registration_enabled") == "0"

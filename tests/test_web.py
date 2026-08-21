@@ -133,6 +133,65 @@ class TestWeb:
         data = client.get("/api/usage").json()
         assert data["interval"] == 5.0
 
+    def test_index_has_refresh_controls(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        html = client.get("/").text
+        assert 'id="refresh-now"' in html      # 马上刷新按钮
+        assert 'id="interval-select"' in html  # 刷新间隔下拉
+        assert 'id="more-menu-btn"' in html    # ⋯ 菜单按钮
+        assert 'id="more-dropdown"' in html    # 折叠菜单容器
+
+    def test_refresh_forces_refetch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, calls = _auth_client(monkeypatch, tmp_db_path)
+        client.get("/api/usage")
+        client.get("/api/usage")
+        assert calls[0] == 1  # TTL 内命中缓存
+        resp = client.post("/api/refresh")
+        assert resp.status_code == 200
+        assert calls[0] == 2  # 强制重新拉取
+        data = resp.json()
+        assert {"fetched_at", "interval", "platforms"} <= data.keys()
+        client.get("/api/usage")
+        assert calls[0] == 2  # 刷新后 TTL 重新计时
+
+    def test_interval_update_and_clamp(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        assert client.post("/api/interval", json={"interval": 120}).json() == {"interval": 120.0}
+        assert client.get("/api/usage").json()["interval"] == 120.0
+        assert client.post("/api/interval", json={"interval": 1}).json() == {"interval": 5.0}
+        assert client.post("/api/interval", json={"interval": 99999}).json() == {"interval": 3600.0}
+
+    def test_interval_invalid_body(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        for bad in ({"interval": "60"}, {}, {"interval": True}, {"interval": None}):
+            assert client.post("/api/interval", json=bad).status_code == 400
+
+    def test_refresh_and_interval_require_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        _patch_fetch(monkeypatch)
+        client = TestClient(create_app({"platforms": {}}))
+        assert client.post("/api/refresh").status_code == 401
+        assert client.post("/api/interval", json={"interval": 30}).status_code == 401
+
+    def test_favicon_no_404(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """页面声明内联 data URI 图标;残留的 /favicon.ico 请求兜底返回 204 而非 404。"""
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        assert client.get("/favicon.ico").status_code == 204
+        html = client.get("/").text
+        assert 'rel="icon"' in html
+        assert "data:image/svg+xml" in html
+
 
 class TestWebAuth:
     def test_unauthenticated_blocked(
@@ -382,3 +441,153 @@ class TestWebConfig:
         # kimi 没有 access_key 字段
         resp = client.put("/api/config/platforms/kimi", json={"access_key": "x"})
         assert resp.status_code == 400
+
+    def test_put_order_persists_and_reorders_get(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, calls = _auth_client(monkeypatch, tmp_db_path)
+        assert client.get("/api/usage").status_code == 200
+        assert calls[0] == 1
+        new_order = [
+            "opencode-go", "ollama", "volcengine-agent", "volcengine-coding", "kimi",
+        ]
+        resp = client.put("/api/config/order", json={"order": new_order})
+        assert resp.status_code == 200
+        assert resp.json()["order"] == new_order
+        assert load_config()["platform_order"] == new_order
+        keys = [p["key"] for p in client.get("/api/config").json()["platforms"]]
+        assert keys == new_order
+        # 缓存在 interval 内仍触发新的 fetch → 顺序保存后缓存已失效
+        client.get("/api/usage")
+        assert calls[0] == 2
+
+    def test_put_order_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.put("/api/config/order", json={"order": "kimi"})
+        assert resp.status_code == 400
+        resp = client.put("/api/config/order", json={"order": ["kimi", 1]})
+        assert resp.status_code == 400
+        # 未知 key 被丢弃,未列出的平台按注册表顺序补全
+        resp = client.put("/api/config/order", json={"order": ["ghost", "ollama"]})
+        assert resp.status_code == 200
+        assert resp.json()["order"] == [
+            "ollama", "kimi", "volcengine-coding", "volcengine-agent", "opencode-go",
+        ]
+
+    def test_config_page_has_drag_handle(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+    ) -> None:
+        """页面 JS 依赖的拖放挂载点:缺失时卡片无法拖动排序。"""
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        html = client.get("/config").text
+        assert "drag-handle" in html
+        assert "dragstart" in html
+
+
+class TestRegistration:
+    """开放注册 + 管理员开关:settings 表持久化,注册即登录(普通用户)。"""
+
+    def test_register_disabled_by_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        anon = TestClient(client.app)
+        r = anon.post(
+            "/api/auth/register", json={"username": "alice", "password": "secret1"}
+        )
+        assert r.status_code == 403
+        assert r.json()["detail"] == "注册已关闭"
+        assert store.get_user("alice") is None
+        assert anon.get("/api/auth/state").json()["registration_enabled"] is False
+
+    def test_register_when_enabled(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        r = client.put("/api/settings", json={"registration_enabled": True})
+        assert r.status_code == 200
+        assert r.json() == {"registration_enabled": True}
+        anon = TestClient(client.app)
+        r = anon.post(
+            "/api/auth/register", json={"username": "alice", "password": "secret1"}
+        )
+        assert r.status_code == 200
+        assert r.json() == {"username": "alice", "is_admin": False}
+        state = anon.get("/api/auth/state").json()  # 注册即登录:cookie 生效
+        assert state["authenticated"] is True
+        assert state["registration_enabled"] is True
+        assert store.get_user("alice")["is_admin"] is False
+
+    def test_register_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        client.put("/api/settings", json={"registration_enabled": True})
+        anon = TestClient(client.app)
+        r = anon.post("/api/auth/register", json={"username": "", "password": "secret1"})
+        assert r.status_code == 400
+        r = anon.post(
+            "/api/auth/register", json={"username": "x" * 65, "password": "secret1"}
+        )
+        assert r.status_code == 400
+        r = anon.post("/api/auth/register", json={"username": "alice", "password": "12345"})
+        assert r.status_code == 400
+        anon.post("/api/auth/register", json={"username": "alice", "password": "secret1"})
+        r = anon.post(
+            "/api/auth/register", json={"username": "alice", "password": "secret1"}
+        )
+        assert r.status_code == 409
+        assert r.json()["detail"] == "用户名已存在"
+        client.put("/api/settings", json={"registration_enabled": False})
+        r = anon.post("/api/auth/register", json={"username": "bob", "password": "secret1"})
+        assert r.status_code == 403
+
+    def test_settings_api_auth_and_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        anon = TestClient(client.app)
+        assert anon.get("/api/settings").status_code == 401
+        assert anon.put("/api/settings", json={"registration_enabled": True}).status_code == 401
+        viewer, _ = _auth_client(
+            monkeypatch, tmp_db_path, username="bob", admin=False
+        )
+        assert viewer.get("/api/settings").status_code == 403
+        assert viewer.put(
+            "/api/settings", json={"registration_enabled": True}
+        ).status_code == 403
+        assert (
+            client.put("/api/settings", json={"registration_enabled": "yes"}).status_code
+            == 400
+        )
+        assert client.put("/api/settings", json={}).status_code == 400
+        r = client.put("/api/settings", json={"nope": 1})
+        assert r.status_code == 400
+        assert "未知字段" in r.json()["detail"]
+        # 持久化:新 app 实例(模拟重启)读到同一 history.db 中的开关
+        client.put("/api/settings", json={"registration_enabled": True})
+        client2 = TestClient(create_app({"platforms": {}}))
+        r = client2.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert r.status_code == 200
+        assert client2.get("/api/settings").json()["registration_enabled"] is True
+
+    def test_login_and_users_page_hooks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """页面 JS 依赖的静态挂载点:缺失时注册入口/开关不渲染。"""
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        anon = TestClient(client.app)
+        login_html = anon.get("/login").text
+        assert "switch-mode" in login_html
+        assert "没有账号?注册" in login_html
+        users_html = client.get("/users").text
+        assert "reg-enabled" in users_html
+        assert "注册设置" in users_html

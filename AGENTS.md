@@ -18,7 +18,8 @@ cli.py (click group: show/tui/web/add/config/history)
   → show: display.render_results() / results_to_json()   # rich Table+Panel or JSON
     tui: display.build_overview() under rich.Live, cbreak key loop (q/r/+/-)
     web: web.create_app() → FastAPI; UsageCache(TTL) wraps fetch_all;
-         session-cookie auth gates every route (users/sessions in history.db);
+         session-cookie auth gates every route (users/sessions in history.db;
+         site toggles like registration_enabled in settings table);
          /api/usage → display.results_to_dict(); pages serve static/*.html
   → store.save_snapshot(results)            # SQLite, skips errored platforms (show only)
 ```
@@ -32,7 +33,7 @@ Key abstractions:
 - **Dependency injection**: `httpx.Client` is constructor-injected into live providers (`client=None` → own client created/closed per `fetch`). Tests pass `httpx.MockTransport`-backed clients.
 - **Shared serialization**: `display.results_to_dict()` is the single JSON shape consumed by both `--json` output (`results_to_json` wraps it) and the web API (`/api/usage`).
 - **Web TTL cache**: `web.UsageCache` refreshes `fetch_all` at most once per `interval` (clamped to `[5, 3600]`s), holding one lock across the fetch so concurrent requests share a result. The browser page re-fetches `/api/usage` on the same interval and ticks countdowns client-side every second. `set_config()` replaces the config and forces the next `get()` to refetch (used after Web credential edits).
-- **Web auth**: Session-cookie auth gates every route — pages 302 to `/login`, APIs 401 (`api_user` dependency) / 403 (`api_admin`). Zero users → `needs_setup`, and `/api/auth/setup` creates the first admin. Roles: admin (user management + provider credential config) vs regular user (dashboard only); every user can change their own password (invalidates their other sessions). Passwords hashed with stdlib `hashlib.pbkdf2_hmac` (SHA-256, 600k iterations, 16-byte salt, `hmac.compare_digest`) — stored as `pbkdf2_sha256$iters$salt$dk` in the `users` table. Sessions are `secrets.token_urlsafe(32)` rows in the `sessions` table with 7-day TTL (lazy expiry on read/create; persist across restarts). Cookie `llm_usage_session`: `httponly`, `samesite=lax`, `path=/`; all mutation endpoints accept JSON bodies only (cross-site forms can't construct JSON → no CSRF token). Deleting a user or resetting a password deletes that user's sessions.
+- **Web auth**: Session-cookie auth gates every route — pages 302 to `/login`, APIs 401 (`api_user` dependency) / 403 (`api_admin`). Zero users → `needs_setup`, and `/api/auth/setup` creates the first admin. Roles: admin (user management + provider credential config) vs regular user (dashboard only); every user can change their own password (invalidates their other sessions). Open registration: admin toggles `registration_enabled` via `GET`/`PUT /api/settings` (stored in the `settings` table, default off); when on, `POST /api/auth/register` creates a regular user and logs them in immediately (session cookie, same as setup). Passwords hashed with stdlib `hashlib.pbkdf2_hmac` (SHA-256, 600k iterations, 16-byte salt, `hmac.compare_digest`) — stored as `pbkdf2_sha256$iters$salt$dk` in the `users` table. Sessions are `secrets.token_urlsafe(32)` rows in the `sessions` table with 7-day TTL (lazy expiry on read/create; persist across restarts). Cookie `llm_usage_session`: `httponly`, `samesite=lax`, `path=/`; all mutation endpoints accept JSON bodies only (cross-site forms can't construct JSON → no CSRF token). Deleting a user or resetting a password deletes that user's sessions.
 - **Web credential config**: Admins edit per-platform `enabled` + credential fields at `/config` (`kimi`/`ollama`/`opencode-go` → `api_key`; `volcengine-*` → `access_key`+`secret_key`, per `web.CREDENTIAL_FIELDS`). PUT merges via `config.update_platform_config()` (TOML save) then calls `UsageCache.set_config()` so the next poll refetches. Views never return plaintext: `env:` values pass through as-is, literal keys show `first4…last2` (`••••` if shorter than 8 chars); an empty input means "keep current value". `base_url`/`tier`/`limits` stay hand-edited in `config.toml`.
 
 ## Key Directories
@@ -66,7 +67,7 @@ llm-usage web                   # FastAPI dashboard at http://127.0.0.1:8765 (ne
 python -m llm_usage show        # equivalent to console script
 
 # Test
-python -m pytest tests/ -v       # 83 tests, ~7s (pbkdf2 password hashing dominates)
+python -m pytest tests/ -v       # 102 tests, ~9s (pbkdf2 password hashing dominates)
 
 # No lint/type-check/CI config exists. No Makefile, no lockfile.
 ```
@@ -94,10 +95,10 @@ python -m pytest tests/ -v       # 83 tests, ~7s (pbkdf2 password hashing domina
 |------|------|
 | `src/llm_usage/cli.py` | `@click.group()` entry point — `show`/`tui`/`web`/`add`/`config`/`history`; exit codes; `_load()` helper |
 | `src/llm_usage/tui.py` | TUI dashboard — `rich.Live` auto-refresh, cbreak key handling, interval clamp `[5, 3600]`s |
-| `src/llm_usage/web.py` | FastAPI app factory `create_app(config, interval)` + `UsageCache` TTL cache; page routes (`/`, `/login`, `/users`, `/config`) + JSON APIs (`/api/usage`, `/api/auth/*`, `/api/users*`, `/api/config*`); `api_user`/`api_admin` auth dependencies; `CREDENTIAL_FIELDS` per platform; masked credential views |
-| `src/llm_usage/static/index.html` | Self-contained dashboard page (no JS deps) — theme toggle with localStorage, per-platform cards cloned from `<template id="entry-table">`, 1s countdown tick, auto-poll on server interval, admin nav links + logout (any API 401 → `/login`) |
-| `src/llm_usage/static/login.html` | Login page — doubles as first-run setup (`needs_setup` → 「创建管理员」), posts to `/api/auth/login` or `/api/auth/setup` |
-| `src/llm_usage/static/users.html` | Admin user management — user table (reset password / delete, no self-delete), add-user form, change-my-password form |
+| `src/llm_usage/web.py` | FastAPI app factory `create_app(config, interval)` + `UsageCache` TTL cache; page routes (`/`, `/login`, `/users`, `/config`) + JSON APIs (`/api/usage`, `/api/refresh`, `/api/interval`, `/api/auth/*`, `/api/users*`, `/api/config*`, `/api/settings`); refresh interval is runtime process-level (never persisted; restart falls back to CLI `--interval`); `api_user`/`api_admin` auth dependencies; `CREDENTIAL_FIELDS` per platform; masked credential views |
+| `src/llm_usage/static/index.html` | Self-contained dashboard page (no JS deps) — theme toggle with localStorage, per-platform cards cloned from `<template id="entry-table">`, 1s countdown tick, auto-poll on server interval, ⋯ dropdown (theme toggle + admin nav links) + logout (any API 401 → `/login`) |
+| `src/llm_usage/static/login.html` | Login page — single form, three modes (login / register / first-run admin setup), `needs_setup` → 「创建管理员」, register entry shown only when the `registration_enabled` setting is on |
+| `src/llm_usage/static/users.html` | Admin user management — user table (reset password / delete, no self-delete), add-user form, change-my-password form, registration toggle card (checkbox saves immediately to `/api/settings`) |
 | `src/llm_usage/static/config.html` | Admin provider config — one card per platform (`enabled` checkbox + credential inputs with `env:`/masked/unset placeholders), PUT per card, empty input = unchanged |
 | `src/llm_usage/models.py` | `UsageEntry`, `PlatformResult` dataclasses + `compute_remaining`/`compute_percent` |
 | `src/llm_usage/providers/__init__.py` | `PROVIDERS` registry, `fetch_all` concurrent dispatch, `_prepare_config`, `env:` key resolution |
@@ -106,7 +107,7 @@ python -m pytest tests/ -v       # 83 tests, ~7s (pbkdf2 password hashing domina
 | `src/llm_usage/providers/volcengine.py` | Volcengine live provider — AK/SK V4 signing → `GetCodingPlanUsage` (percent-only) + `GetAFPUsage` (used/total); self-contained V4 signer; tier table for deriving used from percent |
 | `src/llm_usage/providers/manual.py` | `ManualProvider` base — reads config entries, zero/None limit → unlimited |
 | `src/llm_usage/config.py` | TOML load/save (`tomllib` read / `tomli_w` write), `EXAMPLE_CONFIG` template, `set_manual_entry`, `update_platform_config` (merge + save, used by Web credential edits) |
-| `src/llm_usage/store.py` | SQLite `snapshots` table (`save_snapshot` skips errored, `query_history` platform/days filters) + `users`/`sessions` tables for Web auth (pbkdf2 password hashing, session tokens with 7-day TTL) |
+| `src/llm_usage/store.py` | SQLite `snapshots` table (`save_snapshot` skips errored, `query_history` platform/days filters) + `users`/`sessions` tables for Web auth (pbkdf2 password hashing, session tokens with 7-day TTL) + `settings` KV table (`get_setting`/`set_setting`, e.g. `registration_enabled`) |
 |`src/llm_usage/display.py` | `render_results` (rich Panel+Table), `build_overview` (TUI), `results_to_dict`/`results_to_json`, `render_history` — manual column layout (`COLS`/`BAR_SPAN_WIDTH`) so a progress bar spans under the data columns |
 | `src/llm_usage/__main__.py` | `python -m llm_usage` shim → `cli.main()` |
 | `pyproject.toml` | Sole build config — setuptools, deps, entry point, pytest config |
@@ -122,7 +123,7 @@ python -m pytest tests/ -v       # 83 tests, ~7s (pbkdf2 password hashing domina
 ## Testing & QA
 
 - **Framework**: pytest ≥7.0 (optional dependency via `[project.optional-dependencies] test`; `test_web.py` additionally needs the `web` extra and is skipped without fastapi). Configured in `pyproject.toml` with `testpaths = ["tests"]`.
-- **Run**: `python -m pytest tests/ -v` — 83 tests, ~7s, no network (auth tests pay real pbkdf2 600k-iteration hashing per user creation/login).
+- **Run**: `python -m pytest tests/ -v` — 102 tests, ~9s, no network (auth tests pay real pbkdf2 600k-iteration hashing per user creation/login).
 - **No coverage config, no markers, no tox/CI.**
 
 ### Test isolation patterns
@@ -136,5 +137,5 @@ python -m pytest tests/ -v       # 83 tests, ~7s (pbkdf2 password hashing domina
 
 - **`test_providers.py`**: Kimi parsing (`used=limit-remaining`, nested `detail` shape, `window`→label derivation incl. unknown-unit fallback, epoch-ms resetTime→ISO, 404→`/usage` fallback, 401 hint); Volcengine OpenAPI V4 signing (Coding Plan percent-only → derived used via tier table; Agent Plan used/total; config `limits` override; error response with `ResponseMetadata.Error`; HTTP error); manual providers (defaults, config reads, zero-limit→unlimited); registry (all 5 keys, `env:` prefix resolution for `api_key`/`access_key`/`secret_key`, error isolation, disabled-platform skip, empty config).
 - **`test_config.py`**: init creates/refuses-overwrite/overwrites; load-missing→`{}`; roundtrip; `set_manual_entry` update/add/persist; `env:` prefix stored verbatim.
-- **`test_display.py`**: render contains platform names / error rows / manual marker; JSON structure; history empty + with-rows; local-time conversion of `reset_at`/history `ts` (UTC input → local display); countdown formatting (`_fmt_countdown` incl. fixed-`now` determinism) + countdown column right-alignment; store save/query/filter/two-snapshots/manual-flag-persisted/failed-not-saved.
-- **`test_web.py`**: index HTML contains the static hooks the page JS needs (`#platforms` card container, `#entry-table` template, theme toggle); `/api/usage` payload shape; errored platforms included with empty entries; `UsageCache` TTL (one fetch within interval, refetch after expiry); interval clamping; auth flow (unauthenticated 302/401, first-admin setup + 409 on re-setup, login/logout, username/password validation, viewer role 403s, user CRUD, self-delete/last-admin protection, password reset invalidating sessions, own-password change keeping current session); provider config API (masked `env:`/literal/unset credential views, `enabled` PUT invalidating the usage cache, empty-credential no-op, unknown field/platform/wrong-credential 400/404). `fetch_all` is monkeypatched with a counting fake; `_auth_client(...)` builds an app + logged-in admin client per test.
+- **`test_display.py`**: render contains platform names / error rows / manual marker; JSON structure; history empty + with-rows; local-time conversion of `reset_at`/history `ts` (UTC input → local display); countdown formatting (`_fmt_countdown` incl. fixed-`now` determinism) + countdown column right-alignment; store save/query/filter/two-snapshots/manual-flag-persisted/failed-not-saved/settings-KV-roundtrip.
+- **`test_web.py`**: index HTML contains the static hooks the page JS needs (`#platforms` card container, `#entry-table` template, theme toggle); `/api/usage` payload shape; errored platforms included with empty entries; `UsageCache` TTL (one fetch within interval, refetch after expiry); interval clamping; auth flow (unauthenticated 302/401, first-admin setup + 409 on re-setup, login/logout, username/password validation, viewer role 403s, user CRUD, self-delete/last-admin protection, password reset invalidating sessions, own-password change keeping current session); provider config API (masked `env:`/literal/unset credential views, `enabled` PUT invalidating the usage cache, empty-credential no-op, unknown field/platform/wrong-credential 400/404); registration (default-off 403, enabled flow with register-and-login cookie, validation/409/403-after-disable, settings API auth + persistence across app instances, login/users page hooks). `fetch_all` is monkeypatched with a counting fake; `_auth_client(...)` builds an app + logged-in admin client per test.

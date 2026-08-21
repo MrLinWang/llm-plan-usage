@@ -2,9 +2,13 @@
 
 会话认证:未登录访问页面重定向到 /login,API 返回 401。首次启动(无用户)
 通过 /api/auth/setup 创建首个管理员。用户/会话存储在 history.db(store.py)。
+开放注册:管理员经 PUT /api/settings 打开开关后,访客可经 POST
+/api/auth/register 自助注册(永远是普通用户,注册即登录);开关默认关闭,
+存 history.db settings 表。
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -15,10 +19,16 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from llm_usage import store
-from llm_usage.config import get_platform_config, load_config, update_platform_config
+from llm_usage.config import (
+    get_platform_config,
+    get_platform_order,
+    load_config,
+    set_platform_order,
+    update_platform_config,
+)
 from llm_usage.display import results_to_dict
 from llm_usage.models import PlatformResult
-from llm_usage.providers import DISPLAY_NAMES, PROVIDERS, fetch_all
+from llm_usage.providers import DISPLAY_NAMES, PROVIDERS, fetch_all, registry_index
 
 MIN_INTERVAL = 5.0    # 与 tui.py 一致
 MAX_INTERVAL = 3600.0
@@ -37,6 +47,9 @@ CREDENTIAL_FIELDS: dict[str, list[str]] = {
 # PUT /api/config/platforms/{key} 允许的字段超集
 _CONFIG_FIELDS = {"enabled", "display_name", "api_key", "access_key", "secret_key"}
 _CREDENTIAL_NAMES = {"api_key", "access_key", "secret_key"}
+
+# PUT /api/settings 允许的字段(站点策略,存 history.db settings 表)
+_SETTINGS_KEYS = {"registration_enabled"}
 
 
 class UsageCache:
@@ -59,6 +72,17 @@ class UsageCache:
         with self._lock:
             self._config = config
             self._fetched_at = 0.0
+
+    def invalidate(self) -> None:
+        """Force the next get() to refetch (used by POST /api/refresh)."""
+        with self._lock:
+            self._fetched_at = 0.0
+
+    def set_interval(self, interval: float) -> float:
+        """Update the TTL interval (clamped to [MIN, MAX]); return the clamped value."""
+        with self._lock:
+            self._interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
+            return self._interval
 
     def get(self) -> tuple[list[PlatformResult], str]:
         """Return (results, fetched_at_utc_iso), refreshing when stale.
@@ -156,6 +180,11 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
 
     # ---- 页面 ----
 
+    @app.get("/favicon.ico")
+    def favicon() -> Response:
+        """浏览器默认请求 /favicon.ico;页面已声明内联 data URI 图标,这里兜底返回 204 避免 404 日志。"""
+        return Response(status_code=204)
+
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> Response:
         if _current_user(request) is None:
@@ -192,6 +221,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         return {
             "authenticated": user is not None,
             "needs_setup": store.count_users() == 0,
+            "registration_enabled": store.get_setting("registration_enabled") == "1",
             "user": (
                 {"username": user["username"], "is_admin": user["is_admin"]}
                 if user else None
@@ -216,6 +246,26 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         token = store.create_session(username)
         resp = JSONResponse({"username": username, "is_admin": True})
         _set_session_cookie(resp, token)
+        return resp
+
+    @app.post("/api/auth/register")
+    def auth_register(body: dict[str, Any] = Body(...)) -> JSONResponse:
+        if store.get_setting("registration_enabled") != "1":
+            raise HTTPException(status_code=403, detail="注册已关闭")
+        username = body.get("username")
+        if not _valid_username(username):
+            raise HTTPException(status_code=400, detail="用户名需为 1-64 个字符")
+        password = body.get("password")
+        if not _valid_password(password):
+            raise HTTPException(status_code=400, detail="密码至少 6 位")
+        username = username.strip()
+        try:
+            store.create_user(username, password, is_admin=False)  # 自助注册永远是普通用户
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        token = store.create_session(username)
+        resp = JSONResponse({"username": username, "is_admin": False})
+        _set_session_cookie(resp, token)  # 注册即登录,与 auth_setup 一致
         return resp
 
     @app.post("/api/auth/login")
@@ -263,17 +313,41 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
 
     # ---- 用量 API ----
 
-    @app.get("/api/usage")
-    def usage(user: dict[str, Any] = Depends(api_user)) -> JSONResponse:
+    def _usage_payload() -> JSONResponse:
         try:
             results, fetched_at = cache.get()
-        except Exception as exc:  # noqa: BLE001 — fetch_all 内部已隔离单平台失败,这里兜底
+        except Exception as exc:  # noqa: BLE001 - fetch_all 内部已隔离单平台失败,这里兜底
             return JSONResponse({"error": f"获取用量失败:{exc}"}, status_code=500)
         return JSONResponse({
             "fetched_at": fetched_at,
             "interval": cache.interval,
             "platforms": results_to_dict(results)["platforms"],
         })
+
+    @app.get("/api/usage")
+    def usage(user: dict[str, Any] = Depends(api_user)) -> JSONResponse:
+        return _usage_payload()
+
+    @app.post("/api/refresh")
+    def usage_refresh(user: dict[str, Any] = Depends(api_user)) -> JSONResponse:
+        """立即刷新:失效缓存后重新 fetch_all,响应与 GET /api/usage 同构。"""
+        cache.invalidate()
+        return _usage_payload()
+
+    @app.post("/api/interval")
+    def usage_interval(
+        body: dict[str, Any] = Body(...),
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, Any]:
+        """调整自动刷新间隔(运行期、进程级,不写入 config.toml)。"""
+        value = body.get("interval")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+        ):
+            raise HTTPException(status_code=400, detail="间隔需为 5-3600 秒内的数字")
+        return {"interval": cache.set_interval(float(value))}
 
     # ---- 用户管理 API(管理员) ----
 
@@ -329,11 +403,35 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         store.delete_user_sessions(username)
         return {"ok": True}
 
+    # ---- 站点设置 API(管理员) ----
+
+    @app.get("/api/settings")
+    def settings_get(admin: dict[str, Any] = Depends(api_admin)) -> dict[str, Any]:
+        return {"registration_enabled": store.get_setting("registration_enabled") == "1"}
+
+    @app.put("/api/settings")
+    def settings_put(
+        body: dict[str, Any] = Body(...),
+        admin: dict[str, Any] = Depends(api_admin),
+    ) -> dict[str, Any]:
+        extra = sorted(set(body) - _SETTINGS_KEYS)
+        if extra:
+            raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
+        value = body.get("registration_enabled")
+        if not isinstance(value, bool):
+            raise HTTPException(status_code=400, detail="registration_enabled 需为布尔值")
+        store.set_setting("registration_enabled", "1" if value else "0")
+        return {"registration_enabled": value}
+
     # ---- 供应商配置 API(管理员) ----
 
     @app.get("/api/config")
     def config_get(admin: dict[str, Any] = Depends(api_admin)) -> dict[str, Any]:
-        return {"platforms": [_platform_view(key) for key in PROVIDERS]}
+        cfg_order = get_platform_order(load_config())
+        order = {k: i for i, k in enumerate(cfg_order)}
+        reg = registry_index()
+        keys = sorted(PROVIDERS, key=lambda k: (order.get(k, len(cfg_order)), reg[k]))
+        return {"platforms": [_platform_view(key) for key in keys]}
 
     @app.put("/api/config/platforms/{key}")
     def config_put(
@@ -368,5 +466,20 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             new_config = update_platform_config(key, updates)
             cache.set_config(new_config)
         return _platform_view(key)
+
+    @app.put("/api/config/order")
+    def config_put_order(
+        body: dict[str, Any] = Body(...),
+        admin: dict[str, Any] = Depends(api_admin),
+    ) -> dict[str, Any]:
+        order = body.get("order")
+        if not isinstance(order, list) or not all(isinstance(k, str) for k in order):
+            raise HTTPException(status_code=400, detail="order 需为字符串数组")
+        known = [k for k in order if k in PROVIDERS]
+        missing = [k for k in PROVIDERS if k not in known]
+        full_order = known + missing
+        new_config = set_platform_order(full_order)
+        cache.set_config(new_config)
+        return {"order": full_order}
 
     return app

@@ -3,7 +3,8 @@
 Each successful ``llm-usage show`` writes one row per ``UsageEntry``.
 ``llm-usage history`` reads them back for trend display.  The ``users`` /
 ``sessions`` tables back the Web dashboard's login (pbkdf2 password hashes,
-7-day session tokens); both live in the same ``history.db``.
+7-day session tokens); the ``settings`` KV table holds site policy toggles
+(e.g. ``registration_enabled``); all live in the same ``history.db``.
 """
 
 from __future__ import annotations
@@ -45,6 +46,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
   username TEXT NOT NULL,
   expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 """
 
@@ -350,6 +355,34 @@ def delete_user_sessions(
                 "DELETE FROM sessions WHERE username = ? AND token != ?",
                 (username, keep_token),
             )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---- 站点设置(KV) ----
+
+
+def get_setting(key: str, path: Path | None = None) -> str | None:
+    """Return the setting value, or None if unset."""
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str, path: Path | None = None) -> None:
+    """INSERT OR REPLACE a setting row."""
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+            (key, value),
+        )
         conn.commit()
     finally:
         conn.close()

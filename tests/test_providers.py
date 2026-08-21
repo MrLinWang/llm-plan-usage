@@ -518,3 +518,37 @@ class TestRegistry:
 
     def test_fetch_all_empty_config(self) -> None:
         assert fetch_all({}) == []
+
+    def test_fetch_all_respects_platform_order(self) -> None:
+        cfg = {
+            "platforms": {
+                "kimi": {"enabled": True},
+                "ollama": {"enabled": True},
+                "opencode-go": {"enabled": True},
+            },
+            "platform_order": ["opencode-go", "ollama", "kimi"],
+        }
+        assert [r.platform for r in fetch_all(cfg)] == ["opencode-go", "ollama", "kimi"]
+
+    def test_fetch_all_platform_order_partial(self) -> None:
+        """platform_order 只列部分 key:列出的排最前,其余保持注册表顺序。"""
+        cfg = {
+            "platforms": {
+                "kimi": {"enabled": True},
+                "ollama": {"enabled": True},
+                "opencode-go": {"enabled": True},
+            },
+            "platform_order": ["ollama"],
+        }
+        assert [r.platform for r in fetch_all(cfg)] == ["ollama", "kimi", "opencode-go"]
+
+    def test_fetch_all_platform_order_unknown_ignored(self) -> None:
+        cfg = {
+            "platforms": {
+                "kimi": {"enabled": True},
+                "ollama": {"enabled": True},
+                "opencode-go": {"enabled": True},
+            },
+            "platform_order": ["ghost", "ollama"],
+        }
+        assert [r.platform for r in fetch_all(cfg)] == ["ollama", "kimi", "opencode-go"]

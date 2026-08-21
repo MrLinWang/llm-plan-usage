@@ -53,3 +53,18 @@ class TestEnvPrefix:
         C.init_config(p)
         cfg = C.load_config(p)
         assert cfg["platforms"]["kimi"]["api_key"] == "env:KIMI_API_KEY"
+
+
+class TestPlatformOrder:
+    def test_set_and_get_platform_order(self, tmp_path: Path) -> None:
+        p = tmp_path / "config.toml"
+        C.init_config(p)
+        C.set_platform_order(["ollama", "kimi"], p)
+        assert C.load_config(p)["platform_order"] == ["ollama", "kimi"]
+        # 非字符串元素被过滤;非列表类型/缺失返回空
+        assert C.get_platform_order({"platform_order": ["kimi", 1, "ollama"]}) == [
+            "kimi",
+            "ollama",
+        ]
+        assert C.get_platform_order({"platform_order": "kimi"}) == []
+        assert C.get_platform_order({}) == []

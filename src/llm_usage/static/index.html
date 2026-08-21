@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>LLM 用量总览</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20x='1.5'%20y='12'%20width='3'%20height='6'%20rx='1'%20fill='%2356b6c2'/%3E%3Crect%20x='6'%20y='9'%20width='3'%20height='9'%20rx='1'%20fill='%23ffb300'/%3E%3Crect%20x='10.5'%20y='6'%20width='3'%20height='12'%20rx='1'%20fill='%234caf50'/%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #16181d;
@@ -84,7 +85,7 @@
   .platform-name { font-weight: bold; }
   .platform-err, .platform-empty { padding: 2px 0; }
   .platform-err { color: var(--red); }
-  #theme-toggle, .pill-btn {
+  .pill-btn {
     flex: none;
     padding: 5px 16px;
     font: inherit;
@@ -98,15 +99,69 @@
     transition: color 0.2s ease, border-color 0.2s ease,
                 background-color 0.2s ease, box-shadow 0.2s ease;
   }
-  #theme-toggle:hover, .pill-btn:hover {
+  .pill-btn:hover {
     color: var(--fg);
     border-color: var(--dim);
     background: var(--hover);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
   }
-  #theme-toggle:focus-visible, .pill-btn:focus-visible {
+  .pill-btn:focus-visible {
     outline: 2px solid var(--cyan);
     outline-offset: 2px;
+  }
+  #interval-select {
+    flex: none;
+    padding: 5px 12px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--dim);
+    background: var(--bg);
+    border: 1px solid var(--sep);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: color 0.2s ease, border-color 0.2s ease, background-color 0.2s ease;
+  }
+  #interval-select:hover { color: var(--fg); border-color: var(--dim); }
+  #interval-select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  .nav-menu { position: relative; }
+  #more-dropdown {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    z-index: 50;
+    min-width: 150px;
+    background: var(--surface);
+    border: 1px solid var(--sep);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    padding: 6px;
+  }
+  #more-dropdown button, #more-dropdown .dropdown-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 8px 14px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--fg);
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  #more-dropdown button:hover, #more-dropdown .dropdown-item:hover {
+    background-color: var(--hover);
+  }
+  #more-dropdown button:focus-visible, #more-dropdown .dropdown-item:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: -2px;
+  }
+  #more-dropdown [hidden] { display: none; }
+  #theme-toggle:disabled, .pill-btn:disabled, #interval-select:disabled {
+    opacity: 0.5;
+    cursor: default;
+    pointer-events: none;
   }
   .head-nav { display: flex; gap: 8px; flex: none; align-items: center; }
   .title {
@@ -215,10 +270,17 @@
         <div id="status" class="status">加载中…</div>
       </div>
       <div class="head-nav">
-        <a id="nav-users" class="pill-btn" href="/users" hidden>用户管理</a>
-        <a id="nav-config" class="pill-btn" href="/config" hidden>供应商配置</a>
+        <button id="refresh-now" class="pill-btn" type="button" title="忽略缓存,立即重新获取各平台用量">马上刷新</button>
+        <select id="interval-select" title="自动刷新间隔"></select>
         <button id="logout" class="pill-btn" type="button">退出</button>
-        <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+        <div class="nav-menu">
+          <button id="more-menu-btn" class="pill-btn" type="button" title="更多选项" aria-expanded="false">⋯</button>
+          <div id="more-dropdown" class="dropdown" hidden>
+            <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+            <a id="nav-users" class="dropdown-item" href="/users" hidden>用户管理</a>
+            <a id="nav-config" class="dropdown-item" href="/config" hidden>供应商配置</a>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -249,6 +311,7 @@ var lastFetchedLocal = null;  // 上次成功获取的本地时间 "HH:MM:SS"
 var nextAt = 0;               // 下一次轮询的时间戳(ms)
 var pollTimer = 0;
 var errorState = null;        // 拉取失败时的错误信息(保留旧卡片)
+var currentInterval = 60;     // 服务端当前刷新间隔(秒),每次 render() 同步
 
 // ---- 主题切换 ----
 // data-theme 由 <head> 中的脚本在首屏前设置;这里同步按钮文字并处理点击。
@@ -271,6 +334,26 @@ function toggleTheme() {
 
 document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
 syncThemeButton();
+
+// ---- 更多菜单 ----
+// ⋯ 下拉:主题切换 + 管理员入口;点击菜单项/外部/Escape 关闭。
+var moreBtn = document.getElementById("more-menu-btn");
+var moreDropdown = document.getElementById("more-dropdown");
+
+function setMoreOpen(open) {
+  moreDropdown.hidden = !open;
+  moreBtn.setAttribute("aria-expanded", String(open));
+}
+
+moreBtn.addEventListener("click", function () { setMoreOpen(moreDropdown.hidden); });
+moreDropdown.addEventListener("click", function () { setMoreOpen(false); });  // 点任一菜单项后收起
+document.addEventListener("click", function (e) {
+  if (moreDropdown.hidden) return;
+  if (e.target !== moreBtn && !moreDropdown.contains(e.target)) setMoreOpen(false);
+});
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape" && !moreDropdown.hidden) setMoreOpen(false);
+});
 
 // ---- 会话状态 ----
 // 未登录 → /login;管理员显示「用户管理/供应商配置」入口;退出按钮结束会话。
@@ -480,23 +563,115 @@ function render(data) {
   titleEl.textContent = "LLM 用量总览 (" + fmtLocalMinute(new Date()) + ")";
   errorState = null;
   renderPlatforms(data.platforms || []);
-  schedule(typeof data.interval === "number" ? data.interval : 60);
+  if (typeof data.interval === "number") currentInterval = data.interval;
+  syncIntervalSelect(currentInterval);
+  schedule(currentInterval);
+}
+
+// 统一的用量拉取:401 跳登录页,非 2xx 抛错(消息取响应 error 字段)。
+async function fetchUsage(url, init) {
+  var r = await fetch(url, init);
+  if (r.status === 401) { location.href = "/login"; throw new Error("未登录"); }  // 会话失效
+  var data = null;
+  try { data = await r.json(); } catch (_) { /* 非 JSON 响应 */ }
+  if (!r.ok) throw new Error((data && data.error) || ("HTTP " + r.status));
+  return data;
 }
 
 async function refresh() {
   if (!lastFetchedLocal && !errorState) statusEl.textContent = "加载中…";
   try {
-    var r = await fetch("/api/usage");
-    if (r.status === 401) { location.href = "/login"; return; }  // 会话失效
-    var data = null;
-    try { data = await r.json(); } catch (_) { /* 非 JSON 响应 */ }
-    if (!r.ok) throw new Error((data && data.error) || ("HTTP " + r.status));
-    render(data);
+    render(await fetchUsage("/api/usage"));
   } catch (e) {
+    if (e && e.message === "未登录") return;
     errorState = String((e && e.message) || e);
     schedule(10);  // 10s 后重试,不清空旧卡片
   }
 }
+
+// ---- 手动刷新与间隔控制 ----
+// 「马上刷新」POST /api/refresh:服务端失效缓存后立即重新 fetch_all,
+// 响应与 GET /api/usage 同构,直接走 render() 重新调度轮询。
+// 间隔下拉 POST /api/interval:修改服务端 TTL;所有已打开的页面在
+// 下次轮询响应的 interval 字段里收到新值后自行对齐。
+
+var refreshBtn = document.getElementById("refresh-now");
+var intervalSelect = document.getElementById("interval-select");
+
+var INTERVAL_PRESETS = [10, 30, 60, 300, 600, 1800, 3600];
+
+function intervalLabel(sec) {
+  if (sec >= 3600 && sec % 3600 === 0) return (sec / 3600) + "小时";
+  if (sec % 60 === 0) return (sec / 60) + "分钟";
+  return Math.round(sec) + "秒";
+}
+
+// 把服务端间隔同步到下拉框:不在预设里的值(如 CLI --interval 45)
+// 按数值升序插入动态选项,保证任意间隔都有选中项。
+function syncIntervalSelect(sec) {
+  if (typeof sec !== "number" || !(sec > 0)) return;
+  sec = Math.round(sec);
+  var value = String(sec);
+  if (intervalSelect.value === value) return;
+  var has = Array.prototype.some.call(
+    intervalSelect.options, function (o) { return o.value === value; }
+  );
+  if (!has) {
+    var opt = el("option");
+    opt.value = value;
+    opt.textContent = intervalLabel(sec);
+    var before = Array.prototype.find.call(
+      intervalSelect.options, function (o) { return Number(o.value) > sec; }
+    );
+    intervalSelect.insertBefore(opt, before || null);
+  }
+  intervalSelect.value = value;
+}
+
+INTERVAL_PRESETS.forEach(function (sec) {
+  var opt = el("option");
+  opt.value = String(sec);
+  opt.textContent = intervalLabel(sec);
+  intervalSelect.appendChild(opt);
+});
+intervalSelect.value = "60";  // 首次成功拉取前显示默认值
+
+refreshBtn.addEventListener("click", async function () {
+  clearTimeout(pollTimer);  // 取消已排队的自动轮询,以本次结果为准
+  refreshBtn.disabled = true;
+  statusEl.textContent = (lastFetchedLocal || errorState) ? "刷新中…" : "加载中…";
+  try {
+    render(await fetchUsage("/api/refresh", { method: "POST" }));
+  } catch (e) {
+    if (e && e.message === "未登录") return;
+    errorState = String((e && e.message) || e);
+    schedule(10);
+  } finally {
+    refreshBtn.disabled = false;
+  }
+});
+
+intervalSelect.addEventListener("change", async function () {
+  var sec = Number(intervalSelect.value);
+  if (!sec || sec === currentInterval) return;
+  intervalSelect.disabled = true;
+  try {
+    var data = await fetchUsage("/api/interval", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ interval: sec })
+    });
+    currentInterval = data.interval;
+    syncIntervalSelect(currentInterval);
+    schedule(currentInterval);  // 立即按新间隔重排「下次刷新」倒计时
+  } catch (e) {
+    if (e && e.message === "未登录") return;
+    syncIntervalSelect(currentInterval);  // 失败回退到服务端当前值
+    statusEl.textContent = "设置刷新间隔失败:" + String((e && e.message) || e);
+  } finally {
+    intervalSelect.disabled = false;
+  }
+});
 
 // 每秒:重算重置倒计时 + 更新状态行
 function tick() {

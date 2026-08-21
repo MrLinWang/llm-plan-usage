@@ -24,6 +24,9 @@ EXAMPLE_CONFIG = """\
 #              instead of storing plaintext here.
 # Volcengine: needs AccessKey/SecretKey (AK/SK) with V4 signing, not Bearer API key.
 
+# 平台显示顺序:可选。取消注释并调整列表即可改变 show/tui/web 的显示顺序。
+# platform_order = ["kimi", "volcengine-coding", "volcengine-agent", "ollama", "opencode-go"]
+
 [platforms.kimi]
 enabled = true
 api_key = "env:KIMI_API_KEY"            # or "sk-kimi-xxx"
@@ -99,6 +102,22 @@ def init_config(path: Path | None = None, overwrite: bool = False) -> Path:
 def get_platform_config(config: dict[str, Any], platform: str) -> dict[str, Any]:
     """Return a platform section or ``{}`` if absent."""
     return config.get("platforms", {}).get(platform, {}) or {}
+
+
+def get_platform_order(config: dict[str, Any]) -> list[str]:
+    """Return the configured platform order; unknown keys dropped, unlisted keys appended later by caller."""
+    order = config.get("platform_order")
+    if not isinstance(order, list):
+        return []
+    return [k for k in order if isinstance(k, str)]
+
+
+def set_platform_order(order: list[str], path: Path | None = None) -> dict[str, Any]:
+    """Persist platform_order to TOML; return the full updated config."""
+    cfg = load_config(path)
+    cfg["platform_order"] = order
+    save_config(cfg, path)
+    return cfg
 
 
 def update_platform_config(

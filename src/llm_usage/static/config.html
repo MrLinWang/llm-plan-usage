@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>供应商配置 - LLM 用量总览</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20x='1.5'%20y='12'%20width='3'%20height='6'%20rx='1'%20fill='%2356b6c2'/%3E%3Crect%20x='6'%20y='9'%20width='3'%20height='9'%20rx='1'%20fill='%23ffb300'/%3E%3Crect%20x='10.5'%20y='6'%20width='3'%20height='12'%20rx='1'%20fill='%234caf50'/%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #16181d;
@@ -154,6 +155,10 @@
   .btn:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
   .form-err { color: var(--red); font-size: 13px; }
   .form-ok { color: var(--green); font-size: 13px; }
+  .platform-head-left { display: flex; align-items: center; }
+  .drag-handle { cursor: grab; color: var(--dim); user-select: none; padding-right: 8px; }
+  .card.platform.dragging { opacity: 0.4; }
+  .card.platform.drag-over { border-top: 2px solid var(--cyan); }
 </style>
 <script>
 // 首屏前确定主题,避免闪烁:localStorage 优先,其次系统偏好,默认深色。
@@ -242,9 +247,16 @@ function placeholderOf(cred) {
 
 function platformCard(p) {
   var card = el("div", "card platform");
+  card.dataset.key = p.key;
 
   var head = el("div", "platform-head");
-  head.appendChild(el("span", "platform-name", p.display_name));
+  var headLeft = el("div", "platform-head-left");
+  var handle = el("span", "drag-handle", "⠿");
+  handle.draggable = true;  // 仅手柄可拖,输入框/文本选择不受影响
+  handle.title = "拖动调整顺序";
+  headLeft.appendChild(handle);
+  headLeft.appendChild(el("span", "platform-name", p.display_name));
+  head.appendChild(headLeft);
   head.appendChild(el("span", "dim", p.key));
   card.appendChild(head);
 
@@ -313,11 +325,101 @@ function platformCard(p) {
   return card;
 }
 
+// ---- 拖动排序(落点即保存,与 interval 下拉的即时生效模式一致) ----
+// 事件委托在 #platforms 容器上;只有 .drag-handle 可拖。
+// 拖放成功后不重渲染:DOM 顺序已是新顺序,下次 load() 会按新顺序渲染。
+
+var dragCard = null;      // 正在被拖动的卡片
+var currentOrder = [];    // 服务端确认的顺序(load/persistOrder 更新)
+
+function cardOf(node) {
+  return node && node.closest ? node.closest(".card.platform") : null;
+}
+
+function clearDragOver() {
+  platformsEl.querySelectorAll(".card.platform.drag-over").forEach(function (c) {
+    c.classList.remove("drag-over");
+  });
+}
+
+platformsEl.addEventListener("dragstart", function (ev) {
+  var handle = ev.target && ev.target.closest ? ev.target.closest(".drag-handle") : null;
+  if (!handle) { ev.preventDefault(); return; }
+  dragCard = cardOf(handle);
+  if (!dragCard) return;
+  dragCard.classList.add("dragging");
+  ev.dataTransfer.effectAllowed = "move";
+  try { ev.dataTransfer.setData("text/plain", dragCard.dataset.key || ""); } catch (_) {}
+});
+
+platformsEl.addEventListener("dragover", function (ev) {
+  if (!dragCard) return;
+  ev.preventDefault();  // 允许放置
+  ev.dataTransfer.dropEffect = "move";
+  var target = cardOf(ev.target);
+  clearDragOver();
+  if (target && target !== dragCard) target.classList.add("drag-over");
+});
+
+platformsEl.addEventListener("dragleave", function (ev) {
+  var target = cardOf(ev.target);
+  if (target && !target.contains(ev.relatedTarget)) target.classList.remove("drag-over");
+});
+
+platformsEl.addEventListener("drop", function (ev) {
+  if (!dragCard) return;
+  ev.preventDefault();
+  var target = cardOf(ev.target);
+  clearDragOver();
+  if (target === dragCard) return;
+  if (target) {
+    platformsEl.insertBefore(dragCard, target);  // 指示线在上:插入目标之前
+  } else {
+    platformsEl.appendChild(dragCard);           // 空白处:移到最后
+  }
+  persistOrder();
+});
+
+platformsEl.addEventListener("dragend", function () {
+  if (dragCard) dragCard.classList.remove("dragging");
+  dragCard = null;
+  clearDragOver();
+});
+
+async function persistOrder() {
+  var keys = Array.prototype.map.call(
+    platformsEl.querySelectorAll(".card.platform"),
+    function (c) { return c.dataset.key; }
+  );
+  if (keys.join(",") === currentOrder.join(",")) return;  // 顺序未变
+  try {
+    var r = await api("/api/config/order", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order: keys }),
+    });
+    if (!r.ok) {
+      statusEl.textContent = "顺序保存失败: " + (await detailOf(r));
+      load();  // 恢复 DOM 为服务端顺序
+      return;
+    }
+    var data = await r.json();
+    currentOrder = data.order || keys;
+    statusEl.textContent = "顺序已保存";
+  } catch (e) {
+    if (e && e.message !== "未登录") {
+      statusEl.textContent = "顺序保存失败: " + String(e.message || e);
+      load();
+    }
+  }
+}
+
 async function load() {
   try {
     var r = await api("/api/config");
     if (!r.ok) { statusEl.textContent = await detailOf(r); return; }
     var data = await r.json();
+    currentOrder = (data.platforms || []).map(function (p) { return p.key; });
     platformsEl.textContent = "";
     (data.platforms || []).forEach(function (p) {
       platformsEl.appendChild(platformCard(p));

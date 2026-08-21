@@ -9,6 +9,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from llm_usage.config import get_platform_order
 from llm_usage.models import PlatformResult
 from llm_usage.providers.base import Provider
 from llm_usage.providers.kimi import KimiProvider
@@ -27,6 +28,15 @@ PROVIDERS: dict[str, Provider] = {
     "ollama": OllamaProvider(),
     "opencode-go": OpenCodeGoProvider(),
 }
+
+# Registry order as a lookup table; the fallback for platforms not listed in
+# the config's ``platform_order``.
+_REGISTRY_INDEX: dict[str, int] = {plat: i for i, plat in enumerate(PROVIDERS)}
+
+
+def registry_index() -> dict[str, int]:
+    """Return a copy of the registry-order lookup (platform key -> index)."""
+    return dict(_REGISTRY_INDEX)
 
 # Display names (override-able from config).
 DISPLAY_NAMES: dict[str, str] = {
@@ -113,7 +123,10 @@ def fetch_all(
         for fut in as_completed(futures):
             results.append(fut.result())
 
-    # stable order: registry order
-    order = {plat: i for i, plat in enumerate(PROVIDERS)}
-    results.sort(key=lambda r: order.get(r.platform, 999))
+    # stable order: config platform_order first, then registry order
+    cfg_order = get_platform_order(config)
+    order = {plat: i for i, plat in enumerate(cfg_order)}
+    results.sort(
+        key=lambda r: (order.get(r.platform, len(cfg_order)), _REGISTRY_INDEX.get(r.platform, 999))
+    )
     return results

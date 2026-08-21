@@ -438,7 +438,9 @@ class TestWebConfig:
         group = resp.json()["groups"][0]
         assert group["name"] == "组1"
         assert group["daily_limit"] == 50
-        assert group["api_keys"] == [{"set": True, "env": None, "hint": "sk-g…45"}]
+        assert group["api_keys"] == [
+            {"name": None, "set": True, "env": None, "hint": "sk-g…45"}
+        ]
         # 磁盘持久化:groups 写入且 use_groups 被置为 true
         section = load_config()["platforms"]["llm-gateway"]
         assert section["base_url"] == "http://gw.internal:9090"
@@ -464,6 +466,77 @@ class TestWebConfig:
             {"name": "组1", "api_keys": ["sk-g1-12345"]}
         ]
 
+    def test_put_gateway_named_keys_persist_and_view(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        # 保存:新 key 带名称;既有 key 留空保留 + 重命名
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{
+                "name": "组A", "daily_limit": None,
+                "api_keys": [
+                    {"value": "sk-new-123456", "name": "主 Key"},
+                    {"index": 0, "value": "", "name": "改名 Key"},
+                ],
+            }],
+        })
+        assert resp.status_code == 400  # 尚无既有 key,index 0 无可保留
+        assert "要保留" in resp.json()["detail"]
+        # 先保存两个带名称的 key
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{
+                "name": "组A", "daily_limit": None,
+                "api_keys": [
+                    {"value": "sk-new-1-123456", "name": "主 Key"},
+                    {"value": "sk-new-2-123456", "name": "备份 Key"},
+                ],
+            }],
+        })
+        assert resp.status_code == 200
+        section = load_config()["platforms"]["llm-gateway"]
+        assert section["groups"] == [{
+            "name": "组A",
+            "api_keys": [
+                {"name": "主 Key", "value": "sk-new-1-123456"},
+                {"name": "备份 Key", "value": "sk-new-2-123456"},
+            ],
+        }]
+        # 视图回显名称(不返回明文,掩码来自 dict 条目内的 value)
+        group = resp.json()["groups"][0]
+        assert [k["name"] for k in group["api_keys"]] == ["主 Key", "备份 Key"]
+        assert group["api_keys"][0]["set"] is True
+        assert group["api_keys"][0]["hint"] == "sk-n…56"
+        assert group["api_keys"][1]["hint"] == "sk-n…56"
+        # 留空 key = 保留值;重命名第一个
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{
+                "name": "组A", "daily_limit": None,
+                "api_keys": [
+                    {"index": 0, "value": "", "name": "线上主 Key"},
+                    {"index": 1, "value": "", "name": None},
+                ],
+            }],
+        })
+        assert resp.status_code == 200
+        assert load_config()["platforms"]["llm-gateway"]["groups"] == [{
+            "name": "组A",
+            "api_keys": [
+                {"name": "线上主 Key", "value": "sk-new-1-123456"},
+                {"name": "备份 Key", "value": "sk-new-2-123456"},
+            ],
+        }]
+        # 名称超长 → 400
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "groups": [{
+                "name": "组A", "daily_limit": None,
+                "api_keys": [{"value": "sk-x", "name": "长" * 101}],
+            }],
+        })
+        assert resp.status_code == 400
+        assert "1-100" in resp.json()["detail"]
+
     def test_put_gateway_legacy_single_key_migrates(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
         tmp_config_path: Path,
@@ -485,7 +558,7 @@ class TestWebConfig:
             "index": 0,
             "name": "组1",
             "daily_limit": None,
-            "api_keys": [{"set": True, "env": None, "hint": "sk-l…23"}],
+            "api_keys": [{"name": None, "set": True, "env": None, "hint": "sk-l…23"}],
         }]
         # 保存时留空 key = 保留旧值 → 迁移为 groups
         resp = client.put("/api/config/platforms/llm-gateway", json={

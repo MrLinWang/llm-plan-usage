@@ -28,6 +28,7 @@ source .venv/bin/activate     # 激活虚拟环境
 ```bash
 llm-usage config --init     # 生成示例配置 ./config.toml
 llm-usage show              # 拉取所有平台用量，渲染 rich 表格
+llm-usage show --keys        # 总览 + 多 Key 分组的各 Key 用量明细
 llm-usage show --json        # JSON 输出，便于脚本处理
 llm-usage tui                # 交互式终端仪表盘（q 退出，r 刷新，+/- 调间隔）
 llm-usage web                # 浏览器仪表盘（默认 http://127.0.0.1:8765）
@@ -89,7 +90,18 @@ name = "组1"
 api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"]
 ```
 
-Key 直接写在 config.toml 即可，也支持 `env:VARNAME` 引用环境变量。组内部分 Key 请求失败时，成功 Key 仍会
+Key 直接写在 config.toml 即可，也支持 `env:VARNAME` 引用环境变量。每个 Key 可
+配置**显示名称**（`show --keys` 的 Key 明细与 Web 仪表盘悬浮明细中展示，失败
+提示也会带上名称）：
+
+```toml
+api_keys = [
+    { name = "主 Key", value = "env:LLM_GATEWAY_TEAM_A_1" },
+    "sk-team-a-key-2",  # 无名称,显示 key#2
+]
+```
+
+组内部分 Key 请求失败时，成功 Key 仍会
 聚合，但结果会带提示；带提示的部分聚合不会写入历史快照，以免把不完整数据当成完整用量。
 同一个 Key 不应配置到多个分组。可用
 `LLM_USAGE_CONFIG` 环境变量覆盖路径（历史数据库用 `LLM_USAGE_DB`）。
@@ -183,6 +195,8 @@ llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollam
 （火山「添加 AK/SK」）追加新套餐槽。LLM Gateway 以**组**为单位编辑：
 默认一组「组1」，每组一个 API key 输入框 + 一个每日限额输入框（留空 = 不设限），
 组内可点「添加共享 Key」追加共享同一额度的 key，底部「添加组」新增分组；
+每个 Key 行还有一个可选的「Key 名称」输入框，名称会显示在仪表盘分组行的
+悬浮明细与 `show --keys` 的 Key 明细中（留空 = 保留现有名称）；
 同组 Key 的今日用量会合并计算。凭证永远不回显明文：已保存的值显示为掩码
 （如 `已设置 (sk-k…ey)`），`env:VARNAME` 引用原样显示；凭证值留空表示保留
 已保存的值，删除整个槽才会移除该凭证。保存立即写回 `./config.toml` 并使服务端

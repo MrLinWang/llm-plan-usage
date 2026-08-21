@@ -20,6 +20,19 @@ For multiple keys that share one daily quota, configure groups instead::
     daily_limit = 100
     api_keys = ["env:LLM_GATEWAY_TEAM_A_1", "env:LLM_GATEWAY_TEAM_A_2"]
 
+Each key may carry a display name — used in the per-key usage breakdown
+(``UsageEntry.key_breakdown``) rendered by ``show --keys`` and the web
+dashboard popover, and in per-key error messages::
+
+    api_keys = [
+        { name = "主 Key", value = "env:LLM_GATEWAY_TEAM_A_1" },
+        { name = "备用", value = "env:LLM_GATEWAY_TEAM_A_2" },
+    ]
+
+The ``key_names`` / ``api_key_names`` list alias is also accepted (entry
+``name`` wins when both are present); a plain string entry has no name and
+falls back to ``key#N``.
+
 ``use_groups`` switches explicitly between the single-key and the groups
 form (``true`` = groups only, ``false`` = single key only); when absent,
 groups win if any are configured.  When ``use_groups`` is false, any
@@ -169,7 +182,8 @@ def _group_limit(group: dict[str, Any], fallback: Any = None) -> float | None:
     return parsed
 
 
-def _group_key_values(group: dict[str, Any]) -> list[Any]:
+def _group_raw_key_entries(group: dict[str, Any]) -> list[Any]:
+    """Raw key entries (dicts preserved): plain strings, ``env:`` refs, or ``{"name", "value"}``."""
     values = group.get("api_keys")
     if values is None:
         values = group.get("keys")
@@ -183,6 +197,42 @@ def _group_key_values(group: dict[str, Any]) -> list[Any]:
     if isinstance(envs, list):
         return [f"env:{value}" for value in envs if isinstance(value, str)]
     return []
+
+
+def _group_key_values(group: dict[str, Any]) -> list[Any]:
+    """Resolved key strings: plain ``env:``/literal values, dicts unwrapped."""
+    return [
+        value.get("value") if isinstance(value, dict) else value
+        for value in _group_raw_key_entries(group)
+    ]
+
+
+def _group_key_names(group: dict[str, Any], raw_keys: list[Any]) -> list[str | None]:
+    """Per-key display names, aligned with ``raw_keys``.
+
+    A ``{"name": ..., "value": ...}`` entry carries its own name; the
+    ``key_names`` / ``api_key_names`` list is the legacy array alias used
+    only for entries without one (entry name wins).  ``None`` = fall back
+    to ``key#N``.
+    """
+    aliases = group.get("key_names")
+    if aliases is None:
+        aliases = group.get("api_key_names")
+    if not isinstance(aliases, list):
+        aliases = []
+    names: list[str | None] = []
+    for index, value in enumerate(raw_keys):
+        name = None
+        if isinstance(value, dict):
+            raw_name = value.get("name")
+            if isinstance(raw_name, str) and raw_name.strip():
+                name = raw_name.strip()
+        if name is None and index < len(aliases):
+            alias = aliases[index]
+            if isinstance(alias, str) and alias.strip():
+                name = alias.strip()
+        names.append(name)
+    return names
 
 
 def _configured_groups(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -266,25 +316,35 @@ class LlmGatewayProvider:
     ) -> tuple[UsageEntry | None, list[str], list[dict[str, Any]]]:
         name = _group_name(group, index)
         daily_limit = _group_limit(group, fallback_limit)
+        raw_entries = _group_raw_key_entries(group)
         raw_keys = _group_key_values(group)
+        key_names = _group_key_names(group, raw_entries)
         keys: list[tuple[int, str]] = []
         failures_by_number: dict[int, str] = {}
         seen: set[str] = set()
-        for number, value in enumerate(raw_keys, 1):
-            key = _resolve_secret(value)
-            if not isinstance(value, str) or not value.strip():
-                failures_by_number[number] = f"{name} key#{number}：API key 配置无效"
-            elif not key:
-                failures_by_number[number] = f"{name} key#{number}：未配置 API key"
-            elif key in seen:
-                failures_by_number[number] = f"{name} key#{number}：重复 API key（已忽略）"
+        for number, (entry, raw_key) in enumerate(
+            zip(raw_entries, raw_keys, strict=False), 1
+        ):
+            label = key_names[number - 1] or f"key#{number}"
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                failures_by_number[number] = f"{name} {label}：API key 配置无效"
+            elif not (resolved := _resolve_secret(raw_key)):
+                failures_by_number[number] = f"{name} {label}：未配置 API key"
+            elif resolved in seen:
+                failures_by_number[number] = f"{name} {label}：重复 API key（已忽略）"
             else:
-                seen.add(key)
-                keys.append((number, key))
+                seen.add(resolved)
+                keys.append((number, resolved))
         if not keys:
             failures = [failures_by_number[number] for number in sorted(failures_by_number)]
             breakdown = [
-                {"number": number, "used": None, "ok": False, "error": failures_by_number[number]}
+                {
+                    "number": number,
+                    "name": key_names[number - 1],
+                    "used": None,
+                    "ok": False,
+                    "error": failures_by_number[number],
+                }
                 for number in sorted(failures_by_number)
             ]
             return None, failures or [f"{name}：未配置 API key"], breakdown
@@ -304,17 +364,30 @@ class LlmGatewayProvider:
             }
             for future in as_completed(futures):
                 number = futures[future]
+                label = key_names[number - 1] or f"key#{number}"
                 try:
                     successes_by_number[number] = future.result().actual_cost
                 except Exception as exc:  # noqa: BLE001 - isolate one key
-                    failures_by_number[number] = f"{name} key#{number}：{exc}"
+                    failures_by_number[number] = f"{name} {label}：{exc}"
 
         failures = [failures_by_number[number] for number in sorted(failures_by_number)]
         breakdown = [
             (
-                {"number": number, "used": successes_by_number[number], "ok": True, "error": None}
+                {
+                    "number": number,
+                    "name": key_names[number - 1],
+                    "used": successes_by_number[number],
+                    "ok": True,
+                    "error": None,
+                }
                 if number in successes_by_number
-                else {"number": number, "used": None, "ok": False, "error": failures_by_number[number]}
+                else {
+                    "number": number,
+                    "name": key_names[number - 1],
+                    "used": None,
+                    "ok": False,
+                    "error": failures_by_number[number],
+                }
             )
             for number in range(1, len(raw_keys) + 1)
         ]

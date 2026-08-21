@@ -294,10 +294,12 @@ def render_key_breakdown(results: list[PlatformResult], console: Console | None 
             any_rows = True
             table = Table(title=f"{res.display_name} · {entry.label} · Key 明细")
             table.add_column("#", justify="right")
+            table.add_column("名称")
             table.add_column("已用", justify="right")
             table.add_column("状态")
             for item in entry.key_breakdown:
                 number = str(item.get("number", "-"))
+                name = item.get("name") or "-"
                 if item.get("ok"):
                     used = _fmt_value(item.get("used"), entry.unit)
                     status = "[green]OK[/green]"
@@ -305,7 +307,7 @@ def render_key_breakdown(results: list[PlatformResult], console: Console | None 
                     used = "-"
                     error = item.get("error") or "失败"
                     status = f"[red]{error}[/red]"
-                table.add_row(number, used, status)
+                table.add_row(number, name, used, status)
             console.print(table)
     if not any_rows:
         console.print("[dim]没有多 Key 分组的用量明细[/dim]")

@@ -160,6 +160,7 @@
   .group-head label { flex: 1; }
   .group-head label.limit { max-width: 180px; }
   .key-row input { flex: 1; }
+  .key-row input:first-child { flex: 0 0 160px; }
   .key-row button, .group-actions button {
     flex: none;
     padding: 5px 10px;
@@ -462,13 +463,20 @@ function platformCard(p) {
 
         var keysEl = el("div", "fields");
         var rows = [];
-        function addKey(cred, existingIndex, initialValue) {
+        function addKey(cred, existingIndex, initialValue, initialName) {
           if (cred && Object.prototype.hasOwnProperty.call(cred, "value")) {
             existingIndex = cred.index;
             initialValue = cred.value || "";
             cred = null;
           }
           var row = el("div", "key-row");
+          // Key 名称(可选):显示在仪表盘悬浮明细与 CLI Key 明细中;
+          // 名称留空 = 保留现有名称(与 key 输入框「留空 = 不修改」一致)。
+          var nameInput = document.createElement("input");
+          nameInput.type = "text";
+          nameInput.autocomplete = "off";
+          nameInput.placeholder = "Key 名称(可选)";
+          if (initialName) nameInput.value = initialName;
           var input = document.createElement("input");
           input.type = "text";
           input.autocomplete = "off";
@@ -481,14 +489,18 @@ function platformCard(p) {
             var rowIndex = rows.indexOf(row);
             if (rowIndex >= 0) rows.splice(rowIndex, 1);
           });
+          row.appendChild(nameInput);
           row.appendChild(input);
           row.appendChild(remove);
           keysEl.appendChild(row);
-          rows.push({ row: row, input: input, existingIndex: existingIndex });
+          rows.push({ row: row, nameInput: nameInput, input: input, existingIndex: existingIndex });
         }
         var groupKeys = Array.isArray(group.api_keys) ? group.api_keys : [];
         if (groupKeys.length) {
-          groupKeys.forEach(function (cred, keyIndex) { addKey(cred, keyIndex); });
+          groupKeys.forEach(function (cred, keyIndex) {
+            var name = (cred && typeof cred === "object" && cred.name) ? cred.name : "";
+            addKey(cred, keyIndex, "", name);
+          });
         } else {
           addKey(null, null);  // 每组默认一个 API key 输入框
         }
@@ -527,10 +539,12 @@ function platformCard(p) {
               ? null : Number(editor.limitInput.value),
             api_keys: editor.rows.map(function (row) {
               var value = row.input.value.trim();
+              var name = row.nameInput.value.trim();
               if (row.existingIndex !== null && row.existingIndex !== undefined) {
-                return { index: row.existingIndex, value: value || null };
+                return { index: row.existingIndex, value: value || null, name: name || null };
               }
-              return value ? { index: null, value: value } : null;
+              if (!value) return null;
+              return name ? { index: null, value: value, name: name } : value;
             }).filter(function (value) { return value !== null; }),
           };
           if (editor.originalIndex !== null && editor.originalIndex !== undefined) {
@@ -577,12 +591,14 @@ function platformCard(p) {
           group.daily_limit = limit === "" ? null : Number(limit);
           editor.rows.forEach(function (row) {
             var value = row.input.value.trim();
+            var name = row.nameInput.value.trim();
             if (row.existingIndex === null || row.existingIndex === undefined) {
-              if (value) group.api_keys.push(value);
+              if (value) group.api_keys.push(name ? { value: value, name: name } : value);
             } else {
               group.api_keys.push({
                 index: row.existingIndex,
                 value: value || null,
+                name: name || null,
               });
             }
           });

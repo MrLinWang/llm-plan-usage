@@ -250,6 +250,40 @@
     .status::before { animation: pulse 2s ease-in-out infinite; }
     .status.err::before { animation: none; }
   }
+  /* LLM Gateway 分组各 Key 用量悬浮明细 */
+  .breakdown-row { position: relative; }
+  .breakdown-row .breakdown-hint {
+    text-decoration: underline dotted;
+    cursor: pointer;
+  }
+  .key-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 50;
+    min-width: 220px;
+    max-width: min(90vw, 320px);
+    background: var(--surface);
+    border: 1px solid var(--sep);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    padding: 8px 12px;
+  }
+  .key-pop-title {
+    font-size: 12px;
+    color: var(--dim);
+    margin-bottom: 6px;
+  }
+  .key-pop-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 2px 0;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .key-pop-row .ok { color: var(--green); }
+  .key-pop-row .err { color: var(--red); }
 </style>
 <script>
 // 首屏前确定主题,避免闪烁:localStorage 优先,其次系统偏好,默认深色。
@@ -468,6 +502,48 @@ function td(text, cls, colspan) {
   return cell;
 }
 
+// ---- LLM Gateway 分组各 Key 用量明细弹层 ----
+// 弹层节点挂在分组数据行 tr(.breakdown-row) 内,以行为定位祖先;
+// renderPlatforms 每次重建 #platforms,旧节点连监听一起销毁,无泄漏。
+// 每行显示 key_breakdown 项:配置了名称(name)显示名称,否则回退 #N;
+// 成功(ok)绿色显示用量,失败红色显示 error 文案。
+
+// 关闭页面上所有已打开的弹层(同一时刻只开一个)。
+function closeKeyPopovers() {
+  var open = platformsEl.querySelectorAll(".key-popover");
+  for (var i = 0; i < open.length; i++) open[i].remove();
+}
+
+// 构建弹层:标题 = 组名 + 「各 Key 用量」;逐 Key 行 = #N + 用量/错误。
+function buildKeyPopover(entry) {
+  var pop = el("div", "key-popover");
+  // 点击弹层内部不冒泡,避免触发行 toggle 误关
+  pop.addEventListener("click", function (ev) { ev.stopPropagation(); });
+  var title = el("div", "key-pop-title");
+  title.textContent = entry.label + " · 各 Key 用量";
+  pop.appendChild(title);
+  entry.key_breakdown.forEach(function (item) {
+    var row = el("div", "key-pop-row");
+    var num = el("span");
+    // 配置了 Key 名称 → 显示名称;否则回退 #N
+    num.textContent = (item.name && String(item.name).trim())
+      ? String(item.name).trim()
+      : "#" + (item.number === undefined ? "-" : item.number);
+    var val = el("span");
+    if (item.ok === true) {
+      val.className = "ok";
+      val.textContent = fmtValue(item.used, entry.unit);
+    } else {
+      val.className = "err";
+      val.textContent = item.error || "-";
+    }
+    row.appendChild(num);
+    row.appendChild(val);
+    pop.appendChild(row);
+  });
+  return pop;
+}
+
 function dataRow(entry) {
   var tr = el("tr");
   var used, limit, remaining;
@@ -479,7 +555,23 @@ function dataRow(entry) {
     limit = entry.limit === null ? "∞" : fmtValue(entry.limit, entry.unit);
     remaining = entry.remaining === null ? "-" : fmtValue(entry.remaining, entry.unit);
   }
-  tr.appendChild(td(entry.label));
+  var labelCell = td(entry.label);
+  // 多 Key 组(与 CLI render_key_breakdown 约定一致):行可点击弹出各 Key 明细
+  if (Array.isArray(entry.key_breakdown) && entry.key_breakdown.length >= 2) {
+    tr.className = "breakdown-row";
+    labelCell.className = "breakdown-hint";
+    labelCell.title = "点击查看各 Key 用量";
+    tr.addEventListener("click", function (ev) {
+      ev.stopPropagation();  // 阻止冒泡到 document 的关闭监听
+      if (tr.querySelector(".key-popover")) {
+        closeKeyPopovers();
+      } else {
+        closeKeyPopovers();
+        tr.appendChild(buildKeyPopover(entry));
+      }
+    });
+  }
+  tr.appendChild(labelCell);
   tr.appendChild(td(used, "num"));
   tr.appendChild(td(limit, "num"));
   tr.appendChild(td(remaining, "num"));
@@ -704,6 +796,12 @@ function tick() {
     statusEl.className = "status";
   }
 }
+
+// 页面其它位置点击 / Escape:关闭弹层
+document.addEventListener("click", closeKeyPopovers);
+document.addEventListener("keydown", function (ev) {
+  if (ev.key === "Escape") closeKeyPopovers();
+});
 
 refresh();
 setInterval(tick, 1000);

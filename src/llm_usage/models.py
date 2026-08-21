@@ -26,9 +26,11 @@ class UsageEntry:
             ``None`` = legacy single-credential shape, no partitioning.
         key_breakdown: optional per-key usage detail for entries aggregated
             from multiple API keys (e.g. a gateway's shared-quota groups).
-            Each item is a dict: ``{"number": int, "used": float | None,
-            "ok": bool, "error": str | None}``.  ``None`` for entries that
-            are not a multi-key aggregate.
+            Each item is a dict: ``{"number": int, "name": str | None,
+            "used": float | None, "ok": bool, "error": str | None}`` where
+            ``name`` is the configured per-key display name (``None`` = fall
+            back to ``#N``).  ``None`` for entries that are not a multi-key
+            aggregate.
     """
 
     platform: str

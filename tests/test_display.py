@@ -81,8 +81,8 @@ class TestKeyBreakdown:
         e = UsageEntry(
             "llm-gateway", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
             key_breakdown=[
-                {"number": 1, "used": 1.25, "ok": True, "error": None},
-                {"number": 2, "used": None, "ok": False, "error": "认证失败(401)"},
+                {"number": 1, "name": "主 Key", "used": 1.25, "ok": True, "error": None},
+                {"number": 2, "name": None, "used": None, "ok": False, "error": "认证失败(401)"},
             ],
         )
         r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
@@ -91,12 +91,13 @@ class TestKeyBreakdown:
         out = buf.getvalue()
         assert "team-a" in out
         assert "1.25" in out
+        assert "主 Key" in out
         assert "认证失败" in out
 
     def test_single_key_entry_is_skipped(self) -> None:
         e = UsageEntry(
             "llm-gateway", "今日", 1.94, None, None, None, None, "$", False,
-            key_breakdown=[{"number": 1, "used": 1.94, "ok": True, "error": None}],
+            key_breakdown=[{"number": 1, "name": None, "used": 1.94, "ok": True, "error": None}],
         )
         r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
         console, buf = _make_console()
@@ -128,16 +129,16 @@ class TestDisplaySerialization:
         e = UsageEntry(
             "llm-gateway", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
             key_breakdown=[
-                {"number": 1, "used": 1.25, "ok": True, "error": None},
-                {"number": 2, "used": None, "ok": False, "error": "认证失败(401)"},
+                {"number": 1, "name": "主 Key", "used": 1.25, "ok": True, "error": None},
+                {"number": 2, "name": None, "used": None, "ok": False, "error": "认证失败(401)"},
             ],
         )
         r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
         data = json.loads(results_to_json([r]))
         breakdown = data["platforms"][0]["entries"][0]["key_breakdown"]
         assert breakdown == [
-            {"number": 1, "used": 1.25, "ok": True, "error": None},
-            {"number": 2, "used": None, "ok": False, "error": "认证失败(401)"},
+            {"number": 1, "name": "主 Key", "used": 1.25, "ok": True, "error": None},
+            {"number": 2, "name": None, "used": None, "ok": False, "error": "认证失败(401)"},
         ]
 
     def test_results_to_json_includes_plan(self) -> None:

@@ -51,7 +51,7 @@ _CONFIG_FIELDS = {
 }
 _CREDENTIAL_NAMES = {"api_key", "access_key", "secret_key"}
 _GATEWAY_GROUP_FIELDS = {"index", "name", "daily_limit", "api_keys"}
-_GATEWAY_KEY_FIELDS = {"index", "value"}
+_GATEWAY_KEY_FIELDS = {"index", "value", "name"}
 
 # PUT /api/settings 允许的字段(站点策略,存 history.db settings 表)
 _SETTINGS_KEYS = {"registration_enabled"}
@@ -161,8 +161,8 @@ def _credential_view(raw: Any) -> dict[str, Any]:
     return {"set": True, "env": None, "hint": hint}
 
 
-def _gateway_group_key_values(group: dict[str, Any]) -> list[Any]:
-    """Read the supported group key aliases and return their raw values."""
+def _gateway_group_raw_entries(group: dict[str, Any]) -> list[Any]:
+    """Raw group key entries with dicts preserved (``{"name", "value"}``)."""
     values = group.get("api_keys")
     if values is None:
         values = group.get("keys")
@@ -178,6 +178,22 @@ def _gateway_group_key_values(group: dict[str, Any]) -> list[Any]:
     return []
 
 
+def _gateway_key_name(value: Any, index: int, group: dict[str, Any]) -> str | None:
+    """Per-key display name: ``{"name": …}`` entry wins, then the legacy name array."""
+    if isinstance(value, dict):
+        raw_name = value.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            return raw_name.strip()
+    aliases = group.get("key_names")
+    if aliases is None:
+        aliases = group.get("api_key_names")
+    if isinstance(aliases, list) and index < len(aliases):
+        alias = aliases[index]
+        if isinstance(alias, str) and alias.strip():
+            return alias.strip()
+    return None
+
+
 def _gateway_groups_view(section: dict[str, Any]) -> list[dict[str, Any]]:
     groups = section.get("groups")
     if not isinstance(groups, list):
@@ -188,20 +204,26 @@ def _gateway_groups_view(section: dict[str, Any]) -> list[dict[str, Any]]:
             "index": 0,
             "name": "组1",
             "daily_limit": section.get("daily_limit"),
-            "api_keys": [_credential_view(section["api_key"])],
+            "api_keys": [{"name": None, **_credential_view(section["api_key"])}],
         }]
     views: list[dict[str, Any]] = []
     for index, group in enumerate(groups):
         if not isinstance(group, dict):
             continue
         name = group.get("name") or group.get("label") or f"组{index + 1}"
+        raw_entries = _gateway_group_raw_entries(group)
         views.append({
             "index": index,
             "name": str(name),
             "daily_limit": group.get("daily_limit"),
             "api_keys": [
-                _credential_view(value)
-                for value in _gateway_group_key_values(group)
+                {
+                    "name": _gateway_key_name(value, key_index, group),
+                    **_credential_view(
+                        value.get("value") if isinstance(value, dict) else value
+                    ),
+                }
+                for key_index, value in enumerate(raw_entries)
             ],
         })
     return views
@@ -217,23 +239,31 @@ def _gateway_existing_group(
     return group if isinstance(group, dict) else {}
 
 
-def _gateway_preserved_key(old_keys: list[Any], index: Any) -> str:
+def _gateway_preserved_entry(old_keys: list[Any], index: Any) -> Any:
+    """The existing raw entry (string, env ref, or named dict) to keep."""
     if not isinstance(index, int) or isinstance(index, bool):
         raise ValueError("api_keys 的 index 必须是非负整数")
-    if index < 0 or index >= len(old_keys) or not isinstance(old_keys[index], str):
+    if index < 0 or index >= len(old_keys):
         raise ValueError("要保留的 API key 不存在")
-    return old_keys[index]
+    entry = old_keys[index]
+    value = entry.get("value") if isinstance(entry, dict) else entry
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("要保留的 API key 不存在")
+    return entry
 
 
-def _gateway_key_value(value: Any, old_keys: list[Any], position: int) -> str:
-    # null 或 {"index": n, "value": null} 表示保留已保存的 key；这样 Web
-    # 页面不需要把 literal secret 回传到浏览器或请求体。
+def _gateway_key_value(value: Any, old_keys: list[Any], position: int) -> Any:
+    """Canonicalize one key payload entry to a plain string or a named dict.
+
+    ``None`` / empty string / ``{"index": n, "value": null}`` mean "keep the
+    saved key" — resolved through ``old_keys`` (string or dict, name intact).
+    """
     if value is None:
-        return _gateway_preserved_key(old_keys, position)
+        return _gateway_preserved_entry(old_keys, position)
     if isinstance(value, str):
         value = value.strip()
         if not value:
-            return _gateway_preserved_key(old_keys, position)
+            return _gateway_preserved_entry(old_keys, position)
         if value == "env:" or value.startswith("env:") and not value[4:].strip():
             raise ValueError("API key 的 env 引用不能为空")
         return value
@@ -245,8 +275,24 @@ def _gateway_key_value(value: Any, old_keys: list[Any], position: int) -> str:
     key_index = value.get("index", position)
     raw_value = value.get("value")
     if raw_value is None:
-        return _gateway_preserved_key(old_keys, key_index)
-    return _gateway_key_value(raw_value, old_keys, position)
+        key = _gateway_preserved_entry(old_keys, key_index)
+    else:
+        key = _gateway_key_value(raw_value, old_keys, position)
+    raw_name = value.get("name")
+    if raw_name is None:
+        return key
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        # 名称留空 = 清除名称(否则 UI 无法移除名称);保留的 key 本身不变
+        if isinstance(key, dict):
+            key = dict(key)
+            key.pop("name", None)
+        return key
+    if len(raw_name.strip()) > 100:
+        raise ValueError("API key 名称需为 1-100 个字符")
+    name = raw_name.strip()
+    if isinstance(key, dict):
+        return {**key, "name": name}
+    return {"name": name, "value": key}
 
 
 def _validate_gateway_groups(
@@ -292,7 +338,7 @@ def _validate_gateway_groups(
             raise ValueError(f"分组名称重复：{name}")
         names.add(name)
         old_group = _gateway_existing_group(existing_groups, raw_group.get("index"), position)
-        old_keys = _gateway_group_key_values(old_group)
+        old_raw = _gateway_group_raw_entries(old_group)
 
         canonical: dict[str, Any] = {"name": name}
         if "daily_limit" in raw_group:
@@ -308,24 +354,22 @@ def _validate_gateway_groups(
             canonical["daily_limit"] = old_group["daily_limit"]
 
         if "api_keys" not in raw_group:
-            raw_keys = old_keys
-            if not raw_keys:
+            if not old_raw:
                 raise ValueError(f"分组 {name} 至少需要一个 API key")
-            keys = []
-            for value in raw_keys:
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(f"分组 {name} 包含无效 API key")
-                keys.append(value.strip())
+            keys = list(old_raw)
         else:
             raw_keys = raw_group["api_keys"]
             if not isinstance(raw_keys, list) or not raw_keys:
                 raise ValueError(f"分组 {name} 至少需要一个 API key")
-            keys = [_gateway_key_value(value, old_keys, key_position)
+            keys = [_gateway_key_value(value, old_raw, key_position)
                     for key_position, value in enumerate(raw_keys)]
         for key in keys:
-            if key in seen_keys:
+            identity = key.get("value") if isinstance(key, dict) else key
+            if not isinstance(identity, str) or not identity.strip():
+                raise ValueError(f"分组 {name} 包含无效 API key")
+            if identity in seen_keys:
                 raise ValueError("同一个 API key 不能属于多个分组或重复配置")
-            seen_keys.add(key)
+            seen_keys.add(identity)
         canonical["api_keys"] = keys
         groups.append(canonical)
     return groups

@@ -657,6 +657,55 @@ class TestGatewayHttp:
         assert not result.ok
         assert "多个分组" in result.error
 
+    def test_groups_named_keys_flow_into_breakdown_and_errors(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            auth = req.headers["Authorization"]
+            if auth == "Bearer key-bad":
+                return httpx.Response(401)
+            return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.25"}}})
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{
+                "name": "team-a",
+                "api_keys": [
+                    {"name": "主 Key", "value": "key-good"},
+                    {"name": "备份 Key", "value": "key-bad"},
+                ],
+            }],
+        })
+        assert result.ok
+        breakdown = result.entries[0].key_breakdown
+        assert breakdown is not None
+        assert breakdown[0]["name"] == "主 Key"
+        assert breakdown[0]["ok"] is True
+        assert breakdown[1]["name"] == "备份 Key"
+        assert breakdown[1]["ok"] is False
+        assert "备份 Key" in breakdown[1]["error"]
+        # 旧别名形式 key_names 同样生效
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{
+                "name": "team-b",
+                "api_keys": ["key-good"],
+                "key_names": ["团队 B"],
+            }],
+        })
+        breakdown = result.entries[0].key_breakdown
+        assert breakdown[0]["name"] == "团队 B"
+        # 同时配置时,条目内 name 优先于 key_names 别名
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{
+                "name": "team-c",
+                "api_keys": [{"name": "条目名", "value": "key-good"}],
+                "key_names": ["别名"],
+            }],
+        })
+        breakdown = result.entries[0].key_breakdown
+        assert breakdown[0]["name"] == "条目名"
+
     def test_groups_key_breakdown_records_each_key(self) -> None:
         def handler(req: httpx.Request) -> httpx.Response:
             auth = req.headers["Authorization"]
@@ -677,11 +726,12 @@ class TestGatewayHttp:
         breakdown = result.entries[0].key_breakdown
         assert breakdown is not None
         by_number = {item["number"]: item for item in breakdown}
-        assert by_number[1] == {"number": 1, "used": 1.25, "ok": True, "error": None}
+        assert by_number[1] == {"number": 1, "name": None, "used": 1.25, "ok": True, "error": None}
         assert by_number[2]["ok"] is False
         assert by_number[2]["used"] is None
+        assert by_number[2]["name"] is None
         assert "401" in by_number[2]["error"]
-        assert by_number[3] == {"number": 3, "used": 0.75, "ok": True, "error": None}
+        assert by_number[3] == {"number": 3, "name": None, "used": 0.75, "ok": True, "error": None}
 
     def test_single_key_entry_has_one_item_breakdown(self) -> None:
         def handler(req: httpx.Request) -> httpx.Response:
@@ -691,7 +741,7 @@ class TestGatewayHttp:
         result = provider.fetch({"base_url": "http://llm-gateway.test", "api_key": "solo"})
         assert result.ok
         breakdown = result.entries[0].key_breakdown
-        assert breakdown == [{"number": 1, "used": 1.94, "ok": True, "error": None}]
+        assert breakdown == [{"number": 1, "name": None, "used": 1.94, "ok": True, "error": None}]
 
     def test_use_groups_true_ignores_single_key(self) -> None:
         def handler(req: httpx.Request) -> httpx.Response:

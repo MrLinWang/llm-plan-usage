@@ -87,7 +87,8 @@ api_key = "env:OPENCODE_GO_API_KEY"       # OpenCode Go API key
 enabled = true
 base_url = "http://127.0.0.1:18080"      # gateway base URL
 # API keys 以组为单位配置,每组共享一个每日限额;可在 Web「供应商配置」页维护,
-# 或手工编辑:
+# 或手工编辑。每个 key 可配置显示名称(CLI Key 明细 / Web 悬浮明细展示):
+#   api_keys = [{ name = "主Key", value = "env:LLM_GATEWAY_API_KEY" }]
 [[platforms.llm-gateway.groups]]
 name = "组1"
 # daily_limit = 100

@@ -8,9 +8,13 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import threading
 import time
+from collections import OrderedDict
+from dataclasses import replace
 from datetime import datetime, timezone
 from importlib.resources import files
 from typing import Any
@@ -107,6 +111,57 @@ class UsageCache:
                 self._fetched_at = time.monotonic()
                 self._fetched_at_iso = datetime.now(timezone.utc).isoformat()
             return self._results, self._fetched_at_iso
+
+
+class UserCaches:
+    """Per-config TTL cache pool: one UsageCache per distinct config hash.
+
+    Each user's own config (and every distinct shared config) gets its own
+    cache entry, keyed by the config's content hash so edits invalidate by
+    hash mismatch on the next get() — no explicit invalidation needed.
+    """
+
+    MAX_CACHES = 32
+
+    def __init__(self, interval: float) -> None:
+        self._lock = threading.Lock()
+        self._caches: OrderedDict[str, UsageCache] = OrderedDict()
+        self._interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
+
+    @property
+    def interval(self) -> float:
+        return self._interval
+
+    def _key(self, config: dict[str, Any]) -> str:
+        return hashlib.sha1(
+            json.dumps(config, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+
+    def get(self, config: dict[str, Any]) -> tuple[list[PlatformResult], str]:
+        """Return (results, fetched_at) for the given config's cache entry."""
+        key = self._key(config)
+        with self._lock:
+            cache = self._caches.get(key)
+            if cache is None:
+                cache = UsageCache(config, self._interval)
+                self._caches[key] = cache
+                if len(self._caches) > self.MAX_CACHES:
+                    self._caches.popitem(last=False)  # 淘汰最旧条目
+        return cache.get()
+
+    def invalidate_all(self) -> None:
+        """Force every cached config to refetch on its next get()."""
+        with self._lock:
+            for cache in self._caches.values():
+                cache.invalidate()
+
+    def set_interval(self, interval: float) -> float:
+        """Update the TTL for the pool (clamped to [MIN, MAX]); return it."""
+        with self._lock:
+            self._interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
+            for cache in self._caches.values():
+                cache.set_interval(self._interval)
+            return self._interval
 
 
 # ---- 认证辅助 ----
@@ -537,13 +592,129 @@ def _platform_view(key: str) -> dict[str, Any]:
     return view
 
 
+def _visibility_view(username: str) -> dict[str, Any]:
+    """某用户所有平台的可见性聚合:``{platform: {type, targets}}``。"""
+    rows = store.list_my_visibility(username)
+    view: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = view.setdefault(row["platform"], {"type": "private", "targets": []})
+        if row["target"] == "*":
+            entry["type"] = "public"
+            entry["targets"] = []
+        else:
+            entry["type"] = "shared"
+            entry["targets"].append(row["target"])
+    return view
+
+
+def _validate_visibility(
+    raw: Any, username: str,
+) -> dict[str, Any]:
+    """校验并规范化可见性:``{"type": "public"|"shared"|"private", "targets": [...]}``。
+
+    返回 ``{"targets": [...]}`` —— public 写 ``["*"]``,private/shared 写目标列表。
+    未知 type / 不存在的 target / target 是自己 → ValueError。
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("visibility 需为对象")
+    extra = sorted(set(raw) - {"type", "targets"})
+    if extra:
+        raise ValueError("visibility 未知字段: " + ", ".join(extra))
+    vtype = raw.get("type")
+    if vtype not in ("public", "shared", "private"):
+        raise ValueError("visibility.type 需为 public/shared/private")
+    targets = raw.get("targets")
+    if vtype == "public":
+        if targets:
+            raise ValueError("visibility.public 不接受 targets")
+        return {"targets": ["*"]}
+    if vtype == "private":
+        if targets:
+            raise ValueError("visibility.private 不接受 targets")
+        return {"targets": []}
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("visibility.shared 需要 targets 用户名列表")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for target in targets:
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("visibility.targets 需为用户名列表")
+        target = target.strip()
+        if target == username:
+            raise ValueError("不能共享给自己")
+        if target in seen:
+            continue
+        if store.get_user(target) is None:
+            raise ValueError(f"目标用户不存在：{target}")
+        seen.add(target)
+        deduped.append(target)
+    return {"targets": deduped}
+
+
+def _apply_visibility(
+    username: str, platform: str, visibility: dict[str, Any],
+) -> None:
+    """把规范化后的可见性写入 user_shares(先清后插,原子替换)。"""
+    store.replace_platform_visibility(username, platform, visibility["targets"])
+
+
 def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
-    cache = UsageCache(config, interval)
+    cache = UserCaches(interval)
     app = FastAPI(title="llm-usage")
     pages = {
         name: (files("llm_usage") / "static" / name).read_text(encoding="utf-8")
         for name in ("index.html", "login.html", "users.html", "config.html")
     }
+
+    # ---- 配置来源与按用户合并 ----
+
+    def _config_for(user: dict[str, Any]) -> dict[str, Any]:
+        """单管理员模型:admin 永远用 config.toml;普通用户用自己存 DB 的配置。"""
+        if user["is_admin"]:
+            return load_config()
+        return store.get_user_config(user["username"])
+
+    def _usage_payload_for(user: dict[str, Any]) -> JSONResponse:
+        try:
+            own = _config_for(user)
+            results, fetched_at = cache.get(own)
+            # 自己的平台保留裸名;共享来的平台一律带 (owner) 后缀,
+            # 同名冲突时每个来源都保留展示,不丢弃任何来源。
+            merged: dict[str, PlatformResult] = {r.platform: r for r in results}
+            extra: list[PlatformResult] = []
+            for share in store.list_shared_platforms(user["username"]):
+                owner = share["owner"]
+                if owner == user["username"]:
+                    continue  # 自身来源不参与共享合并(自己的平台是裸名)
+                owner_user = store.get_user(owner)
+                if owner_user is None:
+                    continue
+                owner_cfg = (
+                    load_config()
+                    if owner_user["is_admin"]
+                    else store.get_user_config(owner)
+                )
+                shared_results, shared_at = cache.get(owner_cfg)
+                if shared_at > fetched_at:
+                    fetched_at = shared_at
+                for r in shared_results:
+                    if r.platform != share["platform"]:
+                        continue
+                    # 副本上标注来源,不改动缓存里的共享结果(避免二次合并叠加后缀)
+                    tagged = replace(r)
+                    tagged.display_name = f"{r.display_name}({owner})"
+                    if r.platform not in merged:
+                        merged[r.platform] = tagged  # 无冲突:收录
+                    elif merged[r.platform].display_name != tagged.display_name:
+                        extra.append(tagged)  # 同名冲突:来源区分,不丢弃
+            platforms = list(merged.values()) + extra
+        except Exception as exc:  # noqa: BLE001 - fetch_all 内部已隔离单平台失败,这里兜底
+            return JSONResponse({"error": f"获取用量失败:{exc}"}, status_code=500)
+        return JSONResponse({
+            "fetched_at": fetched_at,
+            "interval": cache.interval,
+            "platforms": results_to_dict(platforms)["platforms"],
+        })
 
     # ---- 页面 ----
 
@@ -573,11 +744,10 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
 
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request) -> Response:
+        """配置页对登录用户开放:页面 JS 按 /api/auth/state 分流 admin/普通用户模式。"""
         user = _current_user(request)
         if user is None:
             return RedirectResponse("/login", status_code=302)
-        if not user["is_admin"]:
-            return RedirectResponse("/", status_code=302)
         return HTMLResponse(pages["config.html"])
 
     # ---- 认证 API ----
@@ -680,26 +850,16 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
 
     # ---- 用量 API ----
 
-    def _usage_payload() -> JSONResponse:
-        try:
-            results, fetched_at = cache.get()
-        except Exception as exc:  # noqa: BLE001 - fetch_all 内部已隔离单平台失败,这里兜底
-            return JSONResponse({"error": f"获取用量失败:{exc}"}, status_code=500)
-        return JSONResponse({
-            "fetched_at": fetched_at,
-            "interval": cache.interval,
-            "platforms": results_to_dict(results)["platforms"],
-        })
-
     @app.get("/api/usage")
     def usage(user: dict[str, Any] = Depends(api_user)) -> JSONResponse:
-        return _usage_payload()
+        return _usage_payload_for(user)
 
     @app.post("/api/refresh")
     def usage_refresh(user: dict[str, Any] = Depends(api_user)) -> JSONResponse:
-        """立即刷新:失效缓存后重新 fetch_all,响应与 GET /api/usage 同构。"""
-        cache.invalidate()
-        return _usage_payload()
+        """立即刷新:失效当前用户配置对应的缓存条目后重新 fetch,响应同构。"""
+        cache.get(_config_for(user))  # 确保条目存在
+        cache.invalidate_all()
+        return _usage_payload_for(user)
 
     @app.post("/api/interval")
     def usage_interval(
@@ -716,10 +876,11 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             raise HTTPException(status_code=400, detail="间隔需为 5-3600 秒内的数字")
         return {"interval": cache.set_interval(float(value))}
 
-    # ---- 用户管理 API(管理员) ----
+    # ---- 用户管理 API ----
+    # GET 放开到任意登录用户(普通用户配置页需要共享目标列表);写操作保持管理员。
 
     @app.get("/api/users")
-    def users_list(admin: dict[str, Any] = Depends(api_admin)) -> list[dict[str, Any]]:
+    def users_list(user: dict[str, Any] = Depends(api_user)) -> list[dict[str, Any]]:
         return store.list_users()
 
     @app.post("/api/users", status_code=201)
@@ -727,6 +888,12 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         body: dict[str, Any] = Body(...),
         admin: dict[str, Any] = Depends(api_admin),
     ) -> dict[str, Any]:
+        """新建用户。单管理员模型:is_admin 一律拒绝,所有新用户都是普通用户。"""
+        if body.get("is_admin") is True:
+            raise HTTPException(
+                status_code=400,
+                detail="系统只存在一个管理员：不能创建新的管理员账号",
+            )
         username = body.get("username")
         if not _valid_username(username):
             raise HTTPException(status_code=400, detail="用户名需为 1-64 个字符")
@@ -735,7 +902,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             raise HTTPException(status_code=400, detail="密码至少 6 位")
         username = username.strip()
         try:
-            store.create_user(username, password, is_admin=bool(body.get("is_admin")))
+            store.create_user(username, password, is_admin=False)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return store.get_user(username)
@@ -790,6 +957,126 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         store.set_setting("registration_enabled", "1" if value else "0")
         return {"registration_enabled": value}
 
+    # ---- 普通用户平台配置 API ----
+    # 普通用户的平台配置存 history.db(user_configs),与 config.toml 完全隔离;
+    # 与 admin /api/config 同构:凭证槽 / gateway base_url+组 / 可见性均可编辑。
+    # 管理员调用 → 400。
+
+    def _non_admin(user: dict[str, Any]) -> dict[str, Any]:
+        if user["is_admin"]:
+            raise HTTPException(status_code=400, detail="管理员请使用 /api/config")
+        return user
+
+    def _my_platform_view(user: dict[str, Any], key: str) -> dict[str, Any]:
+        section = get_platform_config(
+            store.get_user_config(user["username"]), key
+        )
+        visibility = _visibility_view(user["username"]).get(
+            key, {"type": "private", "targets": []}
+        )
+        view: dict[str, Any] = {
+            "key": key,
+            "display_name": section.get("display_name") or DISPLAY_NAMES[key],
+            "enabled": section.get("enabled", True),
+            "visibility": visibility,
+        }
+        if CREDENTIAL_FIELDS[key]:
+            view["credential_slots"] = _credential_slots_view(
+                section, CREDENTIAL_FIELDS[key]
+            )
+        if key == "llm-gateway":
+            view["base_url"] = section.get("base_url")
+            view["groups"] = _gateway_groups_view(section)
+        return view
+
+    @app.get("/api/my/platforms")
+    def my_platforms(
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, Any]:
+        user = _non_admin(user)
+        cfg_order = get_platform_order(store.get_user_config(user["username"]))
+        order = {k: i for i, k in enumerate(cfg_order)}
+        reg = registry_index()
+        keys = sorted(PROVIDERS, key=lambda k: (order.get(k, len(cfg_order)), reg[k]))
+        return {"platforms": [_my_platform_view(user, key) for key in keys]}
+
+    @app.put("/api/my/platforms/{key}")
+    def my_platforms_put(
+        key: str,
+        body: dict[str, Any] = Body(...),
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, Any]:
+        user = _non_admin(user)
+        if key not in PROVIDERS:
+            raise HTTPException(status_code=404, detail="未知平台")
+        # 普通用户走槽式 API:顶层凭证字段一律按未知字段拒绝
+        extra = sorted(set(body) - {"enabled", "visibility", "credential_slots", "base_url", "groups", "display_name"})
+        if extra:
+            raise HTTPException(
+                status_code=400, detail="未知字段: " + ", ".join(extra)
+            )
+        if "display_name" in body and key != "llm-gateway":
+            raise HTTPException(
+                status_code=400, detail=f"平台 {key} 不支持字段: display_name"
+            )
+        if "groups" in body and key != "llm-gateway":
+            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
+        if "base_url" in body and key != "llm-gateway":
+            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
+        if "credential_slots" in body and key == "llm-gateway":
+            raise HTTPException(
+                status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
+            )
+        if "credential_slots" in body and not CREDENTIAL_FIELDS[key]:
+            raise HTTPException(
+                status_code=400, detail=f"平台 {key} 不支持字段: credential_slots"
+            )
+        visibility = None
+        if "visibility" in body:
+            try:
+                visibility = _validate_visibility(
+                    body["visibility"], user["username"]
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        cfg = store.get_user_config(user["username"])
+        platforms = cfg.setdefault("platforms", {})
+        section = platforms.setdefault(key, {})
+        if isinstance(body.get("enabled"), bool):
+            section["enabled"] = body["enabled"]
+        if "credential_slots" in body:
+            # 校验来源是用户自己已存的 section;留空 = 保留既有值
+            try:
+                section["credentials"] = _validate_credential_slots(
+                    body["credential_slots"], section, CREDENTIAL_FIELDS[key]
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # 槽式保存后清除顶层凭证字段(单 JSON 原子写,无中间态问题)
+            for field in _CREDENTIAL_NAMES:
+                section.pop(field, None)
+        if key == "llm-gateway":
+            display_name = body.get("display_name")
+            # 留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
+            if isinstance(display_name, str) and display_name.strip():
+                section["display_name"] = display_name.strip()
+            base_url = body.get("base_url")
+            # 留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
+            if isinstance(base_url, str) and base_url.strip():
+                section["base_url"] = base_url.strip()
+            if "groups" in body:
+                try:
+                    section["groups"] = _validate_gateway_groups(
+                        body["groups"], section
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                section["use_groups"] = True
+        store.set_user_config(user["username"], cfg)
+        if visibility is not None:
+            _apply_visibility(user["username"], key, visibility)
+        return _my_platform_view(user, key)
+
     # ---- 供应商配置 API(管理员) ----
 
     @app.get("/api/config")
@@ -798,7 +1085,15 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         order = {k: i for i, k in enumerate(cfg_order)}
         reg = registry_index()
         keys = sorted(PROVIDERS, key=lambda k: (order.get(k, len(cfg_order)), reg[k]))
-        return {"platforms": [_platform_view(key) for key in keys]}
+        vis = _visibility_view(admin["username"])
+        return {
+            "platforms": [
+                {**_platform_view(key), "visibility": vis.get(
+                    key, {"type": "private", "targets": []}
+                )}
+                for key in keys
+            ]
+        }
 
     @app.put("/api/config/platforms/{key}")
     def config_put(
@@ -808,7 +1103,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     ) -> dict[str, Any]:
         if key not in PROVIDERS:
             raise HTTPException(status_code=404, detail="未知平台")
-        extra = sorted(set(body) - _CONFIG_FIELDS - {"credential_slots"})
+        extra = sorted(set(body) - _CONFIG_FIELDS - {"credential_slots", "visibility"})
         if extra:
             raise HTTPException(
                 status_code=400, detail="未知字段: " + ", ".join(extra)
@@ -831,6 +1126,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
                     status_code=400, detail=f"平台 {key} 不支持字段: {field}"
                 )
         updates: dict[str, Any] = {}
+        visibility: dict[str, Any] | None = None
         if isinstance(body.get("enabled"), bool):
             updates["enabled"] = body["enabled"]
         display_name = body.get("display_name")
@@ -864,13 +1160,24 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             # 覆盖历史遗留的 use_groups=false:保存后 fetch 一定走分组模式
             updates["use_groups"] = True
+        if "visibility" in body:
+            try:
+                visibility = _validate_visibility(body["visibility"], admin["username"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if updates:
-            new_config = update_platform_config(key, updates)
+            update_platform_config(key, updates)
             if "credential_slots" in body:
                 # 槽式保存后清除顶层凭证字段,避免双写不一致(先写后删,避免中间态)
-                new_config = _clear_top_level_credentials(key)
-            cache.set_config(new_config)
-        return _platform_view(key)
+                _clear_top_level_credentials(key)
+        if visibility is not None:
+            _apply_visibility(admin["username"], key, visibility)
+        return {
+            **_platform_view(key),
+            "visibility": _visibility_view(admin["username"]).get(
+                key, {"type": "private", "targets": []}
+            ),
+        }
 
     @app.put("/api/config/order")
     def config_put_order(
@@ -883,8 +1190,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         known = [k for k in order if k in PROVIDERS]
         missing = [k for k in PROVIDERS if k not in known]
         full_order = known + missing
-        new_config = set_platform_order(full_order)
-        cache.set_config(new_config)
+        set_platform_order(full_order)
         return {"order": full_order}
 
     return app

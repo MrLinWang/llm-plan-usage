@@ -281,7 +281,8 @@ class TestWebAuth:
         )
         assert resp.status_code == 200
         assert viewer.get("/").status_code == 200
-        assert viewer.get("/api/users").status_code == 403
+        # 普通用户需要共享目标列表 → GET /api/users 放开到任意登录用户
+        assert viewer.get("/api/users").status_code == 200
         assert viewer.get("/api/config").status_code == 403
         resp = viewer.get("/users", follow_redirects=False)
         assert resp.status_code == 302
@@ -302,17 +303,27 @@ class TestWebAuth:
         assert "viewer" not in names
         assert client.delete("/api/users/viewer").status_code == 404
 
-    def test_cannot_delete_self_or_last_admin(
+    def test_cannot_delete_self_and_single_admin_enforced(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
     ) -> None:
+        """单管理员模型:POST /api/users 的 is_admin 一律拒绝;不能删除自己。"""
         client, _ = _auth_client(monkeypatch, tmp_db_path)
-        client.post(
+        # 尝试创建第二个管理员 → 400,用户未创建,count_admins 恒为 1
+        resp = client.post(
             "/api/users",
             json={"username": "admin2", "password": "secret2", "is_admin": True},
         )
-        # 两个管理员时可删另一个
-        assert client.delete("/api/users/admin2").status_code == 200
-        # 只剩自己:删自己 → 400(最后管理员保护的实际路径)
+        assert resp.status_code == 400
+        assert "管理员" in resp.json()["detail"]
+        assert store.get_user("admin2") is None
+        assert store.count_admins() == 1
+        # 不带 is_admin 的新用户 → 普通用户
+        resp = client.post(
+            "/api/users", json={"username": "viewer", "password": "secret2"}
+        )
+        assert resp.status_code == 201
+        assert store.get_user("viewer")["is_admin"] is False
+        # 唯一管理员删自己 → 400(最后管理员保护的实际路径)
         resp = client.delete("/api/users/admin")
         assert resp.status_code == 400
 
@@ -972,3 +983,632 @@ class TestRegistration:
         users_html = client.get("/users").text
         assert "reg-enabled" in users_html
         assert "注册设置" in users_html
+
+
+class TestUserStore:
+    """user_configs / user_shares 存储层:读写、覆盖、级联删除。"""
+
+    def test_user_config_roundtrip(self, tmp_db_path: Path) -> None:
+        assert store.get_user_config("alice") == {}
+        cfg = {"platforms": {"kimi": {"enabled": True}}}
+        store.set_user_config("alice", cfg)
+        assert store.get_user_config("alice") == cfg
+        # 覆盖写
+        store.set_user_config("alice", {"platforms": {"ollama": {"enabled": False}}})
+        assert store.get_user_config("alice") == {"platforms": {"ollama": {"enabled": False}}}
+        store.delete_user_config("alice")
+        assert store.get_user_config("alice") == {}
+
+    def test_user_config_corrupt_json(self, tmp_db_path: Path) -> None:
+        store.create_user("alice", "secret1")
+        store.set_user_config("alice", {"platforms": {}})
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            "UPDATE user_configs SET config = 'not-json' WHERE username = 'alice'"
+        )
+        conn.commit()
+        conn.close()
+        assert store.get_user_config("alice") == {}
+
+    def test_visibility_crud(self, tmp_db_path: Path) -> None:
+        store.create_user("alice", "secret1")
+        store.create_user("bob", "secret2")
+        store.create_user("admin", "secret3", is_admin=True)
+        store.set_platform_visibility("alice", "kimi", "*")
+        store.set_platform_visibility("alice", "ollama", "bob")
+        # bob 可见:公开 + 指定共享;admin 只可见公开的
+        assert store.list_shared_platforms("bob") == [
+            {"owner": "alice", "platform": "kimi"},
+            {"owner": "alice", "platform": "ollama"},
+        ]
+        assert store.list_shared_platforms("admin") == [
+            {"owner": "alice", "platform": "kimi"}
+        ]
+        assert store.list_my_visibility("alice") == [
+            {"platform": "kimi", "target": "*"},
+            {"platform": "ollama", "target": "bob"},
+        ]
+        # 空 target = 仅清除;替换旧行
+        store.set_platform_visibility("alice", "ollama", "")
+        store.set_platform_visibility("alice", "kimi", "bob")
+        assert store.list_shared_platforms("bob") == [
+            {"owner": "alice", "platform": "kimi"}
+        ]
+        assert store.list_shared_platforms("admin") == []
+
+    def test_delete_user_cascades_config_and_shares(self, tmp_db_path: Path) -> None:
+        store.create_user("alice", "secret1")
+        store.create_user("bob", "secret2")
+        store.set_user_config("alice", {"platforms": {"kimi": {"enabled": True}}})
+        store.set_platform_visibility("alice", "kimi", "bob")  # owner 行
+        store.set_platform_visibility("bob", "ollama", "alice")  # target 行
+        assert store.delete_user("alice")
+        assert store.get_user_config("alice") == {}
+        assert store.list_my_visibility("alice") == []
+        # bob 不再被 alice 共享,也不再共享给 alice
+        assert store.list_shared_platforms("bob") == []
+        assert store.list_shared_platforms("admin") == []
+        assert store.delete_user("alice") is False
+
+
+class TestUserIsolation:
+    """多用户用量隔离:默认私有、共享可见性、普通用户 DB 配置。"""
+
+    def _config_client(
+        self, monkeypatch: pytest.MonkeyPatch, cfg: dict,
+    ) -> tuple[TestClient, list[int]]:
+        """App + 已登录 admin;fetch 假实现按传入配置返回各启用平台(真实 fetch 语义)。"""
+        from llm_usage.providers import DISPLAY_NAMES, PROVIDERS
+
+        calls = [0]
+
+        def fake(cfg_in):
+            calls[0] += 1
+            platforms = (cfg_in or {}).get("platforms", {}) or {}
+            out = []
+            for key in PROVIDERS:
+                section = platforms.get(key)
+                if section is None or section.get("enabled", True) is False:
+                    continue
+                entry = UsageEntry(key, "一次", 60, 120, 60, 50.0, None, "%", False)
+                out.append(PlatformResult(
+                    key, section.get("display_name") or DISPLAY_NAMES[key],
+                    entries=[entry],
+                ))
+            return out
+
+        monkeypatch.setattr("llm_usage.web.fetch_all", fake)
+        client = TestClient(create_app(cfg, interval=60))
+        store.create_user("admin", "secret1", is_admin=True)
+        r = client.post("/api/auth/login", json={"username": "admin", "password": "secret1"})
+        assert r.status_code == 200
+        return client, calls
+
+    def _register(self, client: TestClient, username: str) -> TestClient:
+        """注册 alice/bob 等普通用户并返回其已登录 client。"""
+        client.put("/api/settings", json={"registration_enabled": True})
+        anon = TestClient(client.app)
+        r = anon.post(
+            "/api/auth/register", json={"username": username, "password": "secret1"}
+        )
+        assert r.status_code == 200
+        return anon
+
+    def test_default_private(self, monkeypatch: pytest.MonkeyPatch,
+                             tmp_db_path: Path, tmp_config_path: Path) -> None:
+        """默认私有:普通用户 usage 为空;admin 仍见 config.toml 全部平台。"""
+        init_config(tmp_config_path)
+        client, calls = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        assert alice.get("/api/usage").json()["platforms"] == []
+        admin_names = [p["name"] for p in client.get("/api/usage").json()["platforms"]]
+        assert set(admin_names) == {
+            "kimi", "volcengine-coding", "volcengine-agent", "ollama",
+            "opencode-go", "llm-gateway",
+        }
+        assert calls[0] == 2  # alice 空配置 + admin 配置,各自缓存条目
+
+    def test_admin_share_to_user(self, monkeypatch: pytest.MonkeyPatch,
+                                 tmp_db_path: Path, tmp_config_path: Path) -> None:
+        """admin 共享给 A → 仅 A 可见;公开 → 所有普通用户可见并带 (admin) 后缀。"""
+        init_config(tmp_config_path)
+        client, calls = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        bob = self._register(client, "bob")
+        # 先共享给 alice
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "visibility": {"type": "shared", "targets": ["alice"]},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["visibility"] == {"type": "shared", "targets": ["alice"]}
+        alice_names = [p["name"] for p in alice.get("/api/usage").json()["platforms"]]
+        bob_names = [p["name"] for p in bob.get("/api/usage").json()["platforms"]]
+        assert "llm-gateway" in alice_names
+        assert alice_names == ["llm-gateway"]  # 自己的配置为空,仅共享平台
+        assert "llm-gateway" not in bob_names
+        # 公开 → 所有人都可见,带 (admin) 后缀
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "visibility": {"type": "public", "targets": []},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["visibility"] == {"type": "public", "targets": []}
+        for viewer in (alice, bob):
+            gateway = [p for p in viewer.get("/api/usage").json()["platforms"]
+                       if p["name"] == "llm-gateway"][0]
+            assert gateway["display_name"] == "LLM Gateway(admin)"
+        # 私有 → 无人可见
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "visibility": {"type": "private", "targets": []},
+        })
+        assert resp.status_code == 200
+        for viewer in (alice, bob):
+            names = [p["name"] for p in viewer.get("/api/usage").json()["platforms"]]
+            assert "llm-gateway" not in names
+
+    def test_my_platform_enable_and_visibility(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """普通用户启用自己的平台 → 仅自己可见;公开后他人可见且带 (用户名) 后缀。"""
+        init_config(tmp_config_path)
+        client, calls = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        bob = self._register(client, "bob")
+        # alice 启用 kimi
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "visibility": {"type": "private", "targets": []},
+        })
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "key": "kimi",
+            "display_name": "Kimi Code",
+            "enabled": True,
+            "visibility": {"type": "private", "targets": []},
+            "credential_slots": [],
+        }
+        # 自己的配置存 DB,与 config.toml 隔离
+        assert store.get_user_config("alice") == {
+            "platforms": {"kimi": {"enabled": True}}
+        }
+        alice_names = [p["name"] for p in alice.get("/api/usage").json()["platforms"]]
+        assert alice_names == ["kimi"]
+        assert [p["name"] for p in bob.get("/api/usage").json()["platforms"]] == []
+        # 公开 kimi → bob 可见且带 (alice) 后缀
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "visibility": {"type": "public", "targets": []},
+        })
+        assert resp.status_code == 200
+        bob_kimi = [p for p in bob.get("/api/usage").json()["platforms"]
+                    if p["name"] == "kimi"]
+        assert bob_kimi and bob_kimi[0]["display_name"] == "Kimi Code(alice)"
+        # admin 仪表盘仍是 config.toml 平台,不带 (alice) 后缀
+        admin_kimi = [p for p in client.get("/api/usage").json()["platforms"]
+                      if p["name"] == "kimi"][0]
+        assert admin_kimi["display_name"] == "Kimi Code"
+        assert calls[0] == 3  # alice + bob + admin 各一次
+
+    def test_my_platform_credentials_persist(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """普通用户凭证槽保存:写 credentials 数组、清除顶层凭证、留空保留、视图脱敏。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        # 新槽写入
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "credential_slots": [
+                {"index": None, "name": None, "api_key": "sk-alice-key"},
+            ],
+        })
+        assert resp.status_code == 200
+        assert store.get_user_config("alice") == {
+            "platforms": {
+                "kimi": {
+                    "enabled": True,
+                    "credentials": [{"name": "套餐1", "api_key": "sk-alice-key"}],
+                }
+            }
+        }
+        # 视图脱敏
+        slot = resp.json()["credential_slots"][0]
+        assert slot["credentials"]["api_key"] == {
+            "set": True, "env": None, "hint": "sk-a…ey",
+        }
+        # 留空 = 保留既有值;名称留空 = 保留既有名称
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "credential_slots": [
+                {"index": 0, "name": None, "api_key": ""},
+            ],
+        })
+        assert resp.status_code == 200
+        assert store.get_user_config("alice")["platforms"]["kimi"]["credentials"] == [
+            {"name": "套餐1", "api_key": "sk-alice-key"}
+        ]
+        # 新槽(无 index)+ 既有槽并存
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "credential_slots": [
+                {"index": 0, "name": None, "api_key": ""},
+                {"index": None, "name": "套餐B", "api_key": "sk-b-key"},
+            ],
+        })
+        assert resp.status_code == 200
+        creds = store.get_user_config("alice")["platforms"]["kimi"]["credentials"]
+        assert creds == [
+            {"name": "套餐1", "api_key": "sk-alice-key"},
+            {"name": "套餐B", "api_key": "sk-b-key"},
+        ]
+        # 明文不回显
+        raw = alice.get("/api/my/platforms").text
+        assert "sk-alice-key" not in raw and "sk-b-key" not in raw
+
+    def test_my_platform_gateway_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """普通用户 gateway:base_url + groups 写入、use_groups=true、留空 base_url 不修改。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        resp = alice.put("/api/my/platforms/llm-gateway", json={
+            "enabled": True,
+            "base_url": "http://127.0.0.1:18080",
+            "groups": [
+                {"index": None, "name": "组1", "daily_limit": None,
+                 "api_keys": ["g-alice-key"]},
+            ],
+        })
+        assert resp.status_code == 200
+        section = store.get_user_config("alice")["platforms"]["llm-gateway"]
+        assert section["base_url"] == "http://127.0.0.1:18080"
+        assert section["use_groups"] is True
+        assert section["groups"] == [
+            {"name": "组1", "api_keys": ["g-alice-key"]}
+        ]
+        # 视图:key 脱敏;base_url 原文可见
+        group = resp.json()["groups"][0]
+        assert group["api_keys"][0] == {
+            "name": None, "set": True, "env": None, "hint": "g-al…ey",
+        }
+        # 留空 base_url 不修改;groups 留空 key = 保留
+        resp = alice.put("/api/my/platforms/llm-gateway", json={
+            "enabled": True,
+            "base_url": "",
+            "groups": [
+                {"index": 0, "name": "组1", "daily_limit": None,
+                 "api_keys": [{"index": 0, "value": None}]},
+            ],
+        })
+        assert resp.status_code == 200
+        section = store.get_user_config("alice")["platforms"]["llm-gateway"]
+        assert section["base_url"] == "http://127.0.0.1:18080"
+        assert section["groups"] == [
+            {"name": "组1", "api_keys": ["g-alice-key"]}
+        ]
+
+    def test_my_platform_put_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """普通用户保存校验:空槽/缺 secret_key/gateway 槽/顶层凭证字段/未知平台 → 400。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        for body in (
+            {"credential_slots": []},                                    # 空槽数组
+            {"credential_slots": [{"index": None, "api_key": ""}]},      # 缺 api_key
+            {"credential_slots": [{"index": None, "access_key": "AK",
+                                   "secret_key": ""}]},                  # 缺 secret_key
+            {"api_key": "sk-top"},                                       # 顶层凭证字段
+            {"groups": [{"name": "组1", "api_keys": ["k"]}]},            # kimi 不支持 groups
+            {"base_url": "http://x"},                                    # kimi 不支持 base_url
+        ):
+            resp = alice.put("/api/my/platforms/kimi", json=body)
+            assert resp.status_code == 400, body
+        # gateway 不接受 credential_slots
+        resp = alice.put("/api/my/platforms/llm-gateway", json={
+            "credential_slots": [{"index": None, "api_key": "k"}],
+        })
+        assert resp.status_code == 400
+        # 未知平台
+        assert alice.put("/api/my/platforms/ghost", json={
+            "enabled": True,
+        }).status_code == 404
+        # 校验失败不落库
+        assert store.get_user_config("alice") == {}
+
+    def test_own_platform_and_shared_coexist(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """同名冲突全部保留:自己的裸名 + admin 来源 + alice 来源三张卡并存。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        bob = self._register(client, "bob")
+        # admin 在 config.toml 已启用 kimi,公开给所有人
+        resp = client.put("/api/config/platforms/kimi", json={
+            "visibility": {"type": "public", "targets": []},
+        })
+        assert resp.status_code == 200
+        # alice 公开自己的 kimi
+        alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "visibility": {"type": "public", "targets": []},
+        })
+        bob_kimi = [(p["name"], p["display_name"])
+                    for p in bob.get("/api/usage").json()["platforms"]
+                    if p["name"] == "kimi"]
+        # admin 来源也标注 (admin) 后缀;两来源并存,按 owner 排序
+        assert bob_kimi == [
+            ("kimi", "Kimi Code(admin)"),
+            ("kimi", "Kimi Code(alice)"),
+        ]
+        # bob 自己启用 kimi → 第三个裸名卡,三来源互不覆盖
+        bob.put("/api/my/platforms/kimi", json={"enabled": True})
+        bob_kimi = [(p["name"], p["display_name"])
+                    for p in bob.get("/api/usage").json()["platforms"]
+                    if p["name"] == "kimi"]
+        assert bob_kimi == [
+            ("kimi", "Kimi Code"),
+            ("kimi", "Kimi Code(admin)"),
+            ("kimi", "Kimi Code(alice)"),
+        ]
+
+    def test_my_platform_gateway_display_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """普通用户 gateway 自定义仪表盘名称:持久化、留空不修改、共享带 (owner) 后缀。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        bob = self._register(client, "bob")
+        # 自定义显示名称 + 启用 + 公开
+        resp = alice.put("/api/my/platforms/llm-gateway", json={
+            "enabled": True,
+            "display_name": "我的渠道",
+            "visibility": {"type": "public", "targets": []},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["display_name"] == "我的渠道"
+        assert store.get_user_config("alice")["platforms"]["llm-gateway"] == {
+            "enabled": True,
+            "display_name": "我的渠道",
+        }
+        # 自己的仪表盘显示自定义名(无后缀)
+        alice_gw = [p for p in alice.get("/api/usage").json()["platforms"]
+                    if p["name"] == "llm-gateway"][0]
+        assert alice_gw["display_name"] == "我的渠道"
+        # 共享给他人 → 自定义名 + (owner) 后缀
+        bob_gw = [p for p in bob.get("/api/usage").json()["platforms"]
+                  if p["name"] == "llm-gateway"][0]
+        assert bob_gw["display_name"] == "我的渠道(alice)"
+        # 留空 = 不修改
+        resp = alice.put("/api/my/platforms/llm-gateway", json={
+            "enabled": True,
+            "display_name": "",
+        })
+        assert resp.status_code == 200
+        assert store.get_user_config("alice")["platforms"]["llm-gateway"][
+            "display_name"] == "我的渠道"
+        # 非 gateway 平台拒绝 display_name
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "display_name": "K",
+        })
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "平台 kimi 不支持字段: display_name"
+
+    def test_admin_gateway_display_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """admin gateway 自定义名称写 config.toml,仪表盘与共享视图生效。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "enabled": True,
+            "display_name": "内网网关",
+            "visibility": {"type": "public", "targets": []},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["display_name"] == "内网网关"
+        admin_gw = [p for p in client.get("/api/usage").json()["platforms"]
+                    if p["name"] == "llm-gateway"][0]
+        assert admin_gw["display_name"] == "内网网关"
+        alice_gw = [p for p in alice.get("/api/usage").json()["platforms"]
+                    if p["name"] == "llm-gateway"][0]
+        assert alice_gw["display_name"] == "内网网关(admin)"
+        # 留空 = 不修改
+        resp = client.put("/api/config/platforms/llm-gateway", json={
+            "enabled": True,
+            "display_name": "",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["display_name"] == "内网网关"
+
+    def test_my_platforms_list_matches_admin_shape(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """普通用户平台列表与 admin 视图同构:凭证槽/base_url/groups,无明文。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        data = alice.get("/api/my/platforms").json()
+        keys = [p["key"] for p in data["platforms"]]
+        assert keys == [
+            "kimi", "volcengine-coding", "volcengine-agent", "ollama",
+            "opencode-go", "llm-gateway",
+        ]
+        for p in data["platforms"]:
+            assert p["visibility"] == {"type": "private", "targets": []}
+            if p["key"] == "llm-gateway":
+                assert set(p) == {
+                    "key", "display_name", "enabled", "visibility",
+                    "base_url", "groups",
+                }
+                assert p["base_url"] is None
+                assert p["groups"] == []  # 无凭证/无 legacy 单 key → 空组列表
+            elif p["key"] in ("kimi", "volcengine-coding", "volcengine-agent",
+                              "ollama", "opencode-go"):
+                assert set(p) == {
+                    "key", "display_name", "enabled", "visibility",
+                    "credential_slots",
+                }
+                assert p["credential_slots"] == []
+        # 存一条凭证后视图脱敏,不回明文
+        alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "credential_slots": [
+                {"index": None, "name": None, "api_key": "sk-alice-secret"},
+            ],
+        })
+        data = alice.get("/api/my/platforms").json()
+        kimi = next(p for p in data["platforms"] if p["key"] == "kimi")
+        slot = kimi["credential_slots"][0]
+        assert slot["name"] == "套餐1"
+        assert slot["credentials"]["api_key"] == {
+            "set": True, "env": None, "hint": "sk-a…et",
+        }
+        raw = alice.get("/api/my/platforms").text
+        assert "sk-alice-secret" not in raw
+
+    def test_admin_cannot_use_my_api(self, monkeypatch: pytest.MonkeyPatch,
+                                     tmp_db_path: Path,
+                                     tmp_config_path: Path) -> None:
+        """admin 调 /api/my/* → 400;普通用户调 /api/config → 403;GET /api/users 放开。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        assert client.get("/api/my/platforms").status_code == 400
+        assert client.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+        }).status_code == 400
+        alice = self._register(client, "alice")
+        assert alice.get("/api/config").status_code == 403
+        assert alice.put(
+            "/api/config/platforms/kimi", json={"enabled": True}
+        ).status_code == 403
+        assert alice.get("/api/users").status_code == 200  # 共享目标列表
+        names = [u["username"] for u in alice.get("/api/users").json()]
+        assert "alice" in names and "admin" in names
+
+    def test_visibility_validation(self, monkeypatch: pytest.MonkeyPatch,
+                                   tmp_db_path: Path, tmp_config_path: Path) -> None:
+        """无效 type/target → 400;共享给自己 → 400;重复 target 去重。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        for bad in (
+            {"type": "everyone", "targets": []},
+            {"type": "shared", "targets": "alice"},
+            {"type": "shared", "targets": []},
+            {"type": "shared", "targets": ["ghost"]},
+            {"type": "shared", "targets": ["alice"]},   # 不能共享给自己
+            {"type": "public", "targets": ["alice"]},
+            {"type": "shared", "targets": ["admin", "bob"]},  # bob 尚不存在
+        ):
+            resp = alice.put("/api/my/platforms/kimi", json={
+                "enabled": True, "visibility": bad,
+            })
+            assert resp.status_code == 400, bad
+        # 注册 bob 后共享生效;重复 target 去重
+        bob = self._register(client, "bob")
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "visibility": {"type": "shared", "targets": ["bob", "bob"]},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["visibility"] == {"type": "shared", "targets": ["bob"]}
+        bob_kimi = [p for p in bob.get("/api/usage").json()["platforms"]
+                    if p["name"] == "kimi"]
+        assert bob_kimi and bob_kimi[0]["display_name"] == "Kimi Code(alice)"
+        # admin 侧同样校验
+        resp = client.put("/api/config/platforms/kimi", json={
+            "visibility": {"type": "shared", "targets": ["ghost"]},
+        })
+        assert resp.status_code == 400
+        resp = client.put("/api/config/platforms/kimi", json={
+            "visibility": {"type": "shared", "targets": ["admin"]},
+        })
+        assert resp.status_code == 400
+
+    def test_share_to_admin_and_duplicate_owners(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """共享给 admin 合法(其仪表盘全量,无实际效果);多 owner 共享同平台全部保留。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        bob = self._register(client, "bob")
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "visibility": {"type": "shared", "targets": ["admin"]},
+        })
+        assert resp.status_code == 200  # 允许共享给 admin
+        # 两个 owner 公开同一平台 → 观众同时看到两个来源,后缀区分,不丢弃
+        alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "visibility": {"type": "public", "targets": []},
+        })
+        bob.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "visibility": {"type": "public", "targets": []},
+        })
+        carol = self._register(client, "carol")
+        kimi = carol.get("/api/usage").json()["platforms"]
+        names = [(p["name"], p["display_name"]) for p in kimi]
+        assert names == [("kimi", "Kimi Code(alice)"), ("kimi", "Kimi Code(bob)")]
+        # admin 仪表盘:自己的 config.toml kimi 裸名,无共享后缀
+        viewer = TestClient(client.app)
+        viewer.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        kimi = [p for p in viewer.get("/api/usage").json()["platforms"]
+                if p["name"] == "kimi"]
+        assert kimi and kimi[0]["display_name"] == "Kimi Code"
+
+    def test_shared_config_deduped_by_config_hash(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """同配置多用户共享同一缓存条目(配置哈希驱动,不重复 fetch)。"""
+        init_config(tmp_config_path)
+        client, calls = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        bob = self._register(client, "bob")
+        alice.put("/api/my/platforms/kimi", json={
+            "enabled": True, "visibility": {"type": "public", "targets": []},
+        })
+        bob.put("/api/my/platforms/kimi", json={
+            "enabled": True, "visibility": {"type": "public", "targets": []},
+        })
+        alice.get("/api/usage")
+        bob.get("/api/usage")
+        # alice/bob 配置哈希相同 → 两人共享同一条缓存,总共只 fetch 一次(去重的证据)
+        assert calls[0] == 1
+
+    def test_config_page_dual_mode_hooks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """配置页对普通用户开放(JS 双模式),页面含普通用户端点与可见性控件。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        html = client.get("/config").text
+        assert "/api/my/platforms" in html       # 普通用户模式端点
+        assert "buildVisibilityRow" in html      # 可见性控件
+        assert "dragstart" in html               # admin 拖拽排序保留
+        alice = self._register(client, "alice")
+        alice_html = alice.get("/config").text
+        assert "/api/my/platforms" in alice_html

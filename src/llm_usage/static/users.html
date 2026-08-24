@@ -214,9 +214,7 @@
       <label>密码(至少 6 位)
         <input id="new-password" type="password" autocomplete="new-password" required>
       </label>
-      <label class="check">
-        <input id="new-is-admin" type="checkbox"> 设为管理员
-      </label>
+      <div class="hint">新建账号均为普通用户（系统只存在一个管理员）</div>
       <div id="create-err" class="form-err"></div>
       <button class="btn" type="submit">创建用户</button>
     </form>
@@ -370,13 +368,11 @@ document.getElementById("create-form").addEventListener("submit", async function
     body: JSON.stringify({
       username: document.getElementById("new-username").value,
       password: document.getElementById("new-password").value,
-      is_admin: document.getElementById("new-is-admin").checked,
     }),
   });
   if (!r.ok) { errEl.textContent = await detailOf(r); return; }
   document.getElementById("new-username").value = "";
   document.getElementById("new-password").value = "";
-  document.getElementById("new-is-admin").checked = false;
   loadUsers();
 });
 

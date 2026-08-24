@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
@@ -51,6 +52,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_configs (
+  username TEXT PRIMARY KEY,
+  config TEXT NOT NULL,          -- JSON: {"platforms": {key: section}}
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_shares (
+  owner TEXT NOT NULL, platform TEXT NOT NULL, target TEXT NOT NULL,
+  PRIMARY KEY (owner, platform, target)
 );
 """
 
@@ -287,10 +297,16 @@ def set_user_password(
 
 
 def delete_user(username: str, path: Path | None = None) -> bool:
-    """Delete a user and their sessions. Returns False if the user is absent."""
+    """Delete a user, their sessions, config and shares. Returns False if absent."""
     conn = _connect(path)
     try:
         conn.execute("DELETE FROM sessions WHERE username = ?", (username,))
+        conn.execute("DELETE FROM user_configs WHERE username = ?", (username,))
+        # 用户既是 owner 也是 target:两方向的行都删
+        conn.execute(
+            "DELETE FROM user_shares WHERE owner = ? OR target = ?",
+            (username, username),
+        )
         cur = conn.execute("DELETE FROM users WHERE username = ?", (username,))
         conn.commit()
         return cur.rowcount > 0
@@ -393,6 +409,142 @@ def set_setting(key: str, value: str, path: Path | None = None) -> None:
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
             (key, value),
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---- 用户平台配置与可见性(多用户隔离) ----
+
+def get_user_config(
+    username: str, path: Path | None = None
+) -> dict[str, Any]:
+    """Return a user's platform config (``{"platforms": {key: section}}``).
+
+    Missing row or corrupt JSON → ``{}`` (never crashes).
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT config FROM user_configs WHERE username = ?", (username,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row[0])
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def set_user_config(
+    username: str, config: dict[str, Any], path: Path | None = None
+) -> None:
+    """INSERT OR REPLACE a user's own platform config."""
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_configs (username, config, updated_at) "
+            "VALUES (?,?,?)",
+            (username, json.dumps(config, ensure_ascii=False), _now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_user_config(username: str, path: Path | None = None) -> None:
+    """Drop a user's stored platform config."""
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "DELETE FROM user_configs WHERE username = ?", (username,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_shared_platforms(
+    username: str, path: Path | None = None
+) -> list[dict[str, str]]:
+    """Platforms shared to ``username`` (directly or publicly), owner-sorted.
+
+    Joins ``users`` so a deleted owner's stale rows are invisible.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT s.owner, s.platform FROM user_shares s "
+            "JOIN users u ON u.username = s.owner "
+            "WHERE s.target = ? OR s.target = '*' "
+            "ORDER BY s.owner",
+            (username,),
+        ).fetchall()
+        return [{"owner": r[0], "platform": r[1]} for r in rows]
+    finally:
+        conn.close()
+
+
+def list_my_visibility(
+    username: str, path: Path | None = None
+) -> list[dict[str, str]]:
+    """A user's own share rows: ``[{"platform", "target"}]``."""
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT platform, target FROM user_shares WHERE owner = ? "
+            "ORDER BY platform, target",
+            (username,),
+        ).fetchall()
+        return [{"platform": r[0], "target": r[1]} for r in rows]
+    finally:
+        conn.close()
+
+
+def set_platform_visibility(
+    username: str, platform: str, target: str, path: Path | None = None
+) -> None:
+    """Replace one platform's visibility rows; empty ``target`` = clear only."""
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "DELETE FROM user_shares WHERE owner = ? AND platform = ?",
+            (username, platform),
+        )
+        if target:
+            conn.execute(
+                "INSERT INTO user_shares (owner, platform, target) VALUES (?,?,?)",
+                (username, platform, target),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def replace_platform_visibility(
+    username: str, platform: str, targets: list[str], path: Path | None = None
+) -> None:
+    """Replace one platform's visibility rows with a target list (atomically).
+
+    Targets are the deduped normalized user list from the visibility API:
+    ``["*"]`` = public, ``[]`` = private, otherwise per-user targets.
+    """
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "DELETE FROM user_shares WHERE owner = ? AND platform = ?",
+            (username, platform),
+        )
+        for target in targets:
+            conn.execute(
+                "INSERT INTO user_shares (owner, platform, target) VALUES (?,?,?)",
+                (username, platform, target),
+            )
         conn.commit()
     finally:
         conn.close()

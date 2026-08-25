@@ -184,9 +184,9 @@ class KimiProvider:
                     self.name, display_name, error="响应中未找到用量数据"
                 )
             return PlatformResult(self.name, display_name, entries=entries)
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
             return PlatformResult(
-                self.name, display_name, error=f"网络错误：{exc}"
+                self.name, display_name, error="网络错误"
             )
         finally:
             if own_client:

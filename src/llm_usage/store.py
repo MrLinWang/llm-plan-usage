@@ -15,6 +15,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,8 @@ CREATE TABLE IF NOT EXISTS user_shares (
   owner TEXT NOT NULL, platform TEXT NOT NULL, target TEXT NOT NULL,
   PRIMARY KEY (owner, platform, target)
 );
+CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_snapshots_platform ON snapshots(platform);
 """
 
 
@@ -70,17 +73,40 @@ def db_path() -> Path:
     return Path(env) if env else DB_PATH
 
 
+_init_lock = threading.Lock()
+_init_done: set[str] = set()
+
+def _init_schema(conn: sqlite3.Connection, path: Path) -> None:
+    """每个数据库文件在进程内只执行一次 DDL(测试多库互不干扰)。"""
+    key = str(path)
+    if key in _init_done:
+        return
+    with _init_lock:
+        if key in _init_done:
+            return
+        conn.executescript(_SCHEMA)
+        # 平滑迁移既有库:snapshots 缺 plan 列则补上(SQLite 无 IF NOT EXISTS 的 ADD COLUMN)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
+        if "plan" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN plan TEXT")
+        _init_done.add(key)
 
 
 def _connect(path: Path | None = None) -> sqlite3.Connection:
     p = path or db_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p))
-    conn.executescript(_SCHEMA)
-    # 平滑迁移既有库:snapshots 缺 plan 列则补上(SQLite 无 IF NOT EXISTS 的 ADD COLUMN)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
-    if "plan" not in cols:
-        conn.execute("ALTER TABLE snapshots ADD COLUMN plan TEXT")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            p.chmod(0o600)  # 含会话令牌/密码哈希/用户配置,收敛权限(幂等)
+        except OSError:
+            pass
+        _init_schema(conn, p)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -212,6 +238,48 @@ def count_admins(path: Path | None = None) -> int:
         return conn.execute(
             "SELECT COUNT(*) FROM users WHERE is_admin = 1"
         ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def create_first_admin(
+    username: str, password: str, path: Path | None = None,
+) -> bool:
+    """Atomically create the first admin; False if any user already exists.
+
+    BEGIN IMMEDIATE serializes concurrent first-setup calls so only one
+    request can win the zero-user check (setup race fix).
+    """
+    conn = _connect(path)
+    try:
+        conn.isolation_level = None  # manual BEGIN/COMMIT
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            exists = conn.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0] > 0
+            if exists:
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute(
+                "INSERT INTO users (username, password_hash, is_admin, created_at) "
+                "VALUES (?,?,?,?)",
+                (username, hash_password(password), 1, _now_iso()),
+            )
+            conn.execute("COMMIT")
+            return True
+        except sqlite3.OperationalError:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            return False  # SQLITE_BUSY: 另一并发 setup 正在提交
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
     finally:
         conn.close()
 

@@ -5,7 +5,7 @@ Covers the verification requirements from the plan:
   - millisecond resetTime parsing (Kimi)
   - 404 fallback from /usages to /usage (Kimi)
   - volcengine OpenAPI V4 signing: GetCodingPlanUsage (percent-only) + GetAFPUsage (used/total)
-  - manual providers read from config
+  - gateway sanitized error strings (no raw exception text in results)
   - error isolation (single platform failure doesn't crash)
 """
 
@@ -19,7 +19,7 @@ import pytest
 from llm_usage.models import PlatformResult, UsageEntry
 from llm_usage.providers import (
     PROVIDERS,
-    _resolve_api_key,
+    _resolve_env_value,
     fetch_all,
 )
 from llm_usage.providers.kimi import (
@@ -359,7 +359,8 @@ class TestVolcengineHttp:
             "_platform_key": "volcengine-coding", "display_name": "火山方舟",
         })
         assert not res.ok
-        assert "权限不足" in res.error
+        # 脱敏:只透出错误码,不回显上游 Message
+        assert res.error == "AccessDenied"
 
     def test_http_error(self) -> None:
         def handler(req: httpx.Request) -> httpx.Response:
@@ -371,7 +372,7 @@ class TestVolcengineHttp:
             "_platform_key": "volcengine-coding", "display_name": "火山方舟",
         })
         assert not res.ok
-        assert "500" in res.error
+        assert res.error == "HTTP 500"  # 不回显上游响应体
 
 
 # ---------------------------------------------------------------------------
@@ -798,10 +799,10 @@ class TestRegistry:
 
     def test_env_prefix_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TEST_KEY_VAR", "secret123")
-        assert _resolve_api_key("env:TEST_KEY_VAR") == "secret123"
-        assert _resolve_api_key("sk-literal") == "sk-literal"
-        assert _resolve_api_key(None) is None
-        assert _resolve_api_key("env:NONEXISTENT_VAR") is None
+        assert _resolve_env_value("env:TEST_KEY_VAR") == "secret123"
+        assert _resolve_env_value("sk-literal") == "sk-literal"
+        assert _resolve_env_value(None) is None
+        assert _resolve_env_value("env:NONEXISTENT_VAR") is None
 
     def test_fetch_all_error_isolation(self) -> None:
         """A provider missing credentials should not break the batch."""
@@ -814,6 +815,24 @@ class TestRegistry:
         results = fetch_all(cfg)
         assert len(results) == 1
         assert not results[0].ok  # error expected, not crash
+
+    def test_fetch_all_crash_isolated_as_internal_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """fetch 抛异常 → 捕获为脱敏的「内部错误」,不向用户泄露异常串。"""
+
+        class _BoomProvider:
+            name = "kimi"
+            display_name = "Kimi Code"
+            is_manual = False
+
+            def fetch(self, config):
+                raise RuntimeError("boom secret detail")
+
+        monkeypatch.setitem(PROVIDERS, "kimi", _BoomProvider())
+        results = fetch_all({"platforms": {"kimi": {"enabled": True}}})
+        assert len(results) == 1
+        assert results[0].error == "内部错误"
 
     def test_fetch_all_disabled_platforms_skipped(self) -> None:
         cfg = {
@@ -863,6 +882,48 @@ class TestRegistry:
             "platform_order": ["ghost", "ollama"],
         }
         assert [r.platform for r in fetch_all(cfg)] == ["ollama", "kimi", "opencode-go"]
+
+    def test_fetch_all_worker_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """弹性线程池:20 个任务并发数封顶 16,平台合并与 plan 顺序保持稳定。"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        seen: list[int] = []
+
+        class _RecordingPool:
+            def __init__(self, max_workers=None) -> None:
+                seen.append(max_workers)
+                self._pool = ThreadPoolExecutor(max_workers=max_workers)
+
+            def __enter__(self):
+                return self._pool.__enter__()
+
+            def __exit__(self, *args):
+                return self._pool.__exit__(*args)
+
+        class _FakeProvider:
+            name = "kimi"
+            display_name = "Kimi Code"
+            is_manual = False
+
+            def fetch(self, config):
+                return PlatformResult(
+                    "kimi", "Kimi Code",
+                    entries=[UsageEntry("kimi", "5小时", 1, 2, 1, 50.0,
+                                        "2099-01-01T00:00:00Z", "%", False)],
+                )
+
+        monkeypatch.setattr(
+            "llm_usage.providers.ThreadPoolExecutor", _RecordingPool
+        )
+        monkeypatch.setitem(PROVIDERS, "kimi", _FakeProvider())
+        creds = [{"name": f"套餐{i}", "api_key": f"sk-{i}"} for i in range(20)]
+        cfg = {"platforms": {"kimi": {"enabled": True, "credentials": creds}}}
+        results = fetch_all(cfg)
+        assert len(seen) == 1
+        assert 0 < seen[0] <= 16
+        assert [r.platform for r in results] == ["kimi"]
+        # plan 标注顺序 = 提交顺序
+        assert [e.plan for e in results[0].entries] == [f"套餐{i}" for i in range(20)]
 
 
 class TestRegistryCredentialFanout:

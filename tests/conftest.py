@@ -31,3 +31,10 @@ def _clear_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
                 "VOLCENGINE_ACCESS_KEY", "VOLCENGINE_SECRET_KEY",
                 "OLLAMA_API_KEY", "OPENCODE_GO_API_KEY", "LLM_GATEWAY_API_KEY"):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _fast_pbkdf2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试用低迭代数:hash_password 读模块全局,
+    verify_password 从存储串解析迭代数 → 双路径均生效。"""
+    monkeypatch.setattr("llm_usage.store.PBKDF2_ITERATIONS", 1_000)

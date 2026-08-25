@@ -11,7 +11,8 @@ from llm_usage.models import PlatformResult
 class Provider(Protocol):
     """A platform usage fetcher.
 
-    Implementations are either live (HTTP) or manual (read from config).
+    All current implementations are live HTTP fetchers; ``is_manual`` is kept
+    as a data-contract flag for historical manual snapshots (always False today).
     """
 
     name: str

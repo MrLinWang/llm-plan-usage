@@ -276,15 +276,14 @@ class VolcengineProvider:
             if resp.status_code != 200:
                 return PlatformResult(
                     platform_key, display_name,
-                    error=f"HTTP {resp.status_code}: {resp.text[:200]}",
+                    error=f"HTTP {resp.status_code}",
                 )
             data = resp.json()
             # Volcengine OpenAPI wraps results; error check
             resp_meta = data.get("ResponseMetadata", {})
             if "Error" in resp_meta:
-                err = resp_meta["Error"]
-                msg = err.get("Message", err.get("Code", "未知错误"))
-                return PlatformResult(platform_key, display_name, error=f"{msg}")
+                msg = resp_meta["Error"].get("Code", "未知错误")
+                return PlatformResult(platform_key, display_name, error=msg)
 
             result = data.get("Result", data)
             if plan_type == "coding":
@@ -297,9 +296,9 @@ class VolcengineProvider:
                     error="无订阅或未找到用量数据",
                 )
             return PlatformResult(platform_key, display_name, entries=entries)
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
             return PlatformResult(
-                platform_key, display_name, error=f"网络错误：{exc}"
+                platform_key, display_name, error="网络错误"
             )
         finally:
             if own_client:

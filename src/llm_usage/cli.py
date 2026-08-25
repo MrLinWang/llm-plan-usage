@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Any
 
@@ -11,8 +12,7 @@ from rich.syntax import Syntax
 
 from llm_usage import config as config_mod
 from llm_usage.display import render_history, render_key_breakdown, render_results, results_to_json
-from llm_usage.models import PlatformResult
-from llm_usage.providers import PROVIDERS, fetch_all
+from llm_usage.providers import fetch_all
 from llm_usage.store import query_history, save_snapshot
 from llm_usage.tui import run_tui
 
@@ -37,7 +37,7 @@ def main() -> None:
 
 @main.command()
 @click.option("--json", "as_json", is_flag=True, help="Output JSON for scripting.")
-@click.option("--plain", is_flag=True, help="Plain text table (no box).")
+@click.option("--plain", is_flag=True, help="Reserved; currently same rendering as default (not implemented).")
 @click.option("--no-save", is_flag=True, help="Do not persist a snapshot to history.")
 @click.option("--keys", "show_keys", is_flag=True,
               help="Also show per-key usage detail for multi-key groups (e.g. llm-gateway).")
@@ -100,6 +100,8 @@ def web(host: str, port: int, interval: float) -> None:
         sys.exit(2)
     from llm_usage.web import create_app
 
+    # 让 provider 崩溃等失败边界日志可见(正常路径无 INFO 噪音)
+    logging.basicConfig(level=logging.INFO)
     uvicorn.run(create_app(cfg, interval=interval), host=host, port=port)
 
 

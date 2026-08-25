@@ -47,6 +47,7 @@ storing it as plaintext in ``config.toml``.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -65,6 +66,8 @@ from llm_usage.models import (
 DEFAULT_USAGE_PATH = "/v1/usage"
 TIMEOUT = 10.0
 MAX_KEY_WORKERS = 8
+
+logger = logging.getLogger(__name__)
 
 
 class _GatewayConfigError(ValueError):
@@ -153,17 +156,13 @@ def _parse_daily_usage(
 
 
 def _error_from_response(response: httpx.Response) -> str:
-    """Build a concise Chinese error from a gateway error response."""
+    """Build a concise Chinese error from a gateway error response.
+
+    只保留状态码与静态提示：上游响应体内容不回显给客户端（与整体脱敏
+    约定一致），完整响应仅在服务端日志可见。
+    """
     if response.status_code == 401:
         return "认证失败(401)：请检查 LLM_GATEWAY_API_KEY"
-    try:
-        body = response.json()
-    except ValueError:
-        body = None
-    if isinstance(body, dict):
-        message = body.get("message") or body.get("error") or body.get("code")
-        if message:
-            return f"请求失败(HTTP {response.status_code})：{message}"
     return f"请求失败(HTTP {response.status_code})"
 
 
@@ -367,8 +366,14 @@ class LlmGatewayProvider:
                 label = key_names[number - 1] or f"key#{number}"
                 try:
                     successes_by_number[number] = future.result().actual_cost
-                except Exception as exc:  # noqa: BLE001 - isolate one key
+                except RuntimeError as exc:  # _request_key 的既定中文文案,可直接展示
                     failures_by_number[number] = f"{name} {label}：{exc}"
+                except httpx.HTTPError:
+                    logger.warning("gateway group %s key %s network error", name, label, exc_info=True)
+                    failures_by_number[number] = f"{name} {label}：网络错误"
+                except Exception:  # noqa: BLE001 - isolate one key
+                    logger.exception("gateway group %s key %s crashed", name, label)
+                    failures_by_number[number] = f"{name} {label}：内部错误"
 
         failures = [failures_by_number[number] for number in sorted(failures_by_number)]
         breakdown = [
@@ -510,11 +515,12 @@ class LlmGatewayProvider:
             )
         except _GatewayConfigError as exc:
             return PlatformResult(platform_key, display_name, error=f"配置错误：{exc}")
-        except httpx.HTTPError as exc:
-            return PlatformResult(platform_key, display_name, error=f"网络错误：{exc}")
-        except ValueError as exc:
+        except httpx.HTTPError:
+            return PlatformResult(platform_key, display_name, error="网络错误")
+        except ValueError:
+            logger.exception("gateway usage payload parse failed")
             return PlatformResult(
-                platform_key, display_name, error=f"响应不是有效 JSON：{exc}"
+                platform_key, display_name, error="响应不是有效 JSON"
             )
         finally:
             if own_client:

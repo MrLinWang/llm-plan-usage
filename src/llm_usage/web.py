@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -33,6 +36,8 @@ from llm_usage.config import (
 from llm_usage.display import results_to_dict
 from llm_usage.models import PlatformResult
 from llm_usage.providers import DISPLAY_NAMES, PROVIDERS, fetch_all, registry_index
+
+logger = logging.getLogger(__name__)
 
 MIN_INTERVAL = 5.0    # 与 tui.py 一致
 MAX_INTERVAL = 3600.0
@@ -60,6 +65,47 @@ _GATEWAY_KEY_FIELDS = {"index", "value", "name"}
 # PUT /api/settings 允许的字段(站点策略,存 history.db settings 表)
 _SETTINGS_KEYS = {"registration_enabled"}
 
+class _LoginLimiter:
+    """Per-client sliding-window login throttle.
+
+    同 IP 在 _window 秒内失败满 _max 次 → 锁 _lockout 秒（429）。
+    进程内存态：单 worker 部署下有效，重启清零。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._fails: OrderedDict[str, list[float]] = OrderedDict()
+        self._blocked: dict[str, float] = {}
+        self._max = 5
+        self._window = 60.0
+        self._lockout = 300.0
+
+    def check(self, key: str) -> float | None:
+        """None = 放行；否则返回还需等待的秒数（>0）。"""
+        now = time.monotonic()
+        with self._lock:
+            until = self._blocked.get(key)
+            if until is not None:
+                if now < until:
+                    return until - now
+                del self._blocked[key]
+            stamps = self._fails.setdefault(key, [])
+            stamps[:] = [t for t in stamps if now - t < self._window]
+            if len(stamps) >= self._max:
+                self._blocked[key] = now + self._lockout
+                self._fails.pop(key, None)
+                logger.warning("rate limit engaged for %s", key)
+                return self._lockout
+            stamps.append(now)
+            return None
+
+    def clear(self, key: str) -> None:
+        with self._lock:
+            self._fails.pop(key, None)
+            self._blocked.pop(key, None)
+
+def _client_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 class UsageCache:
     """TTL cache around fetch_all; refreshes at most once per interval."""
@@ -155,6 +201,14 @@ class UserCaches:
             for cache in self._caches.values():
                 cache.invalidate()
 
+    def invalidate_for(self, config: dict[str, Any]) -> None:
+        """仅失效指定配置的缓存条目(下一次 get() 重新拉取)。"""
+        key = self._key(config)
+        with self._lock:
+            cache = self._caches.get(key)
+            if cache is not None:
+                cache.invalidate()
+
     def set_interval(self, interval: float) -> float:
         """Update the TTL for the pool (clamped to [MIN, MAX]); return it."""
         with self._lock:
@@ -173,16 +227,23 @@ def _current_user(request: Request) -> dict[str, Any] | None:
     return store.get_session_user(token)
 
 
+def _secure_cookie_enabled() -> bool:
+    """HTTPS 反代场景设 LLM_USAGE_SECURE_COOKIE=1 给会话 Cookie 加 Secure。"""
+    return os.environ.get("LLM_USAGE_SECURE_COOKIE", "").lower() in {"1", "true", "yes"}
+
 def _set_session_cookie(response: JSONResponse, token: str) -> None:
     response.set_cookie(
         SESSION_COOKIE, token,
         max_age=store.SESSION_TTL_DAYS * 86400,
         httponly=True, samesite="lax", path="/",
+        secure=_secure_cookie_enabled(),
     )
 
 
+_USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
 def _valid_username(value: Any) -> bool:
-    return isinstance(value, str) and 1 <= len(value.strip()) <= 64
+    return isinstance(value, str) and bool(_USERNAME_RE.fullmatch(value))
 
 
 def _valid_password(value: Any) -> bool:
@@ -658,9 +719,90 @@ def _apply_visibility(
     store.replace_platform_visibility(username, platform, visibility["targets"])
 
 
+def _validate_platform_fields(
+    key: str, body: dict[str, Any], allow_top_level_creds: bool,
+) -> None:
+    """404 未知平台 + 400 未知字段/平台支持性校验(两个 PUT handler 共用)。"""
+    if key not in PROVIDERS:
+        raise HTTPException(status_code=404, detail="未知平台")
+    allowed = {
+        "enabled", "visibility", "credential_slots", "base_url", "groups",
+        "display_name",
+    }
+    if allow_top_level_creds:
+        allowed |= _CREDENTIAL_NAMES
+    extra = sorted(set(body) - allowed)
+    if extra:
+        raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
+    if not allow_top_level_creds and "display_name" in body and key != "llm-gateway":
+        raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: display_name")
+    if "groups" in body and key != "llm-gateway":
+        raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
+    if "base_url" in body and key != "llm-gateway":
+        raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
+    if "credential_slots" in body and key == "llm-gateway":
+        raise HTTPException(
+            status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
+        )
+    if "credential_slots" in body and not CREDENTIAL_FIELDS[key]:
+        raise HTTPException(
+            status_code=400, detail=f"平台 {key} 不支持字段: credential_slots"
+        )
+    if allow_top_level_creds:
+        for field in _CREDENTIAL_NAMES & set(body):
+            if field not in CREDENTIAL_FIELDS[key]:
+                raise HTTPException(
+                    status_code=400, detail=f"平台 {key} 不支持字段: {field}"
+                )
+
+
+def _gateway_updates(
+    key: str, body: dict[str, Any], section: dict[str, Any],
+) -> dict[str, Any]:
+    """llm-gateway 专用:base_url 留空不改;groups 校验 + use_groups=True。
+
+    display_name 由调用方按各自规则处理(admin 全平台 / my 仅 gateway)。
+    """
+    updates: dict[str, Any] = {}
+    if key != "llm-gateway":
+        return updates
+    base_url = body.get("base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        updates["base_url"] = base_url.strip()
+    if "groups" in body:
+        try:
+            updates["groups"] = _validate_gateway_groups(body["groups"], section)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 覆盖历史遗留的 use_groups=false:保存后 fetch 一定走分组模式
+        updates["use_groups"] = True
+    return updates
+
+
+def _validate_visibility_body(
+    body: dict[str, Any], username: str,
+) -> dict[str, Any] | None:
+    """visibility 校验 + 规范化;无 visibility 字段返回 None。"""
+    if "visibility" not in body:
+        return None
+    try:
+        return _validate_visibility(body["visibility"], username)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     cache = UserCaches(interval)
+    limiter = _LoginLimiter()
     app = FastAPI(title="llm-usage")
+
+    @app.middleware("http")
+    async def _security_headers(request: Request, call_next: Any) -> Response:
+        resp = await call_next(request)
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        return resp
     pages = {
         name: (files("llm_usage") / "static" / name).read_text(encoding="utf-8")
         for name in ("index.html", "login.html", "users.html", "config.html")
@@ -708,8 +850,11 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
                     elif merged[r.platform].display_name != tagged.display_name:
                         extra.append(tagged)  # 同名冲突:来源区分,不丢弃
             platforms = list(merged.values()) + extra
-        except Exception as exc:  # noqa: BLE001 - fetch_all 内部已隔离单平台失败,这里兜底
-            return JSONResponse({"error": f"获取用量失败:{exc}"}, status_code=500)
+        except Exception:  # noqa: BLE001 - fetch_all 内部已隔离单平台失败,这里兜底
+            logger.error("usage payload failed", exc_info=True)
+            return JSONResponse(
+                {"error": "获取用量失败，请查看服务端日志"}, status_code=500
+            )
         return JSONResponse({
             "fetched_at": fetched_at,
             "interval": cache.interval,
@@ -766,34 +911,55 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         }
 
     @app.post("/api/auth/setup")
-    def auth_setup(body: dict[str, Any] = Body(...)) -> JSONResponse:
-        if store.count_users() > 0:
-            raise HTTPException(status_code=409, detail="已完成初始化")
+    def auth_setup(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        wait = limiter.check(_client_key(request))
+        if wait is not None:
+            seconds = int(wait) + 1
+            raise HTTPException(
+                status_code=429, detail=f"尝试过于频繁，请 {seconds} 秒后再试"
+            )
         username = body.get("username")
-        if not _valid_username(username):
-            raise HTTPException(status_code=400, detail="用户名需为 1-64 个字符")
         password = body.get("password")
-        if not _valid_password(password):
+        if not isinstance(username, str) or not _valid_username(username):
+            raise HTTPException(
+                status_code=400,
+                detail="用户名需为 1-64 位字母、数字、下划线、点或连字符",
+            )
+        if not isinstance(password, str) or not _valid_password(password):
             raise HTTPException(status_code=400, detail="密码至少 6 位")
         username = username.strip()
-        try:
-            store.create_user(username, password, is_admin=True)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not store.create_first_admin(username, password):
+            raise HTTPException(status_code=409, detail="已完成初始化")
         token = store.create_session(username)
         resp = JSONResponse({"username": username, "is_admin": True})
         _set_session_cookie(resp, token)
+        limiter.clear(_client_key(request))
         return resp
 
     @app.post("/api/auth/register")
-    def auth_register(body: dict[str, Any] = Body(...)) -> JSONResponse:
+    def auth_register(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        wait = limiter.check(_client_key(request))
+        if wait is not None:
+            seconds = int(wait) + 1
+            raise HTTPException(
+                status_code=429, detail=f"尝试过于频繁，请 {seconds} 秒后再试"
+            )
         if store.get_setting("registration_enabled") != "1":
             raise HTTPException(status_code=403, detail="注册已关闭")
         username = body.get("username")
-        if not _valid_username(username):
-            raise HTTPException(status_code=400, detail="用户名需为 1-64 个字符")
         password = body.get("password")
-        if not _valid_password(password):
+        if not isinstance(username, str) or not _valid_username(username):
+            raise HTTPException(
+                status_code=400,
+                detail="用户名需为 1-64 位字母、数字、下划线、点或连字符",
+            )
+        if not isinstance(password, str) or not _valid_password(password):
             raise HTTPException(status_code=400, detail="密码至少 6 位")
         username = username.strip()
         try:
@@ -803,10 +969,20 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         token = store.create_session(username)
         resp = JSONResponse({"username": username, "is_admin": False})
         _set_session_cookie(resp, token)  # 注册即登录,与 auth_setup 一致
+        limiter.clear(_client_key(request))
         return resp
 
     @app.post("/api/auth/login")
-    def auth_login(body: dict[str, Any] = Body(...)) -> JSONResponse:
+    def auth_login(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        wait = limiter.check(_client_key(request))
+        if wait is not None:
+            seconds = int(wait) + 1
+            raise HTTPException(
+                status_code=429, detail=f"尝试过于频繁，请 {seconds} 秒后再试"
+            )
         username = body.get("username")
         password = body.get("password")
         user = (
@@ -819,6 +995,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         token = store.create_session(user["username"])
         resp = JSONResponse(user)
         _set_session_cookie(resp, token)
+        limiter.clear(_client_key(request))
         return resp
 
     @app.post("/api/auth/logout")
@@ -856,9 +1033,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
 
     @app.post("/api/refresh")
     def usage_refresh(user: dict[str, Any] = Depends(api_user)) -> JSONResponse:
-        """立即刷新:失效当前用户配置对应的缓存条目后重新 fetch,响应同构。"""
-        cache.get(_config_for(user))  # 确保条目存在
-        cache.invalidate_all()
+        """立即刷新:仅失效当前用户配置的缓存条目后重新 fetch,响应同构。"""
+        cache.invalidate_for(_config_for(user))
         return _usage_payload_for(user)
 
     @app.post("/api/interval")
@@ -896,7 +1072,10 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             )
         username = body.get("username")
         if not _valid_username(username):
-            raise HTTPException(status_code=400, detail="用户名需为 1-64 个字符")
+            raise HTTPException(
+                status_code=400,
+                detail="用户名需为 1-64 位字母、数字、下划线、点或连字符",
+            )
         password = body.get("password")
         if not _valid_password(password):
             raise HTTPException(status_code=400, detail="密码至少 6 位")
@@ -1007,38 +1186,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         user: dict[str, Any] = Depends(api_user),
     ) -> dict[str, Any]:
         user = _non_admin(user)
-        if key not in PROVIDERS:
-            raise HTTPException(status_code=404, detail="未知平台")
-        # 普通用户走槽式 API:顶层凭证字段一律按未知字段拒绝
-        extra = sorted(set(body) - {"enabled", "visibility", "credential_slots", "base_url", "groups", "display_name"})
-        if extra:
-            raise HTTPException(
-                status_code=400, detail="未知字段: " + ", ".join(extra)
-            )
-        if "display_name" in body and key != "llm-gateway":
-            raise HTTPException(
-                status_code=400, detail=f"平台 {key} 不支持字段: display_name"
-            )
-        if "groups" in body and key != "llm-gateway":
-            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
-        if "base_url" in body and key != "llm-gateway":
-            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
-        if "credential_slots" in body and key == "llm-gateway":
-            raise HTTPException(
-                status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
-            )
-        if "credential_slots" in body and not CREDENTIAL_FIELDS[key]:
-            raise HTTPException(
-                status_code=400, detail=f"平台 {key} 不支持字段: credential_slots"
-            )
-        visibility = None
-        if "visibility" in body:
-            try:
-                visibility = _validate_visibility(
-                    body["visibility"], user["username"]
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _validate_platform_fields(key, body, allow_top_level_creds=False)
+        visibility = _validate_visibility_body(body, user["username"])
         cfg = store.get_user_config(user["username"])
         platforms = cfg.setdefault("platforms", {})
         section = platforms.setdefault(key, {})
@@ -1060,18 +1209,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             # 留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
             if isinstance(display_name, str) and display_name.strip():
                 section["display_name"] = display_name.strip()
-            base_url = body.get("base_url")
-            # 留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
-            if isinstance(base_url, str) and base_url.strip():
-                section["base_url"] = base_url.strip()
-            if "groups" in body:
-                try:
-                    section["groups"] = _validate_gateway_groups(
-                        body["groups"], section
-                    )
-                except ValueError as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
-                section["use_groups"] = True
+            section.update(_gateway_updates(key, body, section))
         store.set_user_config(user["username"], cfg)
         if visibility is not None:
             _apply_visibility(user["username"], key, visibility)
@@ -1101,70 +1239,33 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         body: dict[str, Any] = Body(...),
         admin: dict[str, Any] = Depends(api_admin),
     ) -> dict[str, Any]:
-        if key not in PROVIDERS:
-            raise HTTPException(status_code=404, detail="未知平台")
-        extra = sorted(set(body) - _CONFIG_FIELDS - {"credential_slots", "visibility"})
-        if extra:
-            raise HTTPException(
-                status_code=400, detail="未知字段: " + ", ".join(extra)
-            )
-        if "groups" in body and key != "llm-gateway":
-            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
-        if "base_url" in body and key != "llm-gateway":
-            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
-        if "credential_slots" in body and key == "llm-gateway":
-            raise HTTPException(
-                status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
-            )
-        if "credential_slots" in body and not CREDENTIAL_FIELDS[key]:
-            raise HTTPException(
-                status_code=400, detail=f"平台 {key} 不支持字段: credential_slots"
-            )
-        for field in _CREDENTIAL_NAMES & set(body):
-            if field not in CREDENTIAL_FIELDS[key]:
-                raise HTTPException(
-                    status_code=400, detail=f"平台 {key} 不支持字段: {field}"
-                )
+        _validate_platform_fields(key, body, allow_top_level_creds=True)
+        visibility = _validate_visibility_body(body, admin["username"])
+        current_section = (
+            get_platform_config(load_config(), key)
+            if "credential_slots" in body or "groups" in body
+            else {}
+        )
         updates: dict[str, Any] = {}
-        visibility: dict[str, Any] | None = None
         if isinstance(body.get("enabled"), bool):
             updates["enabled"] = body["enabled"]
         display_name = body.get("display_name")
+        # 全平台通用;留空 = 不修改;仅非空字符串写回
         if isinstance(display_name, str) and display_name.strip():
             updates["display_name"] = display_name.strip()
-        if key == "llm-gateway":
-            base_url = body.get("base_url")
-            # 留空 = 不修改;仅非空字符串写回(与凭证字段约定一致)
-            if isinstance(base_url, str) and base_url.strip():
-                updates["base_url"] = base_url.strip()
         for field in CREDENTIAL_FIELDS[key]:
             value = body.get(field)
             # 留空 = 不修改;仅非空字符串写回
             if isinstance(value, str) and value.strip():
                 updates[field] = value.strip()
         if "credential_slots" in body:
-            current_section = get_platform_config(load_config(), key)
             try:
                 updates["credentials"] = _validate_credential_slots(
                     body["credential_slots"], current_section, CREDENTIAL_FIELDS[key]
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if "groups" in body:
-            current_section = get_platform_config(load_config(), key)
-            try:
-                updates["groups"] = _validate_gateway_groups(
-                    body["groups"], current_section
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            # 覆盖历史遗留的 use_groups=false:保存后 fetch 一定走分组模式
-            updates["use_groups"] = True
-        if "visibility" in body:
-            try:
-                visibility = _validate_visibility(body["visibility"], admin["username"])
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        updates.update(_gateway_updates(key, body, current_section))
         if updates:
             update_platform_config(key, updates)
             if "credential_slots" in body:

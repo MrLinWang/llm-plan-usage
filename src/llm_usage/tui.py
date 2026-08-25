@@ -33,7 +33,11 @@ def _cbreak() -> Iterator[None]:
     import termios
     import tty
 
-    saved = termios.tcgetattr(fd)
+    try:
+        saved = termios.tcgetattr(fd)
+    except termios.error:  # 非交互 stdin(管道/重定向):跳过 cbreak,直接运行
+        yield
+        return
     tty.setcbreak(fd)
     try:
         yield
@@ -101,6 +105,8 @@ def run_tui(cfg: dict[str, Any], interval: float = DEFAULT_INTERVAL) -> None:
                 key = _read_key(tick)
                 if key is None:
                     continue
+                if key == "":  # stdin EOF(管道关闭/非交互)→ 退出,避免忙循环
+                    break
                 if key.lower() == "q":
                     break
                 elif key.lower() == "r":

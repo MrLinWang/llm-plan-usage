@@ -6,6 +6,8 @@ is run in a thread and any exception is caught into ``PlatformResult.error``.
 
 from __future__ import annotations
 
+import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -13,10 +15,12 @@ from llm_usage.config import get_platform_order
 from llm_usage.models import PlatformResult, UsageEntry
 from llm_usage.providers.base import Provider
 from llm_usage.providers.kimi import KimiProvider
-from llm_usage.providers.volcengine import VolcengineProvider
+from llm_usage.providers.llm_gateway import LlmGatewayProvider
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
-from llm_usage.providers.llm_gateway import LlmGatewayProvider
+from llm_usage.providers.volcengine import VolcengineProvider
+
+logger = logging.getLogger(__name__)
 
 
 # Registry: platform key -> provider instance.
@@ -53,17 +57,9 @@ DISPLAY_NAMES: dict[str, str] = {
 
 def _resolve_env_value(raw: str | None) -> str | None:
     """Expand an ``env:VARNAME`` reference; pass through literal values."""
-    if not raw:
-        return None
-    import os
-
-    if raw.startswith("env:"):
+    if raw and raw.startswith("env:"):
         return os.environ.get(raw[4:])
     return raw
-
-
-# kept for backward compat / tests
-_resolve_api_key = _resolve_env_value
 
 
 def _prepare_config(platform: str, pcfg: dict[str, Any]) -> dict[str, Any]:
@@ -115,7 +111,7 @@ def _credential_specs(prepared: dict[str, Any]) -> list[tuple[dict[str, Any], st
 def fetch_all(
     config: dict[str, Any],
     enabled_only: bool = True,
-    max_workers: int = 5,
+    max_workers: int | None = None,
 ) -> list[PlatformResult]:
     """Fetch usage from every configured (enabled) platform concurrently.
 
@@ -151,11 +147,12 @@ def fetch_all(
                 # keep the canonical platform key
                 res.platform = cfg["_platform_key"]
             return res
-        except Exception as exc:  # noqa: BLE001 — isolate single-platform failure
+        except Exception:  # noqa: BLE001 — isolate single-platform failure
+            logger.exception("provider %s crashed", cfg.get("_platform_key"))
             return PlatformResult(
                 cfg["_platform_key"],
                 cfg.get("display_name", cfg["_platform_key"]),
-                error=f"内部错误：{exc}",
+                error="内部错误",
             )
 
     # 提交顺序 = 配置顺序(platform_order 之前);合并时按提交顺序累积,
@@ -163,7 +160,11 @@ def fetch_all(
     by_platform: dict[str, list[tuple[str | None, PlatformResult]]] = {
         plat: [] for plat, _, _, _ in tasks
     }
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    # 任务数 = 平台 × 凭证,弹性并发:1~16(默认),不再按 5 个一波排队
+    workers = (
+        min(max(1, len(tasks)), 16) if max_workers is None else max(1, max_workers)
+    )
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         pending: list[tuple[str, str | None, Any]] = []
         for plat, prov, cfg, plan in tasks:
             pending.append((plat, plan, pool.submit(_run, prov, cfg)))

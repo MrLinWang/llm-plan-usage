@@ -1,4 +1,4 @@
-"""Config module tests: init, load, save, manual entry updates, env: keys."""
+"""Config module tests: init, load, save, platform config merge, env: keys, 0600 perms."""
 
 from __future__ import annotations
 
@@ -33,6 +33,11 @@ class TestConfigInit:
         C.init_config(p)
         C.init_config(p, overwrite=True)
         assert p.exists()
+
+    def test_init_config_creates_0600(self, tmp_path: Path) -> None:
+        p = tmp_path / "config.toml"
+        C.init_config(p)
+        assert p.stat().st_mode & 0o777 == 0o600
 
 
 class TestConfigLoadSave:

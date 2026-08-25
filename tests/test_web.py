@@ -1612,3 +1612,150 @@ class TestUserIsolation:
         alice = self._register(client, "alice")
         alice_html = alice.get("/config").text
         assert "/api/my/platforms" in alice_html
+
+
+class TestSecurityHardening:
+    """安全加固:登录限流 / 安全响应头 / Secure Cookie 开关 / 用户名字符集。"""
+
+    def test_login_rate_limited(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        _patch_fetch(monkeypatch)
+        store.create_user("admin", "secret1", is_admin=True)
+        client = TestClient(create_app({"platforms": {}}))
+        for _ in range(5):
+            resp = client.post(
+                "/api/auth/login", json={"username": "admin", "password": "wrong"}
+            )
+            assert resp.status_code == 401
+        # 第 6 次失败 → 429
+        resp = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "wrong"}
+        )
+        assert resp.status_code == 429
+        # 锁定期内正确密码也 429;logout 不受限流但会话仍在锁内
+        resp = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert resp.status_code == 429
+        assert client.post("/api/auth/logout").status_code == 200
+        resp = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert resp.status_code == 429
+        # 新 app 实例(新 limiter)→ 正常登录
+        other = TestClient(create_app({"platforms": {}}))
+        resp = other.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert resp.status_code == 200
+
+    def test_limiter_clear_on_success(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """成功登录清空失败计数:之后再错 5 次不触发 429。"""
+        _patch_fetch(monkeypatch)
+        store.create_user("admin", "secret1", is_admin=True)
+        client = TestClient(create_app({"platforms": {}}))
+        for _ in range(4):
+            client.post(
+                "/api/auth/login", json={"username": "admin", "password": "wrong"}
+            )
+        resp = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert resp.status_code == 200
+        for _ in range(5):
+            resp = client.post(
+                "/api/auth/login", json={"username": "admin", "password": "wrong"}
+            )
+            assert resp.status_code == 401
+
+    def test_security_headers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        _patch_fetch(monkeypatch)
+        client = TestClient(create_app({"platforms": {}}))
+        for path in ("/login", "/api/usage"):
+            resp = client.get(path)
+            assert resp.headers["X-Frame-Options"] == "DENY"
+            assert resp.headers["X-Content-Type-Options"] == "nosniff"
+            assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+    def test_secure_cookie_env_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        monkeypatch.setenv("LLM_USAGE_SECURE_COOKIE", "1")
+        _patch_fetch(monkeypatch)
+        store.create_user("admin", "secret1", is_admin=True)
+        client = TestClient(create_app({"platforms": {}}))
+        resp = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert resp.status_code == 200
+        cookie = resp.headers["set-cookie"]
+        assert "secure" in cookie.lower()
+
+    def test_cookie_not_secure_by_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        monkeypatch.delenv("LLM_USAGE_SECURE_COOKIE", raising=False)
+        _patch_fetch(monkeypatch)
+        store.create_user("admin", "secret1", is_admin=True)
+        client = TestClient(create_app({"platforms": {}}))
+        resp = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert resp.status_code == 200
+        assert "secure" not in resp.headers["set-cookie"].lower()
+
+    def test_username_charset_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        for name in ["a/b", "<img>", "x y", "a\n", "x" * 65, "  ", "中文名"]:
+            resp = client.post(
+                "/api/users", json={"username": name, "password": "secret1"}
+            )
+            assert resp.status_code == 400, repr(name)
+
+
+class TestRefreshIsolation:
+    def test_refresh_only_invalidates_own_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """POST /api/refresh 只失效自己的缓存条目,他人配置不重拉。"""
+        calls = {"alice": 0, "bob": 0}
+
+        def fake(cfg):
+            calls[cfg["platforms"]["kimi"]["api_key"]] += 1
+            return _fake_results()
+
+        monkeypatch.setattr("llm_usage.web.fetch_all", fake)
+        store.create_user("alice", "secret1", is_admin=False)
+        store.create_user("bob", "secret1", is_admin=False)
+        store.set_user_config(
+            "alice", {"platforms": {"kimi": {"enabled": True, "api_key": "alice"}}}
+        )
+        store.set_user_config(
+            "bob", {"platforms": {"kimi": {"enabled": True, "api_key": "bob"}}}
+        )
+        app = create_app({"platforms": {}})
+        alice = TestClient(app)
+        bob = TestClient(app)
+        assert alice.post(
+            "/api/auth/login", json={"username": "alice", "password": "secret1"}
+        ).status_code == 200
+        assert bob.post(
+            "/api/auth/login", json={"username": "bob", "password": "secret1"}
+        ).status_code == 200
+        # 各自首次拉取
+        alice.get("/api/usage")
+        bob.get("/api/usage")
+        assert calls == {"alice": 1, "bob": 1}
+        # alice 刷新 → 只重拉 alice 的配置
+        assert alice.post("/api/refresh").status_code == 200
+        assert calls == {"alice": 2, "bob": 1}
+        # bob 缓存仍新鲜 → 不变
+        bob.get("/api/usage")
+        assert calls == {"alice": 2, "bob": 1}

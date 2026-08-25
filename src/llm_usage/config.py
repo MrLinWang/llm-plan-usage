@@ -102,10 +102,6 @@ def config_path() -> Path:
     return Path(env) if env else CONFIG_PATH
 
 
-def config_dir() -> Path:
-    return config_path().parent
-
-
 def load_config(path: Path | None = None) -> dict[str, Any]:
     """Load config from disk; return ``{}`` if missing (never crash)."""
     p = path or config_path()
@@ -124,6 +120,10 @@ def save_config(config: dict[str, Any], path: Path | None = None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("wb") as fh:
         tomli_w.dump(config, fh)
+    try:
+        p.chmod(0o600)  # 凭证明文,收敛文件权限(幂等)
+    except OSError:
+        pass
     return p
 
 
@@ -134,6 +134,10 @@ def init_config(path: Path | None = None, overwrite: bool = False) -> Path:
         raise FileExistsError(f"配置已存在：{p}（使用 --force 覆盖）")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(EXAMPLE_CONFIG, encoding="utf-8")
+    try:
+        p.chmod(0o600)  # 与 save_config 一致(幂等)
+    except OSError:
+        pass
     return p
 
 

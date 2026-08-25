@@ -616,3 +616,18 @@ def replace_platform_visibility(
         conn.commit()
     finally:
         conn.close()
+
+
+def delete_platform_visibility(
+    username: str, platform: str, path: Path | None = None
+) -> None:
+    """Delete every share row of one owned platform (instance-removal cascade)."""
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "DELETE FROM user_shares WHERE owner = ? AND platform = ?",
+            (username, platform),
+        )
+        conn.commit()
+    finally:
+        conn.close()

@@ -1164,6 +1164,7 @@ class TestUserIsolation:
         assert resp.status_code == 200
         assert resp.json() == {
             "key": "kimi",
+            "type": "kimi",
             "display_name": "Kimi Code",
             "enabled": True,
             "visibility": {"type": "private", "targets": []},
@@ -1482,7 +1483,7 @@ class TestUserIsolation:
             assert p["visibility"] == {"type": "private", "targets": []}
             if p["key"] == "llm-gateway":
                 assert set(p) == {
-                    "key", "display_name", "enabled", "visibility",
+                    "key", "type", "display_name", "enabled", "visibility",
                     "base_url", "groups",
                 }
                 assert p["base_url"] is None
@@ -1490,7 +1491,7 @@ class TestUserIsolation:
             elif p["key"] in ("kimi", "volcengine-coding", "volcengine-agent",
                               "ollama", "opencode-go"):
                 assert set(p) == {
-                    "key", "display_name", "enabled", "visibility",
+                    "key", "type", "display_name", "enabled", "visibility",
                     "credential_slots",
                 }
                 assert p["credential_slots"] == []
@@ -1787,3 +1788,281 @@ class TestRefreshIsolation:
         # bob 缓存仍新鲜 → 不变
         bob.get("/api/usage")
         assert calls == {"alice": 2, "bob": 1}
+
+
+class TestProviderInstances:
+    """同类型供应商实例(多账号卡片):添加/删除/列表排序/共享传播。"""
+
+    def _client(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_config_path: Path,
+    ) -> TestClient:
+        """App + 已登录 admin;fetch 假实现支持实例键(经 resolve_provider_key 判型)。"""
+        from llm_usage.providers import DISPLAY_NAMES, resolve_provider_key
+
+        def fake(cfg_in):
+            platforms = (cfg_in or {}).get("platforms", {}) or {}
+            out = []
+            for key, section in platforms.items():
+                ptype = resolve_provider_key(key)
+                if ptype is None or not isinstance(section, dict):
+                    continue
+                if section.get("enabled", True) is False:
+                    continue
+                entry = UsageEntry(key, "一次", 60, 120, 60, 50.0, None, "%", False)
+                out.append(PlatformResult(
+                    key, section.get("display_name") or DISPLAY_NAMES[ptype],
+                    entries=[entry],
+                ))
+            return out
+
+        monkeypatch.setattr("llm_usage.web.fetch_all", fake)
+        client = TestClient(create_app(load_config(), interval=60))
+        store.create_user("admin", "secret1", is_admin=True)
+        r = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert r.status_code == 200
+        return client
+
+    def _register(self, client: TestClient, username: str) -> TestClient:
+        client.put("/api/settings", json={"registration_enabled": True})
+        anon = TestClient(client.app)
+        r = anon.post(
+            "/api/auth/register", json={"username": username, "password": "secret1"}
+        )
+        assert r.status_code == 200
+        return anon
+
+    def test_provider_types_requires_login(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        anon = TestClient(client.app)
+        assert anon.get("/api/provider-types").status_code == 401
+
+    def test_admin_add_list_and_full_chain(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        alice = self._register(client, "alice")
+        types = client.get("/api/provider-types").json()["types"]
+        assert {t["key"]: t["label"] for t in types}["kimi"] == "Kimi Code"
+        # 添加 → kimi#2,默认禁用 + 默认显示名 + 私有可见性
+        resp = client.post("/api/config/providers", json={"type": "kimi"})
+        assert resp.status_code == 200
+        view = resp.json()
+        assert view["key"] == "kimi#2"
+        assert view["type"] == "kimi"
+        assert view["display_name"] == "Kimi Code #2"
+        assert view["enabled"] is False
+        assert view["visibility"] == {"type": "private", "targets": []}
+        # 落盘 config.toml
+        section = load_config()["platforms"]["kimi#2"]
+        assert section["enabled"] is False
+        assert section["display_name"] == "Kimi Code #2"
+        # 列表紧随基础键
+        keys = [p["key"] for p in client.get("/api/config").json()["platforms"]]
+        assert keys.index("kimi#2") == keys.index("kimi") + 1
+        # 连加两次单调递增 → kimi#3
+        resp = client.post("/api/config/providers", json={"type": "kimi"})
+        assert resp.json()["key"] == "kimi#3"
+        # 全链路:启用 + 显示名 + 凭证槽 + 可见性
+        resp = client.put("/api/config/platforms/kimi%232", json={
+            "enabled": True,
+            "display_name": "工作号K",
+            "credential_slots": [
+                {"index": None, "name": "工作套餐", "api_key": "sk-second-account"},
+            ],
+            "visibility": {"type": "shared", "targets": ["alice"]},
+        })
+        assert resp.status_code == 200
+        view = resp.json()
+        assert view["display_name"] == "工作号K"
+        assert view["enabled"] is True
+        assert view["credential_slots"][0]["credentials"]["api_key"]["hint"] == "sk-s…nt"
+        assert view["visibility"] == {"type": "shared", "targets": ["alice"]}
+        cfg = load_config()["platforms"]["kimi#2"]
+        assert cfg["credentials"] == [{"name": "工作套餐", "api_key": "sk-second-account"}]
+        assert "api_key" not in cfg  # 槽式保存后清除顶层凭证
+        # 共享传播:alice 见 工作号K(admin)
+        names = [p["display_name"] for p in alice.get("/api/usage").json()["platforms"]]
+        assert names == ["工作号K(admin)"]
+
+    def test_admin_delete_cascade_and_guards(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        self._register(client, "alice")
+        client.post("/api/config/providers", json={"type": "kimi"})
+        client.put("/api/config/platforms/kimi%232", json={
+            "visibility": {"type": "shared", "targets": ["alice"]},
+        })
+        assert ("kimi#2", "alice") in {
+            (r["platform"], r["target"])
+            for r in store.list_my_visibility("admin")
+        }
+        # 裸键不可删
+        resp = client.delete("/api/config/platforms/kimi")
+        assert resp.status_code == 400
+        assert "内置平台" in resp.json()["detail"]
+        # 未配置的实例 404
+        assert client.delete("/api/config/platforms/kimi%239").status_code == 404
+        # 未知类型 404
+        assert client.delete("/api/config/platforms/foo%239").status_code == 404
+        # 正常删除 → 配置与共享行级联清理
+        assert client.delete("/api/config/platforms/kimi%232").json() == {"ok": True}
+        keys = [p["key"] for p in client.get("/api/config").json()["platforms"]]
+        assert "kimi#2" not in keys
+        assert "kimi#2" not in load_config().get("platforms", {})
+        assert store.list_my_visibility("admin") == []
+
+    def test_add_provider_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        resp = client.post("/api/config/providers", json={"type": "foo"})
+        assert resp.status_code == 400
+        assert "未知供应商类型" in resp.json()["detail"]
+        resp = client.post(
+            "/api/config/providers", json={"type": "kimi", "extra": 1}
+        )
+        assert resp.status_code == 400
+        assert "未知字段" in resp.json()["detail"]
+
+    def test_my_add_delete_propagation_and_admin_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        alice = self._register(client, "alice")
+        bob = self._register(client, "bob")
+        # admin 不能用普通用户端点
+        assert client.post("/api/my/providers", json={"type": "kimi"}).status_code == 400
+        # alice 添加 ollama 实例 → 写入自己的 user_configs
+        resp = alice.post("/api/my/providers", json={"type": "ollama"})
+        assert resp.status_code == 200
+        view = resp.json()
+        assert view["key"] == "ollama#2"
+        assert view["type"] == "ollama"
+        assert view["enabled"] is False
+        assert store.get_user_config("alice")["platforms"]["ollama#2"] == {
+            "enabled": False,
+            "display_name": "Ollama Cloud #2",
+        }
+        # 列表中紧随 ollama
+        keys = [p["key"] for p in alice.get("/api/my/platforms").json()["platforms"]]
+        assert keys.index("ollama#2") == keys.index("ollama") + 1
+        # 启用并公开 → bob 见 Ollama Cloud #2(alice);alice 自见裸名
+        resp = alice.put("/api/my/platforms/ollama%232", json={
+            "enabled": True,
+            "visibility": {"type": "public", "targets": []},
+        })
+        assert resp.status_code == 200
+        bob_names = {
+            p["name"]: p["display_name"]
+            for p in bob.get("/api/usage").json()["platforms"]
+        }
+        assert bob_names == {"ollama#2": "Ollama Cloud #2(alice)"}
+        alice_names = [
+            p["display_name"] for p in alice.get("/api/usage").json()["platforms"]
+        ]
+        assert alice_names == ["Ollama Cloud #2"]
+        # 删除后传播消失
+        assert alice.delete("/api/my/platforms/ollama%232").json() == {"ok": True}
+        assert store.get_user_config("alice").get("platforms", {}) == {}
+        assert bob.get("/api/usage").json()["platforms"] == []
+        # 守卫:裸键 400 / 未配置 404
+        assert alice.delete("/api/my/platforms/kimi").status_code == 400
+        assert alice.delete("/api/my/platforms/ollama%232").status_code == 404
+
+    def test_order_endpoint_keeps_instances(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        client.post("/api/config/providers", json={"type": "kimi"})
+        order = ["kimi#2", "kimi", "volcengine-coding", "volcengine-agent",
+                 "ollama", "opencode-go", "llm-gateway"]
+        resp = client.put("/api/config/order", json={"order": order})
+        assert resp.status_code == 200
+        assert resp.json()["order"] == order  # 实例键不被过滤
+        assert load_config()["platform_order"] == order
+        # 列表排序仍按类型分组:kimi 在 kimi#2 前
+        keys = [p["key"] for p in client.get("/api/config").json()["platforms"]]
+        assert keys.index("kimi") < keys.index("kimi#2")
+
+    def test_list_endpoints_tolerate_unknown_configured_sections(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """手改配置里的未知平台段不炸列表端点:被过滤忽略(实例键解析失败的容错)。"""
+        init_config(tmp_config_path)
+        update_platform_config("legacy-thing", {"enabled": True})
+        client = self._client(monkeypatch, tmp_config_path)
+        resp = client.get("/api/config")
+        assert resp.status_code == 200
+        from llm_usage.providers import PROVIDERS
+
+        keys = [p["key"] for p in resp.json()["platforms"]]
+        assert "legacy-thing" not in keys
+        assert set(keys) == set(PROVIDERS)
+        # 普通用户侧同样容错
+        alice = self._register(client, "alice")
+        store.set_user_config("alice", {"platforms": {"junk-key": {"enabled": True}}})
+        resp = alice.get("/api/my/platforms")
+        assert resp.status_code == 200
+        keys = [p["key"] for p in resp.json()["platforms"]]
+        assert "junk-key" not in keys
+
+    def test_delete_then_readd_never_reuses_numbers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """删除唯一/最高实例后再添加 → 编号继续递增(admin 与普通用户双路径)。"""
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        alice = self._register(client, "alice")
+        # admin: 添加 kimi#2 → 删除 → 再添加得 kimi#3
+        assert client.post("/api/config/providers", json={"type": "kimi"}).json()["key"] == "kimi#2"
+        assert client.delete("/api/config/platforms/kimi%232").json() == {"ok": True}
+        resp = client.post("/api/config/providers", json={"type": "kimi"})
+        assert resp.json()["key"] == "kimi#3"
+        counters = load_config().get("instance_counters")
+        assert counters["kimi"] >= 3
+        # user: alice 添加 ollama#2 → 删除 → 再添加得 ollama#3(计数器存自己的 user_configs)
+        assert alice.post("/api/my/providers", json={"type": "ollama"}).json()["key"] == "ollama#2"
+        assert alice.delete("/api/my/platforms/ollama%232").json() == {"ok": True}
+        resp = alice.post("/api/my/providers", json={"type": "ollama"})
+        assert resp.json()["key"] == "ollama#3"
+        cfg = store.get_user_config("alice")
+        assert cfg["instance_counters"]["ollama"] >= 3
+        # 计数器不参与平台列表
+        keys = [p["key"] for p in alice.get("/api/my/platforms").json()["platforms"]]
+        assert set(keys) & {"instance_counters"} == set()
+
+    def test_malformed_counter_tolerated_and_self_healed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """手改/损坏的 instance_counters 值不炸添加端点:按缺省分配并自愈为整数。"""
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        cfg = load_config()
+        cfg["instance_counters"] = {"kimi": "9"}
+        from llm_usage.config import save_config
+        save_config(cfg)
+        resp = client.post("/api/config/providers", json={"type": "kimi"})
+        assert resp.status_code == 200
+        assert resp.json()["key"] == "kimi#2"
+        counters = load_config()["instance_counters"]
+        assert counters["kimi"] == 2  # 损坏值被整数覆写

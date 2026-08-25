@@ -204,6 +204,25 @@
   }
   .hint { font-size: 12px; color: var(--dim); }
   .card-foot { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .add-provider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    grid-column: 1 / -1;
+  }
+  .add-provider select { max-width: 280px; }
+  .card-foot .danger {
+    flex: none;
+    padding: 7px 16px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--red);
+    background: transparent;
+    border: 1px solid var(--sep);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .card-foot .danger:hover { border-color: var(--red); }
   .btn {
     padding: 7px 22px;
     font: inherit;
@@ -388,6 +407,8 @@ function buildVisibilityRow(visibility) {
 // 全平台可自定义)、凭证编辑区(非 gateway = 凭证槽编辑器,每槽一个套餐;
 // gateway = base_url 输入 + 分组编辑器)、可见性、保存按钮。模式差异仅三点:保存端点、
 // 拖拽手柄(仅 admin)、保存成功后的状态文案(由 loadCommon 写入 statusEl)。
+// 服务端视图的 p.type 是基础类型键(p.key 为实例键时形如 kimi#2,type 恒为 kimi);
+// 判型一律用 p.type,实例卡(key !== type)额外带「删除此供应商」按钮。
 
 function platformCard(p, isAdmin) {
   var card = el("div", "card platform");
@@ -426,7 +447,7 @@ function platformCard(p, isAdmin) {
   fields.appendChild(displayNameLabel);
 
   var slotEditors = [];
-  var slotFields = SLOT_FIELDS[p.key] || null;
+  var slotFields = SLOT_FIELDS[p.type] || null;
 
   var renderSlots = function (slots) {
     if (!slotFields) return;
@@ -512,13 +533,13 @@ function platformCard(p, isAdmin) {
   var addSlotLabel = "添加凭证";
   var baseUrlInput = null;
   if (slotFields) {
-    if (p.key === "volcengine-coding" || p.key === "volcengine-agent") {
+    if (p.type === "volcengine-coding" || p.type === "volcengine-agent") {
       addSlotLabel = "添加 AK/SK";
     }
     slotsEditor = el("div", "groups-editor");
     fields.appendChild(slotsEditor);
     renderSlots(p.credential_slots || []);
-  } else if (p.key === "llm-gateway") {
+  } else if (p.type === "llm-gateway") {
     // base_url 是 gateway 的必填配置,直接在此编辑
     var baseUrlLabel = el("label", "", "base_url");
     baseUrlInput = document.createElement("input");
@@ -686,7 +707,7 @@ function platformCard(p, isAdmin) {
       if (slotFields) {
         body.credential_slots = slotEditorsToSlots();
       }
-      if (p.key === "llm-gateway") {
+      if (p.type === "llm-gateway") {
         if (baseUrlInput && baseUrlInput.value.trim()) {
           body.base_url = baseUrlInput.value.trim();
         }
@@ -727,7 +748,7 @@ function platformCard(p, isAdmin) {
       if (slotFields) {
         renderSlots(updated.credential_slots || []);
       }
-      if (p.key === "llm-gateway") {
+      if (p.type === "llm-gateway") {
         serverGroups = updated.groups || [];
         renderGroups(serverGroups);
         if (baseUrlInput) {
@@ -749,6 +770,29 @@ function platformCard(p, isAdmin) {
   foot.appendChild(save);
   foot.appendChild(okEl);
   foot.appendChild(errEl);
+  // 实例卡(key !== type):可整体删除,服务端级联清掉该实例的共享行
+  if (p.type && p.key !== p.type) {
+    var del = el("button", "danger", "删除此供应商");
+    del.type = "button";
+    del.addEventListener("click", async function () {
+      if (!window.confirm("删除后其共享设置一并移除，确定？")) return;
+      del.disabled = true;
+      try {
+        var r = await api(
+          (isAdmin ? "/api/config/platforms/" : "/api/my/platforms/") +
+            encodeURIComponent(p.key),
+          { method: "DELETE" }
+        );
+        if (!r.ok) { errEl.textContent = await detailOf(r); return; }
+        await (isAdmin ? loadAdmin() : loadMy());
+      } catch (e) {
+        if (e && e.message !== "未登录") errEl.textContent = String(e.message || e);
+      } finally {
+        del.disabled = false;
+      }
+    });
+    foot.appendChild(del);
+  }
   card.appendChild(foot);
   return card;
 }
@@ -842,6 +886,51 @@ async function persistOrder() {
   }
 }
 
+// 添加入口(双模式同构):类型下拉来自 /api/provider-types 的服务端真源,
+// 点击后 POST 对应角色的 providers 端点,成功重载当前模式列表。
+async function buildAddProviderRow(isAdmin) {
+  var row = el("div", "add-provider");
+  var select = document.createElement("select");
+  select.setAttribute("aria-label", "选择要添加的供应商类型");
+  var btn = el("button", "btn", "添加供应商");
+  btn.type = "button";
+  btn.addEventListener("click", async function () {
+    btn.disabled = true;
+    try {
+      var label = select.selectedIndex >= 0
+        ? select.options[select.selectedIndex].textContent : select.value;
+      var r = await api(isAdmin ? "/api/config/providers" : "/api/my/providers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: select.value }),
+      });
+      if (!r.ok) { statusEl.textContent = "添加失败: " + (await detailOf(r)); return; }
+      await (isAdmin ? loadAdmin() : loadMy());
+      statusEl.textContent = "已添加 " + label + " 实例";
+    } catch (e) {
+      if (e && e.message !== "未登录") statusEl.textContent = String(e.message || e);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  row.appendChild(select);
+  row.appendChild(btn);
+  try {
+    var r = await api("/api/provider-types");
+    if (!r.ok) throw new Error(await detailOf(r));
+    var data = await r.json();
+    (data.types || []).forEach(function (t) {
+      var o = document.createElement("option");
+      o.value = t.key;
+      o.textContent = t.label;
+      select.appendChild(o);
+    });
+  } catch (e) {
+    if (e && e.message !== "未登录") statusEl.textContent = String(e.message || e);
+  }
+  return row;
+}
+
 async function loadCommon(render, isAdmin) {
   try {
     var r = await api("/api/users");
@@ -857,6 +946,7 @@ async function loadCommon(render, isAdmin) {
     var data = await r.json();
     currentOrder = (data.platforms || []).map(function (p) { return p.key; });
     platformsEl.textContent = "";
+    platformsEl.appendChild(await buildAddProviderRow(isAdmin));
     (data.platforms || []).forEach(function (p) {
       platformsEl.appendChild(render(p, isAdmin));
     });

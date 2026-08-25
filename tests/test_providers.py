@@ -21,6 +21,9 @@ from llm_usage.providers import (
     PROVIDERS,
     _resolve_env_value,
     fetch_all,
+    next_instance_key,
+    resolve_provider_key,
+    split_instance_key,
 )
 from llm_usage.providers.kimi import (
     KimiProvider,
@@ -1072,3 +1075,118 @@ class TestRegistryCredentialFanout:
         assert res.ok
         assert len(res.entries) == 2
         assert all(e.plan is None for e in res.entries)
+
+# ---------------------------------------------------------------------------
+# 同类型供应商实例(实例键 <base>#N)
+# ---------------------------------------------------------------------------
+
+class TestInstanceKeys:
+    def test_split_instance_key(self) -> None:
+        assert split_instance_key("kimi#2") == ("kimi", 2)
+        assert split_instance_key("kimi") == ("kimi", None)
+        assert split_instance_key("kimi#10") == ("kimi", 10)
+        # 非法后缀 / 空 base → 整体视为普通键
+        assert split_instance_key("kimi#x") == ("kimi#x", None)
+        assert split_instance_key("#5") == ("#5", None)
+        # 多个 #:取最后一个分隔
+        assert split_instance_key("a#2#3") == ("a#2", 3)
+
+    def test_resolve_provider_key(self) -> None:
+        assert resolve_provider_key("kimi") == "kimi"
+        assert resolve_provider_key("kimi#2") == "kimi"
+        assert resolve_provider_key("llm-gateway#3") == "llm-gateway"
+        assert resolve_provider_key("foo") is None
+        assert resolve_provider_key("foo#9") is None
+
+    def test_next_instance_key_first_is_two(self) -> None:
+        assert next_instance_key({}, "kimi") == "kimi#2"
+        assert next_instance_key({"kimi": {}}, "kimi") == "kimi#2"
+
+    def test_next_instance_key_monotonic_no_reuse(self) -> None:
+        """从最大 N 递增,不复用空洞(删除后快照历史语义不混淆)。"""
+        assert next_instance_key({"kimi": {}, "kimi#2": {}}, "kimi") == "kimi#3"
+        assert next_instance_key({"kimi": {}, "kimi#9": {}}, "kimi") == "kimi#10"
+        assert next_instance_key({"kimi": {}, "kimi#4": {}}, "kimi") == "kimi#5"
+
+    def test_next_instance_key_scoped_to_base(self) -> None:
+        assert next_instance_key({"kimi": {}, "kimi#9": {}}, "ollama") == "ollama#2"
+
+
+class _StubProvider:
+    """恒返回空成功结果的桩 provider;platform 键由 fetch_all 按配置键规范化。"""
+
+    name = "stub"
+    display_name = "Stub"
+    is_manual = False
+
+    def fetch(self, cfg: dict) -> PlatformResult:
+        # 与真实 provider 一致:display_name 取自 _prepare_config 注入的配置
+        return PlatformResult(
+            "stub", cfg.get("display_name", "Stub"), entries=[]
+        )
+
+
+class TestFetchAllInstances:
+    def test_instance_keys_yield_separate_results(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(PROVIDERS, "kimi", _StubProvider())
+        cfg = {
+            "platforms": {
+                "kimi": {"enabled": True},
+                "kimi#2": {"enabled": True},
+            }
+        }
+        results = fetch_all(cfg)
+        assert [(r.platform, r.display_name) for r in results] == [
+            ("kimi", "Kimi Code"),
+            ("kimi#2", "Kimi Code"),  # display_name 回退到基础类型的默认名
+        ]
+
+    def test_instance_custom_display_name_respected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(PROVIDERS, "kimi", _StubProvider())
+        cfg = {"platforms": {"kimi#2": {"enabled": True, "display_name": "工作号"}}}
+        results = fetch_all(cfg)
+        assert len(results) == 1
+        assert results[0].platform == "kimi#2"
+        assert results[0].display_name == "工作号"
+
+    def test_unknown_base_and_disabled_instances_skipped(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(PROVIDERS, "ollama", _StubProvider())
+        cfg = {
+            "platforms": {
+                "foo#9": {"enabled": True},     # 未知基础类型 → 跳过
+                "kimi#2": {"enabled": False},   # 禁用的实例 → 跳过
+                "ollama": {"enabled": True},
+            }
+        }
+        results = fetch_all(cfg)
+        assert [r.platform for r in results] == ["ollama"]
+
+    def test_instance_sorts_right_after_base(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(PROVIDERS, "kimi", _StubProvider())
+        monkeypatch.setitem(PROVIDERS, "opencode-go", _StubProvider())
+        # 配置顺序故意打乱:kimi#2 在最前、kimi 在后
+        cfg = {
+            "platforms": {
+                "kimi#2": {"enabled": True},
+                "opencode-go": {"enabled": True},
+                "kimi": {"enabled": True},
+            }
+        }
+        assert [r.platform for r in fetch_all(cfg)] == [
+            "kimi", "kimi#2", "opencode-go",
+        ]
+
+    def test_next_instance_key_uses_persisted_high_water(self) -> None:
+        """删除最高实例后计数器仍在:不复用编号。"""
+        assert next_instance_key({}, "kimi", {"kimi": 3}) == "kimi#4"
+        # 现存键只会进一步抬高,不会低于计数器
+        assert next_instance_key({"kimi#2": {}}, "kimi", {"kimi": 5}) == "kimi#6"
+        assert next_instance_key({}, "ollama", {}) == "ollama#2"

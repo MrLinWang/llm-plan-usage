@@ -171,3 +171,32 @@ def update_platform_config(
     section.update(updates)
     save_config(cfg, path)
     return cfg
+
+
+def remove_platform_config(
+    platform: str, path: Path | None = None
+) -> dict[str, Any]:
+    """Remove [platforms.<platform>] entirely, save TOML, return the full updated config."""
+    cfg = load_config(path)
+    cfg.get("platforms", {}).pop(platform, None)
+    save_config(cfg, path)
+    return cfg
+
+
+def set_instance_counter(
+    base: str, n: int, path: Path | None = None
+) -> dict[str, Any]:
+    """Persist one base type's instance high-water mark (top-level key).
+
+    Keeps allocated numbers stable across instance deletion so re-adding
+    never reuses ``<base>#N`` (historical snapshot semantics).
+    """
+    cfg = load_config(path)
+    counters = cfg.get("instance_counters")
+    if not isinstance(counters, dict):
+        counters = {}
+    old = counters.get(base)
+    counters[base] = max(n, old) if isinstance(old, int) else n
+    cfg["instance_counters"] = counters
+    save_config(cfg, path)
+    return cfg

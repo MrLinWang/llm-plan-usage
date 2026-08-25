@@ -17,6 +17,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timezone
 from importlib.resources import files
@@ -30,12 +31,23 @@ from llm_usage.config import (
     get_platform_config,
     get_platform_order,
     load_config,
+    remove_platform_config,
+    set_instance_counter,
     set_platform_order,
     update_platform_config,
 )
 from llm_usage.display import results_to_dict
 from llm_usage.models import PlatformResult
-from llm_usage.providers import DISPLAY_NAMES, PROVIDERS, fetch_all, registry_index
+from llm_usage.providers import (
+    DISPLAY_NAMES,
+    PROVIDERS,
+    fetch_all,
+    instance_number,
+    next_instance_key,
+    registry_index,
+    resolve_provider_key,
+    split_instance_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -637,17 +649,19 @@ def _validate_credential_slots(
 
 def _platform_view(key: str) -> dict[str, Any]:
     """从磁盘读最新配置,返回单个平台的可编辑视图。"""
+    ptype = _require_platform_type(key)
     section = get_platform_config(load_config(), key)
     view = {
         "key": key,
-        "display_name": section.get("display_name") or DISPLAY_NAMES[key],
+        "type": ptype,
+        "display_name": section.get("display_name") or DISPLAY_NAMES.get(ptype, key),
         "enabled": section.get("enabled", True),
     }
-    if CREDENTIAL_FIELDS[key]:
+    if CREDENTIAL_FIELDS[ptype]:
         view["credential_slots"] = _credential_slots_view(
-            section, CREDENTIAL_FIELDS[key]
+            section, CREDENTIAL_FIELDS[ptype]
         )
-    if key == "llm-gateway":
+    if ptype == "llm-gateway":
         view["base_url"] = section.get("base_url")
         view["groups"] = _gateway_groups_view(section)
     return view
@@ -719,12 +733,38 @@ def _apply_visibility(
     store.replace_platform_visibility(username, platform, visibility["targets"])
 
 
+def _platform_type(key: str) -> str | None:
+    """实例键 → 基础类型键(``kimi#2`` → ``kimi``);未知返回 None。"""
+    return resolve_provider_key(key)
+
+
+def _require_platform_type(key: str) -> str:
+    """同 _platform_type,但未知键直接 404(调用方均为已校验路径)。"""
+    ptype = _platform_type(key)
+    if ptype is None:
+        raise HTTPException(status_code=404, detail="未知平台")
+    return ptype
+
+
+def _sorted_platform_keys(
+    keys: Iterable[str], cfg_order: list[str],
+) -> list[str]:
+    """平台列表排序:配置顺序优先、注册表顺序次之、同类型实例按 #N 升序。"""
+    order = {k: i for i, k in enumerate(cfg_order)}
+    reg = registry_index()
+
+    def sort_key(key: str) -> tuple[int, int, int]:
+        base, n = split_instance_key(key)
+        return (order.get(base, len(cfg_order)), reg.get(base, len(reg)), n or 0)
+
+    return sorted(dict.fromkeys(keys), key=sort_key)
+
+
 def _validate_platform_fields(
     key: str, body: dict[str, Any], allow_top_level_creds: bool,
 ) -> None:
     """404 未知平台 + 400 未知字段/平台支持性校验(两个 PUT handler 共用)。"""
-    if key not in PROVIDERS:
-        raise HTTPException(status_code=404, detail="未知平台")
+    ptype = _require_platform_type(key)
     allowed = {
         "enabled", "visibility", "credential_slots", "base_url", "groups",
         "display_name",
@@ -737,21 +777,21 @@ def _validate_platform_fields(
     display_name = body.get("display_name")
     if isinstance(display_name, str) and len(display_name.strip()) > 64:
         raise HTTPException(status_code=400, detail="显示名称最长 64 字符")
-    if "groups" in body and key != "llm-gateway":
+    if "groups" in body and ptype != "llm-gateway":
         raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
-    if "base_url" in body and key != "llm-gateway":
+    if "base_url" in body and ptype != "llm-gateway":
         raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
-    if "credential_slots" in body and key == "llm-gateway":
+    if "credential_slots" in body and ptype == "llm-gateway":
         raise HTTPException(
             status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
         )
-    if "credential_slots" in body and not CREDENTIAL_FIELDS[key]:
+    if "credential_slots" in body and not CREDENTIAL_FIELDS[ptype]:
         raise HTTPException(
             status_code=400, detail=f"平台 {key} 不支持字段: credential_slots"
         )
     if allow_top_level_creds:
         for field in _CREDENTIAL_NAMES & set(body):
-            if field not in CREDENTIAL_FIELDS[key]:
+            if field not in CREDENTIAL_FIELDS[ptype]:
                 raise HTTPException(
                     status_code=400, detail=f"平台 {key} 不支持字段: {field}"
                 )
@@ -765,7 +805,8 @@ def _gateway_updates(
     display_name 由调用方统一处理(两个端点均全平台支持)。
     """
     updates: dict[str, Any] = {}
-    if key != "llm-gateway":
+    ptype = _platform_type(key)
+    if ptype != "llm-gateway":
         return updates
     base_url = body.get("base_url")
     if isinstance(base_url, str) and base_url.strip():
@@ -1137,6 +1178,13 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         store.set_setting("registration_enabled", "1" if value else "0")
         return {"registration_enabled": value}
 
+    @app.get("/api/provider-types")
+    def provider_types_list(
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, Any]:
+        """可添加的供应商类型(添加栏下拉的服务端真源)。"""
+        return {"types": [{"key": k, "label": DISPLAY_NAMES[k]} for k in PROVIDERS]}
+
     # ---- 普通用户平台配置 API ----
     # 普通用户的平台配置存 history.db(user_configs),与 config.toml 完全隔离;
     # 与 admin /api/config 同构:凭证槽 / gateway base_url+组 / 可见性均可编辑。
@@ -1147,7 +1195,17 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             raise HTTPException(status_code=400, detail="管理员请使用 /api/config")
         return user
 
+    def _ensure_deletable(key: str, platforms_cfg: dict[str, Any]) -> None:
+        """删除实例的公共校验:类型已知、非内置裸键、配置中存在。"""
+        if _platform_type(key) is None:
+            raise HTTPException(status_code=404, detail="未知平台")
+        if "#" not in key:
+            raise HTTPException(status_code=400, detail="内置平台不可删除")
+        if key not in platforms_cfg:
+            raise HTTPException(status_code=404, detail="平台未配置")
+
     def _my_platform_view(user: dict[str, Any], key: str) -> dict[str, Any]:
+        ptype = _require_platform_type(key)
         section = get_platform_config(
             store.get_user_config(user["username"]), key
         )
@@ -1156,15 +1214,16 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         )
         view: dict[str, Any] = {
             "key": key,
-            "display_name": section.get("display_name") or DISPLAY_NAMES[key],
+            "type": ptype,
+            "display_name": section.get("display_name") or DISPLAY_NAMES.get(ptype, key),
             "enabled": section.get("enabled", True),
             "visibility": visibility,
         }
-        if CREDENTIAL_FIELDS[key]:
+        if CREDENTIAL_FIELDS[ptype]:
             view["credential_slots"] = _credential_slots_view(
-                section, CREDENTIAL_FIELDS[key]
+                section, CREDENTIAL_FIELDS[ptype]
             )
-        if key == "llm-gateway":
+        if ptype == "llm-gateway":
             view["base_url"] = section.get("base_url")
             view["groups"] = _gateway_groups_view(section)
         return view
@@ -1174,10 +1233,12 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         user: dict[str, Any] = Depends(api_user),
     ) -> dict[str, Any]:
         user = _non_admin(user)
-        cfg_order = get_platform_order(store.get_user_config(user["username"]))
-        order = {k: i for i, k in enumerate(cfg_order)}
-        reg = registry_index()
-        keys = sorted(PROVIDERS, key=lambda k: (order.get(k, len(cfg_order)), reg[k]))
+        ucfg = store.get_user_config(user["username"])
+        keys = _sorted_platform_keys(
+            [*PROVIDERS, *(k for k in ucfg.get("platforms", {})
+                           if _platform_type(k) is not None)],
+            get_platform_order(ucfg),
+        )
         return {"platforms": [_my_platform_view(user, key) for key in keys]}
 
     @app.put("/api/my/platforms/{key}")
@@ -1188,6 +1249,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     ) -> dict[str, Any]:
         user = _non_admin(user)
         _validate_platform_fields(key, body, allow_top_level_creds=False)
+        ptype = _require_platform_type(key)
         visibility = _validate_visibility_body(body, user["username"])
         cfg = store.get_user_config(user["username"])
         platforms = cfg.setdefault("platforms", {})
@@ -1198,7 +1260,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             # 校验来源是用户自己已存的 section;留空 = 保留既有值
             try:
                 section["credentials"] = _validate_credential_slots(
-                    body["credential_slots"], section, CREDENTIAL_FIELDS[key]
+                    body["credential_slots"], section, CREDENTIAL_FIELDS[ptype]
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1209,21 +1271,67 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         # 全平台通用;留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
         if isinstance(display_name, str) and display_name.strip():
             section["display_name"] = display_name.strip()
-        if key == "llm-gateway":
+        if ptype == "llm-gateway":
             section.update(_gateway_updates(key, body, section))
         store.set_user_config(user["username"], cfg)
         if visibility is not None:
             _apply_visibility(user["username"], key, visibility)
         return _my_platform_view(user, key)
 
+    @app.post("/api/my/providers")
+    def my_add_provider(
+        body: dict[str, Any] = Body(...),
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, Any]:
+        """给当前普通用户新增一个供应商实例(写入其 user_configs)。"""
+        user = _non_admin(user)
+        extra = sorted(set(body) - {"type"})
+        if extra:
+            raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
+        ptype = body.get("type")
+        if not isinstance(ptype, str) or ptype not in PROVIDERS:
+            raise HTTPException(status_code=400, detail=f"未知供应商类型: {ptype}")
+        cfg = store.get_user_config(user["username"])
+        platforms = cfg.setdefault("platforms", {})
+        counters = cfg.get("instance_counters")
+        if not isinstance(counters, dict):
+            counters = {}
+        new_key = next_instance_key(platforms, ptype, counters)
+        n = instance_number(new_key)
+        # 高水位计数器随删除保留,保证实例编号不复用
+        counters[ptype] = n
+        cfg["instance_counters"] = counters
+        platforms[new_key] = {
+            "enabled": False,
+            "display_name": f"{DISPLAY_NAMES[ptype]} #{n}",
+        }
+        store.set_user_config(user["username"], cfg)
+        return _my_platform_view(user, new_key)
+
+    @app.delete("/api/my/platforms/{key}")
+    def my_delete_provider(
+        key: str,
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, bool]:
+        """删除自己的供应商实例,级联清理其共享行。"""
+        user = _non_admin(user)
+        cfg = store.get_user_config(user["username"])
+        _ensure_deletable(key, cfg.get("platforms", {}))
+        cfg.get("platforms", {}).pop(key, None)
+        store.set_user_config(user["username"], cfg)
+        store.delete_platform_visibility(user["username"], key)
+        return {"ok": True}
+
     # ---- 供应商配置 API(管理员) ----
 
     @app.get("/api/config")
     def config_get(admin: dict[str, Any] = Depends(api_admin)) -> dict[str, Any]:
-        cfg_order = get_platform_order(load_config())
-        order = {k: i for i, k in enumerate(cfg_order)}
-        reg = registry_index()
-        keys = sorted(PROVIDERS, key=lambda k: (order.get(k, len(cfg_order)), reg[k]))
+        cfg = load_config()
+        keys = _sorted_platform_keys(
+            [*PROVIDERS, *(k for k in cfg.get("platforms", {})
+                           if _platform_type(k) is not None)],
+            get_platform_order(cfg),
+        )
         vis = _visibility_view(admin["username"])
         return {
             "platforms": [
@@ -1241,6 +1349,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         admin: dict[str, Any] = Depends(api_admin),
     ) -> dict[str, Any]:
         _validate_platform_fields(key, body, allow_top_level_creds=True)
+        ptype = _require_platform_type(key)
         visibility = _validate_visibility_body(body, admin["username"])
         current_section = (
             get_platform_config(load_config(), key)
@@ -1254,7 +1363,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         # 全平台通用;留空 = 不修改;仅非空字符串写回
         if isinstance(display_name, str) and display_name.strip():
             updates["display_name"] = display_name.strip()
-        for field in CREDENTIAL_FIELDS[key]:
+        for field in CREDENTIAL_FIELDS[ptype]:
             value = body.get(field)
             # 留空 = 不修改;仅非空字符串写回
             if isinstance(value, str) and value.strip():
@@ -1262,7 +1371,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         if "credential_slots" in body:
             try:
                 updates["credentials"] = _validate_credential_slots(
-                    body["credential_slots"], current_section, CREDENTIAL_FIELDS[key]
+                    body["credential_slots"], current_section, CREDENTIAL_FIELDS[ptype]
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1281,6 +1390,46 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             ),
         }
 
+    @app.post("/api/config/providers")
+    def config_add_provider(
+        body: dict[str, Any] = Body(...),
+        admin: dict[str, Any] = Depends(api_admin),
+    ) -> dict[str, Any]:
+        """新增一个管理员侧供应商实例(写入 config.toml)。"""
+        extra = sorted(set(body) - {"type"})
+        if extra:
+            raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
+        ptype = body.get("type")
+        if not isinstance(ptype, str) or ptype not in PROVIDERS:
+            raise HTTPException(status_code=400, detail=f"未知供应商类型: {ptype}")
+        cfg = load_config()
+        counters = cfg.get("instance_counters")
+        if not isinstance(counters, dict):
+            counters = {}
+        new_key = next_instance_key(cfg.get("platforms", {}), ptype, counters)
+        n = instance_number(new_key)
+        update_platform_config(new_key, {
+            "enabled": False,
+            "display_name": f"{DISPLAY_NAMES[ptype]} #{n}",
+        })
+        # 高水位计数器随删除保留,保证实例编号不复用
+        set_instance_counter(ptype, n)
+        return {
+            **_platform_view(new_key),
+            "visibility": {"type": "private", "targets": []},
+        }
+
+    @app.delete("/api/config/platforms/{key}")
+    def config_delete_provider(
+        key: str,
+        admin: dict[str, Any] = Depends(api_admin),
+    ) -> dict[str, bool]:
+        """删除管理员侧实例并级联清理其共享行。"""
+        _ensure_deletable(key, load_config().get("platforms", {}))
+        remove_platform_config(key)
+        store.delete_platform_visibility(admin["username"], key)
+        return {"ok": True}
+
     @app.put("/api/config/order")
     def config_put_order(
         body: dict[str, Any] = Body(...),
@@ -1289,7 +1438,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         order = body.get("order")
         if not isinstance(order, list) or not all(isinstance(k, str) for k in order):
             raise HTTPException(status_code=400, detail="order 需为字符串数组")
-        known = [k for k in order if k in PROVIDERS]
+        known = [k for k in order if _platform_type(k) is not None]
         missing = [k for k in PROVIDERS if k not in known]
         full_order = known + missing
         set_platform_order(full_order)

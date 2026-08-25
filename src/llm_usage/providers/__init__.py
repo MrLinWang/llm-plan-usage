@@ -44,6 +44,63 @@ def registry_index() -> dict[str, int]:
     """Return a copy of the registry-order lookup (platform key -> index)."""
     return dict(_REGISTRY_INDEX)
 
+
+def split_instance_key(key: str) -> tuple[str, int | None]:
+    """Split an instance key ``"<base>#N"`` into ``(base, N)``.
+
+    Keys without a ``#`` suffix (or with a non-numeric suffix) are plain
+    keys and return ``(key, None)``.
+    """
+    base, sep, suffix = key.rpartition("#")
+    if not sep or not base or not suffix.isdigit():
+        return key, None
+    return base, int(suffix)
+
+
+def resolve_provider_key(key: str) -> str | None:
+    """Resolve an instance key to its registered provider base key.
+
+    Returns the base key (e.g. ``"kimi#2" -> "kimi"``) when it exists in
+    :data:`PROVIDERS`; ``None`` for unknown types or unknown base keys.
+    """
+    base, _ = split_instance_key(key)
+    return base if base in PROVIDERS else None
+
+
+def next_instance_key(
+    platforms_cfg: dict[str, Any],
+    base: str,
+    counters: dict[str, int] | None = None,
+) -> str:
+    """Return the next instance key for ``base`` (monotonic, no reuse).
+
+    The first added instance is ``<base>#2``.  ``counters`` is the persisted
+    high-water mark per base (survives deletion of the highest instance —
+    without it, deleting ``kimi#2`` and re-adding would hand out ``#2``
+    again); existing config keys can only raise the result further.
+    Malformed (non-int) persisted values are treated as absent.
+    """
+    counter = (counters or {}).get(base)
+    if not isinstance(counter, int):
+        counter = 0
+    max_n = max(counter, 1)
+    for key in platforms_cfg:
+        kbase, n = split_instance_key(key)
+        if kbase == base and n is not None and n > max_n:
+            max_n = n
+    return f"{base}#{max_n + 1}"
+
+
+def instance_number(key: str) -> int:
+    """Numeric suffix of a well-formed instance key (allocator output).
+
+    Raises ``ValueError`` on plain/malformed keys.
+    """
+    n = split_instance_key(key)[1]
+    if n is None:
+        raise ValueError(f"not an instance key: {key}")
+    return n
+
 # Display names (override-able from config).
 DISPLAY_NAMES: dict[str, str] = {
     "kimi": "Kimi Code",
@@ -68,7 +125,8 @@ def _prepare_config(platform: str, pcfg: dict[str, Any]) -> dict[str, Any]:
     out["_platform_key"] = platform
     # display name resolution
     if "display_name" not in out:
-        out["display_name"] = DISPLAY_NAMES.get(platform, platform)
+        base, _ = split_instance_key(platform)
+        out["display_name"] = DISPLAY_NAMES.get(base, platform)
     # expand env: prefixed credentials (api_key, access_key, secret_key)
     out["api_key"] = _resolve_env_value(pcfg.get("api_key"))
     out["access_key"] = _resolve_env_value(pcfg.get("access_key"))
@@ -120,7 +178,9 @@ def fetch_all(
     Platforms configured with a ``credentials`` list fan out into one
     independent fetch per credential (each = one billing plan); results are
     merged back into a single ``PlatformResult`` per platform with every entry
-    tagged by its plan name.
+    tagged by its plan name.  Instance sections (``<base>#N``) dispatch to
+    their base provider and keep the instance key as ``PlatformResult.platform``;
+    results sort by base type so each instance renders right after it.
     """
     platforms_cfg: dict[str, Any] = config.get("platforms", {})
     tasks: list[tuple[str, Provider, dict[str, Any], str | None]] = []
@@ -129,12 +189,12 @@ def fetch_all(
             continue
         if enabled_only and not pcfg.get("enabled", True):
             continue
-        provider = PROVIDERS.get(platform)
-        if provider is None:
-            # unknown platform key — skip silently
+        ptype = resolve_provider_key(platform)
+        if ptype is None:
+            # unknown platform key / unknown instance type — skip silently
             continue
         for sub, plan_name in _credential_specs(_prepare_config(platform, pcfg)):
-            tasks.append((platform, provider, sub, plan_name))
+            tasks.append((platform, PROVIDERS[ptype], sub, plan_name))
 
     results: list[PlatformResult] = []
     if not tasks:
@@ -204,6 +264,10 @@ def fetch_all(
     cfg_order = get_platform_order(config)
     order = {plat: i for i, plat in enumerate(cfg_order)}
     results.sort(
-        key=lambda r: (order.get(r.platform, len(cfg_order)), _REGISTRY_INDEX.get(r.platform, 999))
+        key=lambda r: (
+            order.get(r.platform, len(cfg_order)),
+            _REGISTRY_INDEX.get(split_instance_key(r.platform)[0], 999),
+            split_instance_key(r.platform)[1] or 0,
+        )
     )
     return results

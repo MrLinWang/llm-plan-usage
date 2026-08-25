@@ -734,8 +734,9 @@ def _validate_platform_fields(
     extra = sorted(set(body) - allowed)
     if extra:
         raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
-    if not allow_top_level_creds and "display_name" in body and key != "llm-gateway":
-        raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: display_name")
+    display_name = body.get("display_name")
+    if isinstance(display_name, str) and len(display_name.strip()) > 64:
+        raise HTTPException(status_code=400, detail="显示名称最长 64 字符")
     if "groups" in body and key != "llm-gateway":
         raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
     if "base_url" in body and key != "llm-gateway":
@@ -761,7 +762,7 @@ def _gateway_updates(
 ) -> dict[str, Any]:
     """llm-gateway 专用:base_url 留空不改;groups 校验 + use_groups=True。
 
-    display_name 由调用方按各自规则处理(admin 全平台 / my 仅 gateway)。
+    display_name 由调用方统一处理(两个端点均全平台支持)。
     """
     updates: dict[str, Any] = {}
     if key != "llm-gateway":
@@ -1204,11 +1205,11 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             # 槽式保存后清除顶层凭证字段(单 JSON 原子写,无中间态问题)
             for field in _CREDENTIAL_NAMES:
                 section.pop(field, None)
+        display_name = body.get("display_name")
+        # 全平台通用;留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
+        if isinstance(display_name, str) and display_name.strip():
+            section["display_name"] = display_name.strip()
         if key == "llm-gateway":
-            display_name = body.get("display_name")
-            # 留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
-            if isinstance(display_name, str) and display_name.strip():
-                section["display_name"] = display_name.strip()
             section.update(_gateway_updates(key, body, section))
         store.set_user_config(user["username"], cfg)
         if visibility is not None:

@@ -1366,7 +1366,7 @@ class TestUserIsolation:
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
         tmp_config_path: Path,
     ) -> None:
-        """普通用户 gateway 自定义仪表盘名称:持久化、留空不修改、共享带 (owner) 后缀。"""
+        """普通用户自定义仪表盘名称(全平台):持久化、留空不修改、共享带后缀。"""
         init_config(tmp_config_path)
         client, _ = self._config_client(monkeypatch, load_config())
         alice = self._register(client, "alice")
@@ -1399,13 +1399,41 @@ class TestUserIsolation:
         assert resp.status_code == 200
         assert store.get_user_config("alice")["platforms"]["llm-gateway"][
             "display_name"] == "我的渠道"
-        # 非 gateway 平台拒绝 display_name
+        # 非 gateway 平台同样支持自定义名称(全平台开放)
         resp = alice.put("/api/my/platforms/kimi", json={
             "enabled": True,
             "display_name": "K",
+            "visibility": {"type": "public", "targets": []},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["display_name"] == "K"
+        my_view = {
+            p["key"]: p
+            for p in alice.get("/api/my/platforms").json()["platforms"]
+        }
+        assert my_view["kimi"]["display_name"] == "K"
+        # 自定义名传播:bob 的合并视图显示 自定义名(owner)
+        bob_kimi = [p["display_name"]
+                    for p in bob.get("/api/usage").json()["platforms"]
+                    if p["name"] == "kimi"]
+        assert "K(alice)" in bob_kimi
+
+    def test_my_platform_display_name_too_long(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """display_name 超 64 字符 → 400(两个端点共用同一校验);64 字符合法。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        resp = alice.put("/api/my/platforms/kimi", json={
+            "enabled": True,
+            "display_name": "长" * 65,
         })
         assert resp.status_code == 400
-        assert resp.json()["detail"] == "平台 kimi 不支持字段: display_name"
+        assert resp.json()["detail"] == "显示名称最长 64 字符"
+        resp = alice.put("/api/my/platforms/kimi", json={"display_name": "长" * 64})
+        assert resp.status_code == 200
 
     def test_admin_gateway_display_name(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,

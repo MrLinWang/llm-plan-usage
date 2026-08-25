@@ -384,10 +384,10 @@ function buildVisibilityRow(visibility) {
 }
 
 // ---- 平台卡片(单一构造器,admin/普通用户双模式) ----
-// 两模式同构完整编辑器:标题(display_name + key)、启用 checkbox、凭证编辑区
-// (非 gateway = 凭证槽编辑器,每槽一个套餐;gateway = base_url 输入 + 分组编辑器)、
-// 可见性、保存按钮。模式差异仅三点:保存端点、拖拽手柄(仅 admin)、
-// 保存成功后的状态文案(由 loadCommon 写入 statusEl)。
+// 两模式同构完整编辑器:标题(display_name + key)、启用 checkbox、显示名称输入(公共字段,
+// 全平台可自定义)、凭证编辑区(非 gateway = 凭证槽编辑器,每槽一个套餐;
+// gateway = base_url 输入 + 分组编辑器)、可见性、保存按钮。模式差异仅三点:保存端点、
+// 拖拽手柄(仅 admin)、保存成功后的状态文案(由 loadCommon 写入 statusEl)。
 
 function platformCard(p, isAdmin) {
   var card = el("div", "card platform");
@@ -415,6 +415,15 @@ function platformCard(p, isAdmin) {
   enableLabel.appendChild(enableBox);
   enableLabel.appendChild(document.createTextNode("启用"));
   fields.appendChild(enableLabel);
+  // 显示名称:全平台公共字段;留空 = 不修改;回显当前生效名称(自定义或默认)
+  var displayNameLabel = el("label", "", "显示名称");
+  var displayNameInput = document.createElement("input");
+  displayNameInput.type = "text";
+  displayNameInput.autocomplete = "off";
+  displayNameInput.placeholder = p.display_name || p.key;
+  if (p.display_name) displayNameInput.value = p.display_name;
+  displayNameLabel.appendChild(displayNameInput);
+  fields.appendChild(displayNameLabel);
 
   var slotEditors = [];
   var slotFields = SLOT_FIELDS[p.key] || null;
@@ -510,15 +519,6 @@ function platformCard(p, isAdmin) {
     fields.appendChild(slotsEditor);
     renderSlots(p.credential_slots || []);
   } else if (p.key === "llm-gateway") {
-    // 渠道显示名称:留空 = 不修改;回显当前生效名称(自定义或默认 LLM Gateway)
-    var displayNameLabel = el("label", "", "显示名称");
-    var displayNameInput = document.createElement("input");
-    displayNameInput.type = "text";
-    displayNameInput.autocomplete = "off";
-    displayNameInput.placeholder = "LLM Gateway";
-    if (p.display_name) displayNameInput.value = p.display_name;
-    displayNameLabel.appendChild(displayNameInput);
-    fields.appendChild(displayNameLabel);
     // base_url 是 gateway 的必填配置,直接在此编辑
     var baseUrlLabel = el("label", "", "base_url");
     baseUrlInput = document.createElement("input");
@@ -680,13 +680,13 @@ function platformCard(p, isAdmin) {
     save.disabled = true;
     try {
       var body = { enabled: enableBox.checked, visibility: vis.getBody() };
+      if (displayNameInput.value.trim()) {
+        body.display_name = displayNameInput.value.trim();
+      }
       if (slotFields) {
         body.credential_slots = slotEditorsToSlots();
       }
       if (p.key === "llm-gateway") {
-        if (displayNameInput && displayNameInput.value.trim()) {
-          body.display_name = displayNameInput.value.trim();
-        }
         if (baseUrlInput && baseUrlInput.value.trim()) {
           body.base_url = baseUrlInput.value.trim();
         }
@@ -730,15 +730,14 @@ function platformCard(p, isAdmin) {
       if (p.key === "llm-gateway") {
         serverGroups = updated.groups || [];
         renderGroups(serverGroups);
-        if (displayNameInput) {
-          displayNameInput.value = "";
-          displayNameInput.placeholder = updated.display_name || "LLM Gateway";
-        }
         if (baseUrlInput) {
           baseUrlInput.value = "";
           baseUrlInput.placeholder = updated.base_url || "http://127.0.0.1:18080";
         }
       }
+      // 显示名称公共字段:清空输入,placeholder 更新为新生效名
+      displayNameInput.value = "";
+      displayNameInput.placeholder = updated.display_name || p.key;
       enableBox.checked = !!updated.enabled;
       okEl.textContent = "已保存，下次刷新生效";
     } catch (e) {

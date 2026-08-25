@@ -13,7 +13,7 @@ cli.py (click group: show/tui/web/config/history)
   → config.load_config()                    # TOML at ./config.toml (cwd)
   → providers.fetch_all(cfg)                 # ThreadPoolExecutor, one thread per enabled platform
       → _prepare_config() per platform       # inject _platform_key, resolve display_name, expand env: api_key
-      → Provider.fetch(config_section)       # live: httpx sync; manual: reads config entries
+      → Provider.fetch(config_section)       # live: httpx sync; config supplies credentials
           → returns PlatformResult(entries=[UsageEntry...], error=None|str)
   → show: display.render_results() / results_to_json()   # rich Table+Panel or JSON
     tui: display.build_overview() under rich.Live, cbreak key loop (q/r/+/-)

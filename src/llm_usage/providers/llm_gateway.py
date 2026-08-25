@@ -158,8 +158,8 @@ def _parse_daily_usage(
 def _error_from_response(response: httpx.Response) -> str:
     """Build a concise Chinese error from a gateway error response.
 
-    只保留状态码与静态提示：上游响应体内容不回显给客户端（与整体脱敏
-    约定一致），完整响应仅在服务端日志可见。
+    只保留状态码与静态提示：上游响应体内容一律不回显给客户端（与整体
+    脱敏约定一致）；本函数不读取也不记录响应体。
     """
     if response.status_code == 401:
         return "认证失败(401)：请检查 LLM_GATEWAY_API_KEY"

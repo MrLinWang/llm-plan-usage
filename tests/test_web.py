@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -191,6 +192,56 @@ class TestWeb:
         html = client.get("/").text
         assert 'rel="icon"' in html
         assert "data:image/svg+xml" in html
+
+
+
+class TestPwa:
+    def test_manifest_served_without_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """登录页也要能取 manifest 并注册 SW,故清单路由不设认证。"""
+        _patch_fetch(monkeypatch)
+        client = TestClient(create_app({"platforms": {}}))
+        resp = client.get("/manifest.webmanifest")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/manifest+json")
+        data = json.loads(resp.text)
+        assert data["start_url"] == "/"
+        assert data["display"] == "standalone"
+        sizes = {icon["sizes"] for icon in data["icons"]}
+        assert "192x192" in sizes and "512x512" in sizes
+
+    def test_service_worker_served_without_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        _patch_fetch(monkeypatch)
+        client = TestClient(create_app({"platforms": {}}))
+        resp = client.get("/sw.js")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/javascript")
+        assert '"llm-usage-v1"' in resp.text
+        assert 'addEventListener("fetch"' in resp.text
+
+    def test_icons_whitelist_and_traversal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """图标按白名单放行;路径穿越(线上原样形式 %2E%2E)与未知名一律 404。"""
+        _patch_fetch(monkeypatch)
+        client = TestClient(create_app({"platforms": {}}))
+        resp = client.get("/icons/icon-192.png")
+        assert resp.status_code == 200
+        assert resp.content.startswith(b"\x89PNG")
+        assert client.get("/icons/%2E%2E/sw.js").status_code == 404
+        assert client.get("/icons/junk.png").status_code == 404
+
+    def test_pages_declare_pwa_hooks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        for path in ("/", "/login"):
+            html = client.get(path).text
+            assert 'rel="manifest"' in html
+            assert "serviceWorker" in html
 
 
 class TestWebAuth:

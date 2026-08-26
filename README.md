@@ -181,6 +181,21 @@ api_key = "sk-kimi-xxx"
 页面右上角可切换浅色/深色主题；选择持久化在浏览器 `localStorage`，
 未手动选择时跟随系统 `prefers-color-scheme`（默认深色）。
 
+### PWA（安装到桌面 / 离线查看）
+
+仪表盘是一个 Progressive Web App：在浏览器地址栏安装（Chrome/Edge 安装图标）或
+iOS Safari「添加到主屏幕」后，以独立窗口（standalone）运行。四个页面均内联注册
+Service Worker（`/sw.js`，根作用域）：
+
+- **离线兜底**：页面导航网络优先、失败回退缓存；`/api/usage` 等只读 GET 会缓存
+  最近一次成功响应——断网时刷新仍能看到上次拉取的完整数据（状态栏「上次获取」
+  保持不变），恢复联网后自动继续轮询。
+- **免登录资产**：`/manifest.webmanifest`（应用名/图标/standalone）、
+  `/icons/icon-192.png`、`/icons/icon-512.png`、`/icons/apple-touch-icon.png`
+  无需登录即可获取（登录页也要能安装）；主题色固定深色 `#16181d`。
+- **缓存版本**：修改 `static/sw.js` 后必须递增文件头部的 `CACHE` 版本号，
+  客户端才会淘汰旧缓存。
+
 ```bash
 llm-usage web --host 127.0.0.1 --port 8765 --interval 60
 ```

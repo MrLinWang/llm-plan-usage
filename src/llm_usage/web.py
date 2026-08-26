@@ -5,6 +5,9 @@
 开放注册:管理员经 PUT /api/settings 打开开关后,访客可经 POST
 /api/auth/register 自助注册(永远是普通用户,注册即登录);开关默认关闭,
 存 history.db settings 表。
+PWA:四个页面内联注册 Service Worker(/sw.js,根作用域);/manifest.webmanifest
+与 /icons/{name} 为无认证静态路由(登录页也要能取清单并注册 SW),离线时由
+SW 以缓存回退页面导航与 /api 只读 GET。
 """
 from __future__ import annotations
 
@@ -21,10 +24,11 @@ from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timezone
 from importlib.resources import files
+from pathlib import Path
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from llm_usage import store
 from llm_usage.config import (
@@ -834,6 +838,10 @@ def _validate_visibility_body(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+_STATIC_DIR = Path(str(files("llm_usage") / "static"))
+_ICON_FILES = {"icon-192.png", "icon-512.png", "apple-touch-icon.png"}
+
+
 def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     cache = UserCaches(interval)
     limiter = _LoginLimiter()
@@ -910,6 +918,23 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     def favicon() -> Response:
         """浏览器默认请求 /favicon.ico;页面已声明内联 data URI 图标,这里兜底返回 204 避免 404 日志。"""
         return Response(status_code=204)
+
+    @app.get("/manifest.webmanifest")
+    def webmanifest() -> Response:
+        """PWA 清单:application/manifest+json 是浏览器识别安装条件的媒体类型。"""
+        return FileResponse(_STATIC_DIR / "manifest.webmanifest",
+                            media_type="application/manifest+json")
+
+    @app.get("/sw.js")
+    def service_worker() -> Response:
+        """Service worker 必须挂在根作用域才能控制全部页面。"""
+        return FileResponse(_STATIC_DIR / "sw.js", media_type="text/javascript")
+
+    @app.get("/icons/{name}")
+    def icon(name: str) -> Response:
+        if name not in _ICON_FILES:
+            raise HTTPException(status_code=404)
+        return FileResponse(_STATIC_DIR / "icons" / name, media_type="image/png")
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> Response:

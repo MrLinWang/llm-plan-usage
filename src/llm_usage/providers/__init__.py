@@ -14,6 +14,7 @@ from typing import Any
 from llm_usage.config import get_platform_order
 from llm_usage.models import PlatformResult, UsageEntry
 from llm_usage.providers.base import Provider
+from llm_usage.providers.clinepass import ClinePassProvider
 from llm_usage.providers.kimi import KimiProvider
 from llm_usage.providers.llm_gateway import LlmGatewayProvider
 from llm_usage.providers.ollama import OllamaProvider
@@ -32,6 +33,7 @@ PROVIDERS: dict[str, Provider] = {
     "volcengine-agent": VolcengineProvider(),
     "ollama": OllamaProvider(),
     "opencode-go": OpenCodeGoProvider(),
+    "clinepass": ClinePassProvider(),
     "llm-gateway": LlmGatewayProvider(),
 }
 
@@ -108,6 +110,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "volcengine-agent": "火山方舟 Agent Plan",
     "ollama": "Ollama Cloud",
     "opencode-go": "OpenCode Go",
+    "clinepass": "ClinePass",
     "llm-gateway": "LLM Gateway",
 }
 
@@ -140,9 +143,10 @@ def _credential_specs(prepared: dict[str, Any]) -> list[tuple[dict[str, Any], st
     Returns a list of ``(sub_config, plan_name)``.  When the section has a
     non-empty ``credentials`` list (multi-credential billing plans), one spec
     per credential is produced — each is an independent fetch with its own
-    plan name.  Otherwise a single spec for the legacy top-level credential
-    is returned with ``plan_name=None``.  LLM Gateway keeps its own groups
-    handling and is never expanded here.
+    plan name.  A section resolving to a single credential behaves like the
+    legacy top-level form (``plan_name=None``): partition headers are only
+    meaningful with ≥2 plans.  LLM Gateway keeps its own groups handling
+    and is never expanded here.
     """
     platform = prepared["_platform_key"]
     slots = prepared.get("credentials")
@@ -163,6 +167,9 @@ def _credential_specs(prepared: dict[str, Any]) -> list[tuple[dict[str, Any], st
         specs.append((sub, plan_name))
     if not specs:
         return [(prepared, None)]
+    # 单一凭证(无论存储形态)不打套餐标:分区头只在 ≥2 个套餐时有意义
+    if len(specs) == 1:
+        return [(specs[0][0], None)]
     return specs
 
 

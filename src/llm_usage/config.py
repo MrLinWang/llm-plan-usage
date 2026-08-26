@@ -83,6 +83,15 @@ api_key = "env:OPENCODE_GO_API_KEY"       # OpenCode Go API key
 # name = "套餐A"
 # api_key = "env:OPENCODE_GO_API_KEY_A"
 
+[platforms.clinepass]
+enabled = true
+api_key = "env:CLINEPASS_API_KEY"         # Cline API key (app.cline.bot)
+# 多计费套餐:同一平台可有多个独立凭证(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.clinepass.credentials]]
+# name = "套餐A"
+# api_key = "env:CLINEPASS_API_KEY_A"
+
 [platforms.llm-gateway]
 enabled = true
 base_url = "http://127.0.0.1:18080"      # gateway base URL

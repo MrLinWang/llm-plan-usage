@@ -67,9 +67,10 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | 火山方舟 Agent Plan | 自动 API | Volcengine OpenAPI `GetAFPUsage`，AK/SK + V4 签名 |
 | Ollama Cloud | 自动 API | `GET /api/usage`，Bearer |
 | OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer |
+| ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口 |
 | LLM Gateway（本地 Sub2API 网关） | 自动 API | `GET /v1/usage`，Bearer；显示今日 `actual_cost` USD |
 
-以上 6 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
+以上 7 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
 `kimi#2`），见下方「同类型供应商实例」。
 
 ## 配置
@@ -113,14 +114,17 @@ api_keys = [
 provider 兼容，可手工编辑 `config.toml` 使用；Web 端会把这种配置当作一组展示，
 保存时自动迁移为 `groups` 并置 `use_groups = true`。
 
-### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go）
+### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass）
 
 除 LLM Gateway 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
 **不同计费套餐**。每个凭证彼此完全独立——各自 fetch、各自展示、无共享限额、
 不合并数值；仪表盘按套餐分区展示同一平台的用量（`show`/`tui`/`web` 一致）。
 与 Gateway 的 groups（共享额度、聚合求和）不同。
+只有一个凭证时不显示套餐分区头——单槽（含 Web 编辑器保存时写入的
+`name = "套餐1"`）与旧的顶层单 Key 形态展示完全一致；两个及以上凭证才按
+套餐分区。
 
-Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go 为
+Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass 为
 `api_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
 （火山为「添加 AK/SK」）即可增加新套餐；「套餐名」留空时服务端自动命名
 `套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后写回
@@ -210,8 +214,8 @@ PBKDF2-SHA256（60 万次迭代、随机盐）哈希存储，不落明文；站�
 ### 供应商配置
 
 管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证
-（kimi/ollama/opencode-go 为 `api_key`；火山两个平台为 `access_key` + `secret_key`；
-llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go
+（kimi/ollama/opencode-go/clinepass 为 `api_key`；火山两个平台为 `access_key` + `secret_key`；
+llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass
 以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
 命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
 （火山「添加 AK/SK」）追加新套餐槽。LLM Gateway 以**组**为单位编辑：
@@ -235,7 +239,7 @@ llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollam
 卡片；新实例默认**停用**，配好凭证后再勾选启用。管理员添加写入
 `./config.toml`（`POST /api/config/providers`），普通用户写入自己的
 `user_configs`（`POST /api/my/providers`）。删除走卡片上的「删除此供应商」
-按钮（确认框），该实例的共享设置一并级联移除；内置的 6 个基础平台不可删除。
+按钮（确认框），该实例的共享设置一并级联移除；内置的 7 个基础平台不可删除。
 实例编号单调递增不复用（删除 `kimi#2` 后再添加得到 `kimi#3`），避免历史快照
 歧义。终端侧无需配置：实例随所在平台的配置自动抓取并显示。
 

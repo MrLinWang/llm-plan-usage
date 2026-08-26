@@ -34,6 +34,10 @@ from llm_usage.providers.llm_gateway import (
     LlmGatewayProvider,
     _parse_daily_usage,
 )
+from llm_usage.providers.clinepass import (
+    ClinePassProvider,
+    _parse_usage_payload as _parse_clinepass_payload,
+)
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
 from llm_usage.providers.volcengine import (
@@ -484,6 +488,153 @@ class TestOpenCodeGoHttp:
 
 
 # ---------------------------------------------------------------------------
+# ClinePass (live API)
+# ---------------------------------------------------------------------------
+
+def _clinepass_usage_payload() -> dict:
+    """ClinePass usage-limits response: percent-only windows in an envelope."""
+    return {
+        "success": True,
+        "data": {
+            "limits": [
+                {"type": "weekly", "percentUsed": 12.5,
+                 "resetsAt": "2026-08-31T00:00:00Z"},
+                {"type": "five_hour", "percentUsed": 42.5,
+                 "resetsAt": "2026-08-26T18:00:00Z"},
+                {"type": "monthly", "percentUsed": "3.1",
+                 "resetsAt": "2026-09-01T00:00:00Z"},
+                {"type": "daily", "percentUsed": 9.9,
+                 "resetsAt": "2026-08-27T00:00:00Z"},  # 未知窗口 → 跳过
+            ]
+        },
+    }
+
+
+class TestClinePassParsing:
+    def test_windows_mapped_in_fixed_order(self) -> None:
+        entries = _parse_clinepass_payload(_clinepass_usage_payload(), "clinepass")
+        assert [e.label for e in entries] == ["5小时", "每周", "每月"]
+        five_hour, weekly, monthly = entries
+        assert five_hour.percent == 42.5
+        assert weekly.percent == 12.5
+        assert monthly.percent == 3.1  # JSON 字符串数字也接受
+        # reset_at 原样透传(ISO UTC)
+        assert five_hour.reset_at == "2026-08-26T18:00:00Z"
+        # 与 Ollama 同型的百分比形态:无绝对额度
+        for e in entries:
+            assert e.platform == "clinepass"
+            assert e.unit == "%"
+            assert e.used == 0.0
+            assert e.limit is None
+            assert e.remaining is None
+
+    def test_percent_clamped_and_bad_values_skipped(self) -> None:
+        payload = {"data": {"limits": [
+            {"type": "five_hour", "percentUsed": 140},
+            {"type": "weekly", "percentUsed": "abc"},
+            {"type": "monthly"},
+        ]}}
+        entries = _parse_clinepass_payload(payload, "clinepass")
+        assert len(entries) == 1
+        assert entries[0].label == "5小时"
+        assert entries[0].percent == 100.0
+
+    def test_epoch_millis_reset_time_converted_to_utc_iso(self) -> None:
+        payload = {"data": {"limits": [
+            {"type": "five_hour", "percentUsed": 1, "resetsAt": 1798387200000},
+        ]}}
+        entries = _parse_clinepass_payload(payload, "clinepass")
+        assert entries[0].reset_at is not None
+        assert entries[0].reset_at.endswith("Z")
+
+    def test_missing_or_malformed_data_yields_no_entries(self) -> None:
+        assert _parse_clinepass_payload({}, "clinepass") == []
+        assert _parse_clinepass_payload({"data": {}}, "clinepass") == []
+        assert _parse_clinepass_payload(
+            {"data": {"limits": "junk"}}, "clinepass") == []
+
+
+class TestClinePassHttp:
+    def test_fetch_success_hits_versioned_endpoint(self) -> None:
+        payload = _clinepass_usage_payload()
+        seen: dict = {}
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["path"] = req.url.path
+            seen["auth"] = req.headers.get("Authorization")
+            return httpx.Response(200, json=payload)
+        provider = ClinePassProvider(client=_mock_client(handler))
+        res = provider.fetch({
+            "api_key": "test-key", "display_name": "ClinePass",
+            "_platform_key": "clinepass",
+        })
+        assert res.ok
+        # 默认 base_url(.../api) 归一化到版本根
+        assert seen["path"] == "/api/v1/users/me/plan/usage-limits"
+        assert seen["auth"] == "Bearer test-key"
+        assert len(res.entries) == 3
+
+    def test_base_url_variants_normalize_to_same_endpoint(self) -> None:
+        variants = (
+            "https://api.cline.bot",
+            "https://api.cline.bot/api",
+            "https://api.cline.bot/api/v1",
+            "https://api.cline.bot/api/v1/",
+        )
+        paths: list[str] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            paths.append(req.url.path)
+            return httpx.Response(200, json=_clinepass_usage_payload())
+
+        provider = ClinePassProvider(client=_mock_client(handler))
+        for base in variants:
+            res = provider.fetch({
+                "base_url": base, "api_key": "k",
+                "_platform_key": "clinepass", "display_name": "ClinePass",
+            })
+            assert res.ok, base
+        assert paths == ["/api/v1/users/me/plan/usage-limits"] * len(variants)
+
+    def test_fetch_401_neutral_error(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(401)
+        provider = ClinePassProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "bad-key"})
+        assert not res.ok
+        assert res.error == "认证失败(401)"
+
+    def test_http_error_not_echoed(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, json={"error": "upstream detail xyz"})
+        provider = ClinePassProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "请求失败(HTTP 503)"  # 不回显上游响应体
+
+    def test_empty_limits_is_error(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"success": True, "data": {"limits": []}})
+        provider = ClinePassProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "响应中未找到用量数据"
+
+    def test_no_key_returns_unconfigured(self) -> None:
+        res = ClinePassProvider().fetch({})
+        assert not res.ok
+        assert res.error == "未配置"
+
+    def test_network_error_sanitized(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("boom")
+        provider = ClinePassProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "网络错误"
+
+
+# ---------------------------------------------------------------------------
 # LLM Gateway (local Sub2API-compatible gateway)
 # ---------------------------------------------------------------------------
 
@@ -795,9 +946,10 @@ class TestGatewayHttp:
 # ---------------------------------------------------------------------------
 
 class TestRegistry:
-    def test_all_six_providers_registered(self) -> None:
+    def test_all_seven_providers_registered(self) -> None:
         assert set(PROVIDERS.keys()) == {
-            "kimi", "volcengine-coding", "volcengine-agent", "ollama", "opencode-go", "llm-gateway"
+            "kimi", "volcengine-coding", "volcengine-agent", "ollama",
+            "opencode-go", "clinepass", "llm-gateway",
         }
 
     def test_env_prefix_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1029,28 +1181,31 @@ class TestRegistryCredentialFanout:
         assert not res.ok
         assert "套餐A" in res.error and "套餐B" in res.error
 
-    def test_fetch_all_credentials_default_name(
+    def test_fetch_all_single_slot_behaves_like_legacy(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """槽无 name → plan 缺省为 套餐N。"""
+        """单一凭证槽(无论有无 name)等价旧顶层形态:不标套餐、无分区头。"""
+        seen_auth: list[str] = []
+
         def handler(req: httpx.Request) -> httpx.Response:
+            seen_auth.append(req.headers["Authorization"])
             return httpx.Response(200, json=_kimi_payload_5h_and_week())
 
         monkeypatch.setattr(
             "llm_usage.providers.PROVIDERS",
             {"kimi": self._kimi_with_handler(handler)},
         )
-        cfg = {
-            "platforms": {
-                "kimi": {
-                    "enabled": True,
-                    "credentials": [{"api_key": "key-a"}],
-                }
-            }
-        }
-        results = fetch_all(cfg)
-        assert len(results) == 1
-        assert {e.plan for e in results[0].entries} == {"套餐1"}
+        # Web 凭证槽保存的单槽会显式写上默认名 套餐1
+        for creds in ([{"api_key": "key-a"}],
+                      [{"name": "套餐1", "api_key": "key-a"}]):
+            cfg = {"platforms": {"kimi": {"enabled": True, "credentials": creds}}}
+            results = fetch_all(cfg)
+            assert len(results) == 1
+            res = results[0]
+            assert res.ok
+            assert len(res.entries) == 2
+            assert all(e.plan is None for e in res.entries)
+        assert seen_auth == ["Bearer key-a", "Bearer key-a"]
 
     def test_fetch_all_credentials_empty_list_uses_legacy_path(
         self, monkeypatch: pytest.MonkeyPatch,

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
 <title>LLM 用量总览</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20x='1.5'%20y='12'%20width='3'%20height='6'%20rx='1'%20fill='%2356b6c2'/%3E%3Crect%20x='6'%20y='9'%20width='3'%20height='9'%20rx='1'%20fill='%23ffb300'/%3E%3Crect%20x='10.5'%20y='6'%20width='3'%20height='12'%20rx='1'%20fill='%234caf50'/%3E%3C/svg%3E">
@@ -22,9 +22,11 @@
     --cyan: #56b6c2;
     --track: #2c313c;
     --surface: #1c2027;
+    --surface-raised: #222730;
     --hover: rgba(255, 255, 255, 0.035);
     --glow: #1b2230;
-    --shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+    --accent-soft: rgba(86, 182, 194, 0.12);
+    --shadow: 0 8px 28px rgba(0, 0, 0, 0.26);
   }
   /* 浅色主题:覆盖同名变量,强调色取深一档以保证白底对比度 */
   html[data-theme="light"] {
@@ -38,16 +40,23 @@
     --cyan: #0a7ea4;
     --track: #e2e5ea;
     --surface: #ffffff;
+    --surface-raised: #f8fafc;
     --hover: rgba(0, 0, 0, 0.03);
     --glow: #e9edf3;
-    --shadow: 0 10px 30px rgba(27, 31, 36, 0.1);
+    --accent-soft: rgba(10, 126, 164, 0.1);
+    --shadow: 0 6px 24px rgba(27, 31, 36, 0.08);
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    padding: 20px;
-    min-height: 100vh;
-    background: radial-gradient(1100px 520px at 78% -8%, var(--glow), var(--bg) 62%);
+    padding: max(clamp(8px, 2.2vh, 20px), env(safe-area-inset-top))
+             max(clamp(8px, 2vw, 20px), env(safe-area-inset-right))
+             max(clamp(8px, 2.2vh, 20px), env(safe-area-inset-bottom))
+             max(clamp(8px, 2vw, 20px), env(safe-area-inset-left));
+    min-height: 100dvh;
+    background:
+      radial-gradient(900px 460px at 82% -10%, var(--glow), transparent 68%),
+      var(--bg);
     background-attachment: fixed;
     color: var(--fg);
     font-family: "Sarasa Mono SC", "Noto Sans Mono CJK SC", "PingFang SC",
@@ -55,48 +64,131 @@
     font-size: 14px;
     transition: background-color 0.25s ease, color 0.25s ease;
   }
-  #app { max-width: 1200px; margin: 0 auto; }
+  #app { width: 100%; max-width: 1500px; margin: 0 auto; }
   .card {
     background: var(--surface);
     border: 1px solid var(--sep);
-    border-radius: 12px;
+    border-radius: 14px;
     box-shadow: var(--shadow);
-    padding: 14px 18px 12px;
-    transition: background-color 0.25s ease, border-color 0.25s ease;
+    padding: clamp(9px, 1.6vh, 14px) clamp(12px, 1.5vw, 18px)
+             clamp(7px, 1.35vh, 12px);
+    transition: background-color 0.25s ease, border-color 0.25s ease,
+                transform 0.2s ease, box-shadow 0.2s ease;
+  }
+  .overview-card {
+    padding-block: clamp(9px, 1.4vh, 14px);
+    background:
+      linear-gradient(110deg, var(--accent-soft), transparent 42%),
+      var(--surface);
   }
   .card-head {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
-    gap: 16px;
-  }
-  /* 平台卡片网格:够宽时两列,窄屏自动单列 */
-  #platforms {
-    margin-top: 12px;
-    display: grid;
     gap: 12px;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 560px), 1fr));
+  }
+  /* 平台卡片网格:中等 PWA 窗口也能容纳两列,卡片内部再独立响应宽度。 */
+  #platforms {
+    margin-top: clamp(8px, 1.4vh, 12px);
+    display: grid;
+    align-items: stretch;
+    gap: clamp(8px, 1.3vmin, 12px);
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr));
+  }
+  .platform {
+    container-type: inline-size;
+    height: 100%;
+    min-width: 0;
+    overflow: visible;
+  }
+  @media (hover: hover) {
+    .platform:hover {
+      border-color: color-mix(in srgb, var(--sep) 45%, var(--cyan));
+      box-shadow: 0 10px 34px rgba(0, 0, 0, 0.2);
+      transform: translateY(-1px);
+    }
   }
   .platform-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding-bottom: 8px;
-    margin-bottom: 2px;
+    padding-bottom: clamp(5px, 0.9vh, 8px);
+    margin-bottom: 1px;
     border-bottom: 1px solid var(--sep);
   }
-  .platform-name { font-weight: bold; }
+  .platform-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--fg);
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .platform-state {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    line-height: 1.35;
+  }
+  .platform-state::before {
+    content: "";
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .entry-toggle, .rotation-indicator {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    min-height: 22px;
+    padding: 1px 7px;
+    color: var(--cyan);
+    background: transparent;
+    border: 1px solid color-mix(in srgb, var(--cyan) 55%, var(--sep));
+    border-radius: 999px;
+    font: inherit;
+    font-size: 11px;
+    line-height: 1.2;
+    cursor: pointer;
+  }
+  .entry-toggle:hover, .rotation-indicator:hover {
+    color: var(--fg);
+    background: var(--accent-soft);
+  }
+  .entry-toggle:focus-visible, .rotation-indicator:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: 2px;
+  }
+  .rotation-indicator[hidden] { display: none; }
+  .platform.is-expanded {
+    grid-column: 1 / -1;
+    height: auto;
+  }
   .platform-err, .platform-empty { padding: 2px 0; }
   .platform-err { color: var(--red); }
-  .platform-warning { padding: 2px 0 8px; color: var(--yellow); }
+  .platform-warning {
+    padding: 4px 0 clamp(4px, 0.8vh, 8px);
+    color: var(--yellow);
+  }
   .pill-btn {
     flex: none;
+    min-height: 34px;
     padding: 5px 16px;
     font: inherit;
     font-size: 13px;
     color: var(--dim);
-    background: transparent;
+    background: var(--surface-raised);
     border: 1px solid var(--sep);
     border-radius: 999px;
     cursor: pointer;
@@ -116,11 +208,12 @@
   }
   #interval-select {
     flex: none;
+    min-height: 34px;
     padding: 5px 12px;
     font: inherit;
     font-size: 13px;
     color: var(--dim);
-    background: var(--bg);
+    background: var(--surface-raised);
     border: 1px solid var(--sep);
     border-radius: 999px;
     cursor: pointer;
@@ -129,6 +222,13 @@
   #interval-select:hover { color: var(--fg); border-color: var(--dim); }
   #interval-select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
   .nav-menu { position: relative; }
+  .more-btn {
+    width: 34px;
+    padding-inline: 0;
+    color: var(--fg);
+    font-size: 17px;
+    line-height: 1;
+  }
   #more-dropdown {
     position: absolute;
     right: 0;
@@ -155,6 +255,12 @@
     cursor: pointer;
     text-decoration: none;
   }
+  #more-dropdown .menu-separator {
+    height: 1px;
+    margin: 5px 8px;
+    background: var(--sep);
+  }
+  #more-dropdown .danger-item { color: var(--red); }
   #more-dropdown button:hover, #more-dropdown .dropdown-item:hover {
     background-color: var(--hover);
   }
@@ -168,7 +274,7 @@
     cursor: default;
     pointer-events: none;
   }
-  .head-nav { display: flex; gap: 8px; flex: none; align-items: center; }
+  .head-nav { display: flex; gap: 6px; flex: none; align-items: center; }
   .title {
     font-weight: bold;
     font-size: 17px;
@@ -185,13 +291,14 @@
     color: var(--dim);
     font-size: 13px;
     min-height: 1.2em;
+    font-variant-numeric: tabular-nums;
   }
   .status::before {
     content: "";
     flex: none;
-    width: 8px;
-    height: 8px;
-    margin-right: 8px;
+    width: 6px;
+    height: 6px;
+    margin-right: 6px;
     border-radius: 50%;
     background: var(--green);
   }
@@ -208,11 +315,11 @@
     color: var(--dim);
     font-weight: normal;
     font-size: 12px;
-    padding: 6px 14px 4px 0;
+    padding: clamp(3px, 0.7vh, 6px) 14px clamp(2px, 0.5vh, 4px) 0;
     border-bottom: 1px solid var(--sep);
   }
   td {
-    padding: 3px 14px 3px 0;
+    padding: clamp(2px, 0.45vh, 3px) 14px clamp(1px, 0.45vh, 3px) 0;
     vertical-align: middle;
   }
   th:last-child, td:last-child { padding-right: 0; }
@@ -220,15 +327,21 @@
   tbody tr:not(.bar-row):hover td { background: var(--hover); }
   .bold { font-weight: bold; }
   .dim { color: var(--dim); }
-  .plan-head td { padding-top: 8px; font-weight: 600; }
+  .plan-head td { padding-top: clamp(5px, 0.9vh, 8px); font-weight: 600; }
+  .summary-row td {
+    padding-top: clamp(4px, 0.7vh, 7px);
+    border-top: 1px dashed var(--sep);
+    font-weight: 700;
+  }
+  .summary-bar td { padding-bottom: 0; }
   .red { color: var(--red); }
   .yellow { color: var(--yellow); }
   .ok { color: var(--green); font-weight: 600; }
-  .bar-row td { padding-top: 0; padding-bottom: 5px; }
+  .bar-row td { padding-top: 0; padding-bottom: clamp(2px, 0.65vh, 5px); }
   .bar-wrap { display: flex; align-items: center; gap: 10px; }
   .bar-track {
     flex: 1;
-    height: 10px;
+    height: clamp(5px, 1vh, 10px);
     background: var(--track);
     border-radius: 999px;
     overflow: hidden;
@@ -242,10 +355,14 @@
   .bar-fill.green  { background: linear-gradient(180deg, color-mix(in srgb, var(--green) 78%, white), var(--green)); }
   .bar-fill.yellow { background: linear-gradient(180deg, color-mix(in srgb, var(--yellow) 78%, white), var(--yellow)); }
   .bar-fill.red    { background: linear-gradient(180deg, color-mix(in srgb, var(--red) 78%, white), var(--red)); }
-  .bar-label { min-width: 4em; text-align: right; font-weight: 600; }
+  .bar-label { min-width: 4em; text-align: right; font-weight: 700; }
   .bar-label.green-text  { color: var(--green); }
   .bar-label.yellow-text { color: var(--yellow); }
   .bar-label.red-text    { color: var(--red); }
+  @keyframes row-in {
+    from { transform: translateY(2px); }
+    to { transform: translateY(0); }
+  }
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.35; }
@@ -253,6 +370,7 @@
   @media (prefers-reduced-motion: no-preference) {
     .status::before { animation: pulse 2s ease-in-out infinite; }
     .status.err::before { animation: none; }
+    .rotating-slot { animation: row-in 0.22s ease-out; }
   }
   /* LLM Gateway 分组各 Key 用量悬浮明细 */
   .breakdown-row { position: relative; }
@@ -288,6 +406,118 @@
   }
   .key-pop-row .ok { color: var(--green); }
   .key-pop-row .err { color: var(--red); }
+  .compact-value, .compact-label { display: none; }
+
+  /* 卡片级响应式布局:网格出现多列时,每张窄卡仍保持完整的核心指标。 */
+  @container (max-width: 520px) {
+    .platform-head { gap: 6px; padding-bottom: 6px; }
+    table { table-layout: fixed; }
+    th { padding-right: 5px; }
+    td { padding-right: 5px; }
+    .window-col { width: 24%; }
+    .usage-col { width: 31%; }
+    .remaining-col { width: 21%; }
+    .countdown-col { width: 24%; }
+    .limit-col, .reset-col { display: none; }
+    .wide-value, .wide-label { display: none; }
+    .compact-value, .compact-label { display: inline; }
+    .entry-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .usage-cell, .remaining-cell, .countdown-cell {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bar-row td { padding-right: 0; }
+    .bar-label { min-width: 3.2em; }
+  }
+
+  @media (max-width: 900px) {
+    #platforms {
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+    }
+  }
+
+  @media (max-width: 560px) {
+    .overview-card { border-radius: 12px; }
+    .card-head { gap: 8px; }
+    .head-nav { gap: 4px; }
+    .pill-btn, #interval-select { min-height: 30px; }
+    .pill-btn { padding-inline: 9px; }
+    #interval-select { max-width: 74px; padding-inline: 6px; }
+    #platforms { margin-top: 8px; gap: 8px; }
+  }
+
+  @media (max-width: 390px) {
+    .refresh-label { display: none; }
+    #refresh-now { width: 31px; padding-inline: 0; font-size: 16px; }
+    .overview-card .title { max-width: 135px; white-space: nowrap; }
+  }
+
+  /* 高度不足时利用横向空间增加卡片列数，并压平顶栏；正文大小保持不变。 */
+  @media (max-height: 700px) and (min-width: 901px) {
+    #platforms {
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+    }
+  }
+
+  @media (max-height: 700px) and (min-width: 561px) {
+    .overview-card .card-head > :first-child {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+    .overview-card .title { margin-bottom: 0; white-space: nowrap; }
+    .overview-card .status { white-space: nowrap; }
+  }
+
+  @media (max-height: 520px) {
+    .bar-track { height: 4px; }
+    .platform-head { margin-bottom: 0; }
+  }
+
+  /* 自动试排选中的密度档位；只压缩布局，不缩小正文。 */
+  html[data-density="compact"] #platforms {
+    gap: 8px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  }
+  html[data-density="ultra"] #platforms {
+    gap: 7px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  }
+  html[data-density="compact"] .platform {
+    padding-block: 10px 8px;
+  }
+  html[data-density="ultra"] .platform {
+    padding-block: 8px 6px;
+  }
+  html[data-density="compact"] .platform-head,
+  html[data-density="ultra"] .platform-head {
+    margin-bottom: 0;
+    padding-bottom: 5px;
+  }
+  html[data-density="compact"] .bar-track { height: 6px; }
+  html[data-density="ultra"] .bar-track { height: 4px; }
+  html[data-density="ultra"] .bar-row td { padding-bottom: 1px; }
+
+  @media (min-width: 561px) {
+    html[data-density="compact"] .overview-card .card-head > :first-child,
+    html[data-density="ultra"] .overview-card .card-head > :first-child {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+    html[data-density="compact"] .overview-card .title,
+    html[data-density="ultra"] .overview-card .title {
+      margin-bottom: 0;
+      white-space: nowrap;
+    }
+    html[data-density="compact"] .overview-card .status,
+    html[data-density="ultra"] .overview-card .status { white-space: nowrap; }
+  }
 </style>
 <script>
 // 首屏前确定主题,避免闪烁:localStorage 优先,其次系统偏好,默认深色。
@@ -304,22 +534,23 @@
 </head>
 <body>
 <div id="app">
-  <div class="card">
+  <div class="card overview-card">
     <div class="card-head">
       <div>
         <div id="title" class="title">LLM 用量总览</div>
-        <div id="status" class="status">加载中…</div>
+        <div id="status" class="status" aria-live="polite">加载中…</div>
       </div>
       <div class="head-nav">
-        <button id="refresh-now" class="pill-btn" type="button" title="忽略缓存,立即重新获取各平台用量">马上刷新</button>
-        <select id="interval-select" title="自动刷新间隔"></select>
-        <button id="logout" class="pill-btn" type="button">退出</button>
+        <button id="refresh-now" class="pill-btn" type="button" title="忽略缓存，立即重新获取各平台用量" aria-label="马上刷新">↻ <span class="refresh-label">刷新</span></button>
+        <select id="interval-select" title="自动刷新间隔" aria-label="自动刷新间隔"></select>
         <div class="nav-menu">
-          <button id="more-menu-btn" class="pill-btn" type="button" title="更多选项" aria-expanded="false">⋯</button>
-          <div id="more-dropdown" class="dropdown" hidden>
+          <button id="more-menu-btn" class="pill-btn more-btn" type="button" title="更多选项" aria-label="更多选项" aria-controls="more-dropdown" aria-expanded="false">⋯</button>
+          <div id="more-dropdown" class="dropdown" role="menu" hidden>
             <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
             <a id="nav-users" class="dropdown-item" href="/users" hidden>用户管理</a>
             <a id="nav-config" class="dropdown-item" href="/config" hidden>供应商配置</a>
+            <div class="menu-separator" aria-hidden="true"></div>
+            <button id="logout" class="danger-item" type="button">退出登录</button>
           </div>
         </div>
       </div>
@@ -332,9 +563,10 @@
   <table>
     <thead>
       <tr>
-        <th>窗口</th>
-        <th class="num">已用</th><th class="num">限额</th><th class="num">剩余</th>
-        <th>重置时间</th><th class="num">重置倒计时</th>
+        <th class="window-col">窗口</th>
+        <th class="num usage-col"><span class="wide-label">已用</span><span class="compact-label">已用/限额</span></th>
+        <th class="num limit-col">限额</th><th class="num remaining-col">剩余</th>
+        <th class="reset-col">重置时间</th><th class="num countdown-col">重置倒计时</th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -346,13 +578,16 @@
 var platformsEl = document.getElementById("platforms");
 var entryTableTpl = document.getElementById("entry-table");
 var statusEl = document.getElementById("status");
-var titleEl = document.getElementById("title");
 
 var lastFetchedLocal = null;  // 上次成功获取的本地时间 "HH:MM:SS"
 var nextAt = 0;               // 下一次轮询的时间戳(ms)
 var pollTimer = 0;
 var errorState = null;        // 拉取失败时的错误信息(保留旧卡片)
 var currentInterval = 60;     // 服务端当前刷新间隔(秒),每次 render() 同步
+var entryRotationTimers = [];   // 各卡片轮播的 setInterval 句柄,重渲染前统一清理
+var ENTRY_ROTATE_MS = 5000;     // 轮播步进间隔
+var lastPlatformData = [];      // 最近一次成功渲染的平台数据,resize 试排复用
+var fitResizeTimer = 0;         // resize 防抖计时器
 
 // ---- 主题切换 ----
 // data-theme 由 <head> 中的脚本在首屏前设置;这里同步按钮文字并处理点击。
@@ -433,6 +668,31 @@ function fmtValue(v, unit) {
   return (num + " " + (unit || "")).trim();
 }
 
+// 窄卡片内的数字缩写，完整值仍保留在 title/aria-label 中。
+function fmtCompactNumber(v) {
+  var n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  var abs = Math.abs(n);
+  var scale = 1;
+  var suffix = "";
+  if (abs >= 1000000000) { scale = 1000000000; suffix = "B"; }
+  else if (abs >= 1000000) { scale = 1000000; suffix = "M"; }
+  else if (abs >= 1000) { scale = 1000; suffix = "k"; }
+  var scaled = n / scale;
+  var digits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2;
+  return String(parseFloat(scaled.toFixed(digits))) + suffix;
+}
+
+function fmtCompactValue(v, unit) {
+  if (v === null || v === undefined) return "-";
+  var num = fmtCompactNumber(v);
+  if (unit === "$") return "$" + num;
+  if (unit === "%") return num + "%";
+  // tokens 等长单位在紧凑表头中省略，避免数字被挤压；完整单位可悬停查看。
+  if (unit && unit !== "tokens" && unit.length <= 3) return num + unit;
+  return num;
+}
+
 // ISO 解析:naive(无 Z 且无 ±HH:MM 偏移)视为 UTC —— 对应 _to_local_time 的规则。
 function parseReset(s) {
   if (!s) return null;
@@ -450,11 +710,6 @@ function fmtLocal(d) {
 
 function fmtTime(d) {
   return p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
-}
-
-function fmtLocalMinute(d) {
-  return d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate()) +
-         " " + p2(d.getHours()) + ":" + p2(d.getMinutes());
 }
 
 // 重置时间列:_to_local_time —— 空 → "-",无法解析 → 原样显示
@@ -489,8 +744,10 @@ function pctColor(percent) {
 }
 
 // ---- DOM 构建 ----
-// 每个平台一张卡片:卡片头 = 平台名 + 状态;卡片体 = entry 表格
-// (每个 entry 占一个数据行 + 一个通栏进度条行)。
+// 每个平台一张卡片:卡片头 = 平台名 + 状态徽章(OK/提示/错误),条数超限时附带
+// 轮播指示器 / 「+N」展开按钮;卡片体 = entry 表格(每个 entry 占一个数据行 +
+// 一个通栏进度条行)。周期窗口平台按密度档折叠(compact 档保留 5小时/每周);
+// 同计费单位平台改为轮播展示,尾部追加「全部合计」汇总行。
 // error 平台卡片体显示错误信息;空 entries 平台显示 "无数据"。
 
 function el(tag, cls) {
@@ -504,6 +761,111 @@ function td(text, cls, colspan) {
   cell.textContent = text;
   if (colspan) cell.colSpan = colspan;
   return cell;
+}
+
+function responsiveValueCell(wide, compact, cls, accessibleText) {
+  var cell = td("", cls);
+  var wideSpan = el("span", "wide-value");
+  var compactSpan = el("span", "compact-value");
+  wideSpan.textContent = wide;
+  compactSpan.textContent = compact;
+  wideSpan.setAttribute("aria-hidden", "true");
+  compactSpan.setAttribute("aria-hidden", "true");
+  cell.setAttribute("aria-label", accessibleText || wide);
+  cell.title = accessibleText || wide;
+  cell.appendChild(wideSpan);
+  cell.appendChild(compactSpan);
+  return cell;
+}
+
+function isGatewayPlatform(platform) {
+  return String(platform && platform.name || "").split("#")[0] === "llm-gateway";
+}
+
+function periodRank(label) {
+  var text = String(label || "").trim();
+  var duration = text.match(/^(\d+(?:\.\d+)?)(分钟|小时|天)$/);
+  if (duration) {
+    var scale = duration[2] === "分钟" ? 1 : duration[2] === "小时" ? 60 : 1440;
+    return Number(duration[1]) * scale;
+  }
+  return {
+    "每小时": 60,
+    "每日": 1440,
+    "每天": 1440,
+    "每周": 10080,
+    "每月": 43200,
+    "每季": 129600,
+    "每季度": 129600,
+    "每年": 525600
+  }[text] || null;
+}
+
+function hasPeriodWindows(entries) {
+  return entries.length > 0 && entries.every(function (entry) {
+    return periodRank(entry.label) !== null;
+  });
+}
+
+function hasSingleUnit(entries) {
+  return entries.length > 0 && entries.every(function (entry) {
+    return entry.unit === entries[0].unit;
+  });
+}
+
+function firstEntryWithRank(entries, wantedRank) {
+  for (var i = 0; i < entries.length; i++) {
+    if (periodRank(entries[i].label) === wantedRank) return entries[i];
+  }
+  return null;
+}
+
+function collapsedPeriodEntries(entries, mode, periodWindows) {
+  if (mode === "normal") return entries.slice(0, 3);
+  if (!periodWindows) return entries.slice(0, mode === "compact" ? 2 : 1);
+  var fiveHour = firstEntryWithRank(entries, 5 * 60) || entries[0] || null;
+  if (mode === "ultra") return fiveHour ? [fiveHour] : [];
+  var weekly = firstEntryWithRank(entries, 7 * 24 * 60);
+  var selected = fiveHour ? [fiveHour] : [];
+  if (weekly && weekly !== fiveHour) selected.push(weekly);
+  return selected;
+}
+
+function cleanTotal(value) {
+  return Number(Number(value).toPrecision(12));
+}
+
+// 独立分组必须使用同一计费单位；限额不完整时只汇总已用，不虚构总进度。
+function totalEntry(entries) {
+  var unit = entries[0].unit;
+  var sameUnit = entries.every(function (entry) { return entry.unit === unit; });
+  var used = sameUnit ? cleanTotal(entries.reduce(function (sum, entry) {
+    return sum + (Number.isFinite(Number(entry.used)) ? Number(entry.used) : 0);
+  }, 0)) : 0;
+  var hasCompleteLimit = sameUnit && entries.every(function (entry) {
+    return entry.limit !== null && entry.limit !== undefined &&
+           Number.isFinite(Number(entry.limit));
+  });
+  var limit = hasCompleteLimit ? cleanTotal(entries.reduce(function (sum, entry) {
+    return sum + Number(entry.limit);
+  }, 0)) : null;
+  var remaining = limit === null ? null : cleanTotal(Math.max(limit - used, 0));
+  var percent = limit === null || limit === 0
+    ? null : Math.round(Math.max(Math.min(used / limit * 100, 100), 0) * 10) / 10;
+  var resets = entries.map(function (entry) { return entry.reset_at || null; });
+  var resetAt = resets.every(function (value) { return value === resets[0]; })
+    ? resets[0] : null;
+  return {
+    label: "全部合计",
+    used: used,
+    limit: limit,
+    remaining: remaining,
+    percent: percent,
+    reset_at: resetAt,
+    unit: sameUnit ? unit : "",
+    plan: null,
+    key_breakdown: null
+  };
 }
 
 // ---- LLM Gateway 分组各 Key 用量明细弹层 ----
@@ -559,11 +921,17 @@ function dataRow(entry) {
     limit = entry.limit === null ? "∞" : fmtValue(entry.limit, entry.unit);
     remaining = entry.remaining === null ? "-" : fmtValue(entry.remaining, entry.unit);
   }
-  var labelCell = td(entry.label);
+  var compactUsed = used === "-" ? "-" : fmtCompactValue(entry.used, entry.unit);
+  var compactLimit = limit === "-"
+    ? "-" : entry.limit === null ? "∞" : fmtCompactValue(entry.limit, entry.unit);
+  var compactRemaining = remaining === "-"
+    ? "-" : fmtCompactValue(entry.remaining, entry.unit);
+  var labelCell = td(entry.label, "entry-label");
+  labelCell.title = entry.label;
   // 多 Key 组(与 CLI render_key_breakdown 约定一致):行可点击弹出各 Key 明细
   if (Array.isArray(entry.key_breakdown) && entry.key_breakdown.length >= 2) {
     tr.className = "breakdown-row";
-    labelCell.className = "breakdown-hint";
+    labelCell.classList.add("breakdown-hint");
     labelCell.title = "点击查看各 Key 用量";
     tr.addEventListener("click", function (ev) {
       ev.stopPropagation();  // 阻止冒泡到 document 的关闭监听
@@ -576,12 +944,22 @@ function dataRow(entry) {
     });
   }
   tr.appendChild(labelCell);
-  tr.appendChild(td(used, "num"));
-  tr.appendChild(td(limit, "num"));
-  tr.appendChild(td(remaining, "num"));
-  tr.appendChild(td(fmtResetCell(entry.reset_at), "dim"));
-  var cd = td(fmtCountdown(entry.reset_at, new Date()), "num dim cd");
+  tr.appendChild(responsiveValueCell(
+    used,
+    compactUsed + "/" + compactLimit,
+    "num usage-cell",
+    "已用 " + used + "，限额 " + limit
+  ));
+  tr.appendChild(td(limit, "num limit-col"));
+  tr.appendChild(responsiveValueCell(
+    remaining, compactRemaining, "num remaining-cell", "剩余 " + remaining
+  ));
+  var reset = td(fmtResetCell(entry.reset_at), "dim reset-col");
+  reset.title = fmtResetCell(entry.reset_at);
+  tr.appendChild(reset);
+  var cd = td(fmtCountdown(entry.reset_at, new Date()), "num dim cd countdown-cell");
   cd.dataset.reset = entry.reset_at || "";
+  cd.title = entry.reset_at ? "重置时间 " + fmtResetCell(entry.reset_at) : "无重置时间";
   tr.appendChild(cd);
   return tr;
 }
@@ -606,13 +984,99 @@ function barRow(percent) {
   return tr;
 }
 
-function platformCard(p) {
+function appendEntryRows(body, entry, rowClass) {
+  var data = dataRow(entry);
+  var bar = barRow(entry.percent);
+  if (rowClass) {
+    data.classList.add(rowClass);
+    bar.classList.add(rowClass);
+  }
+  body.appendChild(data);
+  body.appendChild(bar);
+}
+
+function appendEntries(body, entries) {
+  var prevPlan = null;
+  entries.forEach(function (entry) {
+    if (entry.plan && entry.plan !== prevPlan) {
+      var planRow = el("tr", "plan-head");
+      planRow.appendChild(td(entry.plan, "dim", 6));
+      body.appendChild(planRow);
+    }
+    appendEntryRows(body, entry);
+    prevPlan = entry.plan;
+  });
+}
+
+function renderRotatingRows(body, entries, offset, indicator, slotCount) {
+  body.textContent = "";
+  var shown = [];
+  for (var i = 0; i < slotCount; i++) {
+    var index = (offset + i) % entries.length;
+    shown.push(index);
+    appendEntryRows(body, entries[index], "rotating-slot");
+  }
+  appendTotalRows(body, entries);
+  if (indicator && shown.length > 0) {
+    indicator.textContent = shown.map(function (index) { return index + 1; }).join("–") +
+                            "/" + entries.length;
+    indicator.title = "正在轮播第 " + shown.map(function (index) {
+      return index + 1;
+    }).join("、") + " 条，共 " + entries.length + " 条；点击切换";
+  }
+}
+
+function appendTotalRows(body, entries) {
+  var total = totalEntry(entries);
+  var totalData = dataRow(total);
+  var totalBar = barRow(total.percent);
+  totalData.classList.add("summary-row");
+  totalBar.classList.add("summary-bar");
+  body.appendChild(totalData);
+  body.appendChild(totalBar);
+}
+
+function platformCard(p, displayMode) {
   var card = el("div", "card platform");
   var head = el("div", "platform-head");
   var name = el("span", "platform-name");
   name.textContent = p.display_name;
   head.appendChild(name);
-  var state = el("span", p.error ? "red" : p.warning ? "yellow" : "ok");
+  var entries = Array.isArray(p.entries) ? p.entries : [];
+  var periodWindows = hasPeriodWindows(entries);
+  var independentRows = hasSingleUnit(entries) &&
+    (isGatewayPlatform(p) || !periodWindows);
+  var rotationSlotCount = displayMode === "normal" ? 2 : displayMode === "compact" ? 1 : 0;
+  var independentCompacts = !p.error && independentRows &&
+    ((displayMode === "normal" && entries.length > 3) ||
+     (displayMode === "compact" && entries.length > 1) ||
+     (displayMode === "ultra" && entries.length > 0));
+  var collapsedEntries = collapsedPeriodEntries(entries, displayMode, periodWindows);
+  var periodicCollapses = !p.error && !independentCompacts &&
+    collapsedEntries.length < entries.length;
+  var entryToggle = null;
+  var rotationIndicator = null;
+  if (independentCompacts && rotationSlotCount > 0 && entries.length > rotationSlotCount) {
+    rotationIndicator = el("button", "rotation-indicator");
+    rotationIndicator.type = "button";
+    rotationIndicator.setAttribute("aria-label", "切换下一组用量");
+    head.appendChild(rotationIndicator);
+  }
+  if (periodicCollapses || independentCompacts) {
+    var hiddenEntryCount = entries.length -
+      (independentCompacts ? rotationSlotCount : collapsedEntries.length);
+    entryToggle = el("button", "entry-toggle");
+    entryToggle.type = "button";
+    entryToggle.textContent = "+" + hiddenEntryCount;
+    entryToggle.title = "展开全部 " + entries.length + " 条用量";
+    entryToggle.setAttribute("aria-label", entryToggle.title);
+    entryToggle.setAttribute("aria-expanded", "false");
+    head.appendChild(entryToggle);
+  }
+  var state = el(
+    "span",
+    "platform-state " + (p.error ? "red" : p.warning ? "yellow" : "ok")
+  );
   state.textContent = p.error ? "错误" : p.warning ? "提示" : "OK";
   head.appendChild(state);
   card.appendChild(head);
@@ -627,7 +1091,7 @@ function platformCard(p) {
     warning.textContent = "提示：" + p.warning;
     card.appendChild(warning);
   }
-  if (!p.entries || p.entries.length === 0) {
+  if (entries.length === 0) {
     var empty = el("div", "platform-empty dim");
     empty.textContent = "无数据";
     card.appendChild(empty);
@@ -635,26 +1099,110 @@ function platformCard(p) {
   }
   var frag = entryTableTpl.content.cloneNode(true);
   var body = frag.querySelector("tbody");
-  var prevPlan = null;
-  p.entries.forEach(function (entry) {
-    if (entry.plan && entry.plan !== prevPlan) {
-      var planRow = el("tr", "plan-head");
-      planRow.appendChild(td(entry.plan, "dim", 6));
-      body.appendChild(planRow);
+  if (independentCompacts) {
+    var rotationOffset = 0;
+    var independentExpanded = false;
+    var advanceRotation = function () {
+      if (independentExpanded) return;
+      closeKeyPopovers();
+      rotationOffset = (rotationOffset + Math.max(rotationSlotCount, 1)) % entries.length;
+      renderRotatingRows(body, entries, rotationOffset, rotationIndicator, rotationSlotCount);
+    };
+    var renderIndependentRows = function () {
+      closeKeyPopovers();
+      body.textContent = "";
+      card.classList.toggle("is-expanded", independentExpanded);
+      if (rotationIndicator) rotationIndicator.hidden = independentExpanded;
+      if (independentExpanded) {
+        appendEntries(body, entries);
+        appendTotalRows(body, entries);
+      } else if (rotationSlotCount > 0) {
+        renderRotatingRows(
+          body, entries, rotationOffset, rotationIndicator, rotationSlotCount
+        );
+      } else {
+        appendTotalRows(body, entries);
+      }
+      entryToggle.textContent = independentExpanded
+        ? "收起" : "+" + (entries.length - rotationSlotCount);
+      entryToggle.title = independentExpanded
+        ? "收起并恢复精简视图" : "展开全部 " + entries.length + " 条用量";
+      entryToggle.setAttribute("aria-label", entryToggle.title);
+      entryToggle.setAttribute("aria-expanded", String(independentExpanded));
+    };
+    renderIndependentRows();
+    if (rotationIndicator) {
+      rotationIndicator.addEventListener("click", function (event) {
+        event.stopPropagation();
+        advanceRotation();
+      });
     }
-    body.appendChild(dataRow(entry));
-    body.appendChild(barRow(entry.percent));
-    prevPlan = entry.plan;
-  });
+    entryToggle.addEventListener("click", function (event) {
+      event.stopPropagation();
+      independentExpanded = !independentExpanded;
+      renderIndependentRows();
+    });
+    var reduceMotion = window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!reduceMotion && rotationSlotCount > 0 && entries.length > rotationSlotCount) {
+      entryRotationTimers.push(setInterval(function () {
+        if (independentExpanded || document.hidden || card.matches(":hover") ||
+            card.contains(document.activeElement)) {
+          return;
+        }
+        advanceRotation();
+      }, ENTRY_ROTATE_MS));
+    }
+  } else if (periodicCollapses) {
+    var expanded = false;
+    var renderPeriodicRows = function () {
+      closeKeyPopovers();
+      body.textContent = "";
+      appendEntries(body, expanded ? entries : collapsedEntries);
+      card.classList.toggle("is-expanded", expanded);
+      entryToggle.textContent = expanded
+        ? "收起" : "+" + (entries.length - collapsedEntries.length);
+      entryToggle.title = expanded
+        ? "收起到精简用量" : "展开其余 " +
+          (entries.length - collapsedEntries.length) + " 条用量";
+      entryToggle.setAttribute("aria-label", entryToggle.title);
+      entryToggle.setAttribute("aria-expanded", String(expanded));
+    };
+    entryToggle.addEventListener("click", function (event) {
+      event.stopPropagation();
+      expanded = !expanded;
+      renderPeriodicRows();
+    });
+    renderPeriodicRows();
+  } else {
+    appendEntries(body, entries);
+  }
   card.appendChild(frag);
   return card;
 }
 
-function renderPlatforms(platforms) {
+function renderPlatformsAtMode(platforms, mode) {
+  entryRotationTimers.forEach(function (timer) { clearInterval(timer); });
+  entryRotationTimers = [];
+  document.documentElement.dataset.density = mode;
   platformsEl.textContent = "";
   platforms.forEach(function (p) {
-    platformsEl.appendChild(platformCard(p));
+    platformsEl.appendChild(platformCard(p, mode));
   });
+}
+
+function pageFitsViewport() {
+  return document.documentElement.scrollHeight <= Math.ceil(window.innerHeight) + 2;
+}
+
+// 从信息最多的模式开始试排；终极压缩仍放不下时保留自然滚动。
+function renderPlatforms(platforms) {
+  lastPlatformData = platforms;
+  var modes = ["normal", "compact", "ultra"];
+  for (var i = 0; i < modes.length; i++) {
+    renderPlatformsAtMode(platforms, modes[i]);
+    if (pageFitsViewport()) return;
+  }
 }
 
 // ---- 刷新循环 ----
@@ -671,7 +1219,6 @@ function schedule(sec) {
 function render(data) {
   var fetched = parseReset(data.fetched_at);
   lastFetchedLocal = fmtTime(fetched || new Date());
-  titleEl.textContent = "LLM 用量总览 (" + fmtLocalMinute(new Date()) + ")";
   errorState = null;
   renderPlatforms(data.platforms || []);
   if (typeof data.interval === "number") currentInterval = data.interval;
@@ -793,10 +1340,10 @@ function tick() {
   }
   var remain = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
   if (errorState) {
-    statusEl.textContent = "获取失败:" + errorState + " · " + remain + "s 后重试";
+    statusEl.textContent = "获取失败：" + errorState + " · " + remain + "s 后重试";
     statusEl.className = "status err";
   } else if (lastFetchedLocal) {
-    statusEl.textContent = "上次获取 " + lastFetchedLocal + " · 下次刷新 " + remain + "s";
+    statusEl.textContent = lastFetchedLocal + " 获取 · " + remain + "s 后刷新";
     statusEl.className = "status";
   }
 }
@@ -805,6 +1352,12 @@ function tick() {
 document.addEventListener("click", closeKeyPopovers);
 document.addEventListener("keydown", function (ev) {
   if (ev.key === "Escape") closeKeyPopovers();
+});
+
+// 调整窗口时重新从正常模式试排；80ms 防抖避免拖动过程中频繁重建 DOM。
+window.addEventListener("resize", function () {
+  clearTimeout(fitResizeTimer);
+  fitResizeTimer = setTimeout(function () { renderPlatforms(lastPlatformData); }, 80);
 });
 
 refresh();

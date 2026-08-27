@@ -6,8 +6,10 @@
 /api/auth/register 自助注册(永远是普通用户,注册即登录);开关默认关闭,
 存 history.db settings 表。
 PWA:四个页面内联注册 Service Worker(/sw.js,根作用域);/manifest.webmanifest
-与 /icons/{name} 为无认证静态路由(登录页也要能取清单并注册 SW),离线时由
-SW 以缓存回退页面导航与 /api 只读 GET。
+与 /icons/{name} 为无认证静态路由(登录页也要能取清单并注册 SW)。导航壳
+页面保留网络优先缓存;``/api/*`` 响应是用户私有的,SW 一律网络直连不入缓存,
+服务端同时下发 ``Cache-Control: no-store``,离线时 API 读取失败而非回退
+其它会话的数据。
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ import os
 import re
 import threading
 import time
+import tomllib
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import replace
@@ -35,8 +38,9 @@ from llm_usage.config import (
     get_platform_config,
     get_platform_order,
     load_config,
+    mutate_config,
     remove_platform_config,
-    set_instance_counter,
+    save_config,
     set_platform_order,
     update_platform_config,
 )
@@ -82,6 +86,7 @@ _GATEWAY_KEY_FIELDS = {"index", "value", "name"}
 # PUT /api/settings 允许的字段(站点策略,存 history.db settings 表)
 _SETTINGS_KEYS = {"registration_enabled", "allow_user_providers"}
 
+
 class _LoginLimiter:
     """Per-client sliding-window login throttle.
 
@@ -96,6 +101,9 @@ class _LoginLimiter:
         self._max = 5
         self._window = 60.0
         self._lockout = 300.0
+        # 有界内存:只保留最近 _max_entries 个活跃客户端,防止
+        # 大量不同 IP 的失败尝试无限累积(条目过期后自然被淘汰)
+        self._max_entries = 10_000
 
     def check(self, key: str) -> float | None:
         """None = 放行；否则返回还需等待的秒数（>0）。"""
@@ -114,12 +122,18 @@ class _LoginLimiter:
                 logger.warning("rate limit engaged for %s", key)
                 return self._lockout
             stamps.append(now)
+            if len(self._fails) > self._max_entries:
+                self._fails.popitem(last=False)  # 淘汰最久未活动的客户端
+            if len(self._blocked) > self._max_entries:
+                # 锁定期条目同样有界:淘汰最旧的(该 IP 可重新尝试,内存优先)
+                self._blocked.pop(next(iter(self._blocked)))
             return None
 
     def clear(self, key: str) -> None:
         with self._lock:
             self._fails.pop(key, None)
             self._blocked.pop(key, None)
+
 
 def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
@@ -539,23 +553,6 @@ def _credential_slots_view(section: dict[str, Any], fields: list[str]) -> list[d
     return []
 
 
-def _clear_top_level_credentials(key: str) -> dict[str, Any]:
-    """删除平台 section 的顶层凭证字段并保存,返回最终完整配置。
-
-    在 credentials 数组已写盘之后调用(先写后删,避免中间态);
-    cache.set_config 使用返回的最终配置。
-    """
-    from llm_usage.config import save_config
-
-    cfg = load_config()
-    section = cfg.get("platforms", {}).get(key)
-    if isinstance(section, dict):
-        for field in _CREDENTIAL_NAMES:
-            section.pop(field, None)
-        save_config(cfg)
-    return cfg
-
-
 def _existing_slot(
     current_section: dict[str, Any], index: Any, position: int,
 ) -> dict[str, Any]:
@@ -853,6 +850,9 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        if request.url.path.startswith("/api/"):
+            # API 响应是用户私有的(用量/配置/认证),禁止任何缓存层留存
+            resp.headers["Cache-Control"] = "no-store"
         return resp
     pages = {
         name: (files("llm_usage") / "static" / name).read_text(encoding="utf-8")
@@ -1249,6 +1249,35 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         if key not in platforms_cfg:
             raise HTTPException(status_code=404, detail="平台未配置")
 
+    def _parse_import_body(body: dict[str, Any]) -> dict[str, Any]:
+        """校验并解析导入的 TOML 文本,返回整体替换用的配置字典。"""
+        extra = sorted(set(body) - {"content"})
+        if extra:
+            raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
+        content = body.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise HTTPException(status_code=400, detail="content 需为非空字符串")
+        try:
+            imported = tomllib.loads(content)
+        except tomllib.TOMLDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"TOML 解析失败: {exc}") from exc
+        platforms = imported.get("platforms")
+        if platforms is not None and not isinstance(platforms, dict):
+            raise HTTPException(status_code=400, detail="platforms 需为表(字典)")
+        return imported
+
+    def _import_summary(imported: dict[str, Any]) -> dict[str, Any]:
+        """导入结果摘要:平台总数 + 启用数(缺省 enabled 视为启用,与 fetch_all 一致)。"""
+        platforms = imported.get("platforms")
+        if not isinstance(platforms, dict):
+            return {"ok": True, "platforms": 0, "enabled": 0}
+        enabled = sum(
+            1
+            for p in platforms.values()
+            if isinstance(p, dict) and p.get("enabled", True)
+        )
+        return {"ok": True, "platforms": len(platforms), "enabled": enabled}
+
     def _my_platform_view(user: dict[str, Any], key: str) -> dict[str, Any]:
         ptype = _require_platform_type(key)
         section = get_platform_config(
@@ -1367,6 +1396,17 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         store.delete_platform_visibility(user["username"], key)
         return {"ok": True}
 
+    @app.post("/api/my/import")
+    def my_import(
+        body: dict[str, Any] = Body(...),
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, Any]:
+        """普通用户整体导入 TOML 配置,替换自己在 history.db 的 user_configs。"""
+        user = _non_admin(user)
+        imported = _parse_import_body(body)
+        store.set_user_config(user["username"], imported)
+        return _import_summary(imported)
+
     # ---- 供应商配置 API(管理员) ----
 
     @app.get("/api/config")
@@ -1422,10 +1462,12 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         updates.update(_gateway_updates(key, body, current_section))
         if updates:
-            update_platform_config(key, updates)
-            if "credential_slots" in body:
-                # 槽式保存后清除顶层凭证字段,避免双写不一致(先写后删,避免中间态)
-                _clear_top_level_credentials(key)
+            # 单事务:credentials 数组与顶层凭证字段清除同一次原子落盘
+            update_platform_config(
+                key,
+                updates,
+                remove_fields=_CREDENTIAL_NAMES if "credential_slots" in body else (),
+            )
         if visibility is not None:
             _apply_visibility(admin["username"], key, visibility)
         return {
@@ -1447,22 +1489,41 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         ptype = body.get("type")
         if not isinstance(ptype, str) or ptype not in PROVIDERS:
             raise HTTPException(status_code=400, detail=f"未知供应商类型: {ptype}")
-        cfg = load_config()
-        counters = cfg.get("instance_counters")
-        if not isinstance(counters, dict):
-            counters = {}
-        new_key = next_instance_key(cfg.get("platforms", {}), ptype, counters)
-        n = instance_number(new_key)
-        update_platform_config(new_key, {
-            "enabled": False,
-            "display_name": f"{DISPLAY_NAMES[ptype]} #{n}",
-        })
-        # 高水位计数器随删除保留,保证实例编号不复用
-        set_instance_counter(ptype, n)
+
+        def _add_instance(cfg: dict[str, Any]) -> str:
+            platforms = cfg.get("platforms")
+            if not isinstance(platforms, dict):
+                platforms = {}
+                cfg["platforms"] = platforms
+            counters = cfg.get("instance_counters")
+            if not isinstance(counters, dict):
+                counters = {}
+                cfg["instance_counters"] = counters
+            new_key = next_instance_key(platforms, ptype, counters)
+            n = instance_number(new_key)
+            # 高水位计数器随删除保留,保证实例编号不复用
+            counters[ptype] = n
+            platforms[new_key] = {
+                "enabled": False,
+                "display_name": f"{DISPLAY_NAMES[ptype]} #{n}",
+            }
+            return new_key
+
+        _, new_key = mutate_config(_add_instance)
         return {
             **_platform_view(new_key),
             "visibility": {"type": "private", "targets": []},
         }
+
+    @app.post("/api/config/import")
+    def config_import(
+        body: dict[str, Any] = Body(...),
+        admin: dict[str, Any] = Depends(api_admin),
+    ) -> dict[str, Any]:
+        """管理员整体导入 TOML 配置,整体替换 config.toml(初始化/迁移语义)。"""
+        imported = _parse_import_body(body)
+        save_config(imported)
+        return _import_summary(imported)
 
     @app.delete("/api/config/platforms/{key}")
     def config_delete_provider(

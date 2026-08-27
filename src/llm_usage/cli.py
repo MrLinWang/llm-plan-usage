@@ -19,6 +19,24 @@ from llm_usage.tui import run_tui
 console = Console()
 
 
+class _UvicornUpgradeNoiseFilter(logging.Filter):
+    """本应用无 WebSocket 路由:过滤 uvicorn 对 Upgrade 探测请求的提示噪音。
+
+    uvicorn 收到 ``Connection: Upgrade`` 请求且未装 websockets 库时,对每个
+    探测请求打两条 WARNING("Unsupported upgrade request." / "No supported
+    WebSocket library detected...")。应用没有 WS 路由,这两条纯属噪音;
+    其余 uvicorn 日志(启动、访问、真实错误)不受影响。
+    """
+
+    _NOISE_PREFIXES = (
+        "Unsupported upgrade request.",
+        "No supported WebSocket library detected",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith(self._NOISE_PREFIXES)
+
+
 def _load() -> dict[str, Any]:
     try:
         return config_mod.load_config()
@@ -102,6 +120,9 @@ def web(host: str, port: int, interval: float) -> None:
 
     # 让 provider 崩溃等失败边界日志可见(正常路径无 INFO 噪音)
     logging.basicConfig(level=logging.INFO)
+    # uvicorn.run 内部 dictConfig 会重置 logger 级别,但不会动 logger 上的
+    # Filter:用过滤器屏蔽 Upgrade 探测噪音(ERROR 与访问日志仍可见)
+    logging.getLogger("uvicorn.error").addFilter(_UvicornUpgradeNoiseFilter())
     uvicorn.run(create_app(cfg, interval=interval), host=host, port=port)
 
 

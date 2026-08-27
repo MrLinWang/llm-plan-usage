@@ -258,8 +258,12 @@ llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollam
 已保存的值，删除整个槽才会移除该凭证。保存立即写回 `./config.toml` 并使服务端
 用量缓存失效（下次刷新生效）：槽式保存写 `credentials` 数组并清除顶层凭证
 字段；LLM Gateway 的分组保存写 `groups` 并置 `use_groups = true`。LLM Gateway
-的 `base_url` 也在同一页直接编辑（留空 = 不修改）；`usage_path` 等高级字段
-仍需手工编辑 `config.toml`。
+**一键导入 config.toml**：添加栏旁的「导入 config.toml」按钮可直接上传一个
+TOML 文件（`POST /api/config/import`），**整体替换**当前配置——管理员替换
+`./config.toml`，普通用户替换自己在 `history.db` 的 `user_configs`（把本地
+配置同步到在线服务）。适合迁移新机器/新部署时免手工逐平台填写；导入前有
+确认对话框，需保留现有配置时请先自行备份。导入内容与现状相同则不会触发
+重新拉取（缓存按配置哈希驱动）。
 
 ### 同类型供应商实例（多账号卡片）
 

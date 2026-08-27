@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -52,6 +53,48 @@ class TestConfigLoadSave:
         C.save_config(cfg, p)
         cfg2 = C.load_config(p)
         assert cfg2 == cfg
+
+    def test_failed_serialization_preserves_existing_file(self, tmp_path: Path) -> None:
+        """序列化失败(不支持的值)不得触碰目标文件:旧内容逐字节保留。"""
+        p = tmp_path / "config.toml"
+        C.init_config(p)
+        baseline = p.read_bytes()
+        with pytest.raises(TypeError):
+            C.save_config({"ok": 1, "bad": object()}, p)
+        assert p.read_bytes() == baseline
+
+    def test_mutate_config_serializes_concurrent_updates(self, tmp_path: Path) -> None:
+        """读-改-写临界区串行:并发回调不丢失更新,两个键都落盘。"""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        p = tmp_path / "config.toml"
+        C.init_config(p)
+        entered = threading.Event()
+        release = threading.Event()
+        second_entered = threading.Event()
+
+        def first(cfg: dict[str, Any]) -> None:
+            entered.set()
+            assert release.wait(timeout=5)
+            cfg["first"] = 1
+
+        def second(cfg: dict[str, Any]) -> None:
+            second_entered.set()
+            cfg["second"] = 2
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(C.mutate_config, first, p)
+            assert entered.wait(timeout=5)
+            f2 = pool.submit(C.mutate_config, second, p)
+            # 第一个回调持锁期间,第二个回调不得进入临界区
+            assert not second_entered.wait(timeout=0.2)
+            release.set()
+            f1.result(timeout=5)
+            f2.result(timeout=5)
+        cfg = C.load_config(p)
+        assert cfg["first"] == 1
+        assert cfg["second"] == 2
 
 
 

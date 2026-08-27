@@ -920,6 +920,42 @@ async function buildAddProviderRow(isAdmin) {
   });
   row.appendChild(select);
   row.appendChild(btn);
+  // 一键导入 config.toml(双模式):整体替换当前配置,快速初始化/迁移
+  var importBtn = el("button", "btn", "导入 config.toml");
+  importBtn.type = "button";
+  var fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = ".toml,text/plain";
+  fileInput.style.display = "none";
+  importBtn.addEventListener("click", function () { fileInput.click(); });
+  fileInput.addEventListener("change", async function () {
+    var f = fileInput.files && fileInput.files[0];
+    if (!f) return;
+    importBtn.disabled = true;
+    try {
+      var text = await f.text();
+      var msg = isAdmin
+        ? "导入将覆盖当前 config.toml(含全部平台与凭证),确定?"
+        : "导入将覆盖你在本服务的平台配置(含全部凭证),确定?";
+      if (!window.confirm(msg)) return;
+      var r = await api(isAdmin ? "/api/config/import" : "/api/my/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: text }),
+      });
+      if (!r.ok) { statusEl.textContent = "导入失败: " + (await detailOf(r)); return; }
+      var data = await r.json();
+      await (isAdmin ? loadAdmin() : loadMy());
+      statusEl.textContent = "已导入 " + data.platforms + " 个平台(" + data.enabled + " 个启用)";
+    } catch (e) {
+      if (e && e.message !== "未登录") statusEl.textContent = String(e.message || e);
+    } finally {
+      importBtn.disabled = false;
+      fileInput.value = "";
+    }
+  });
+  row.appendChild(importBtn);
+  row.appendChild(fileInput);
   try {
     var r = await api("/api/provider-types");
     if (!r.ok) throw new Error(await detailOf(r));

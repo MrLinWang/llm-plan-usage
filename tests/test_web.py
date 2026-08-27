@@ -227,7 +227,12 @@ class TestPwa:
         resp = client.get("/sw.js")
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/javascript")
-        assert '"llm-usage-v1"' in resp.text
+        assert '"llm-usage-v2"' in resp.text
+        assert 'var CACHE_PREFIX = "llm-usage-";' in resp.text
+        # 激活清理只删本应用前缀的旧缓存(llm-usage-v1 可能已含认证 API 响应)
+        assert "k.indexOf(CACHE_PREFIX) === 0" in resp.text
+        # /api/ 网络直连:respondWith(fetch(req)) 且无 caches.match 回退
+        assert 'e.respondWith(fetch(req));' in resp.text
         assert 'addEventListener("fetch"' in resp.text
 
     def test_icons_whitelist_and_traversal(
@@ -707,6 +712,36 @@ class TestWebConfig:
         assert slots[1]["name"] == "套餐B"
         assert slots[1]["credentials"]["api_key"]["hint"] == "sk-b…45"
 
+    def test_put_credential_slots_commits_config_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """槽式 PUT 只落盘一次:credentials 数组与顶层凭证清除同一次原子写。"""
+        import llm_usage.config as config_mod
+
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        writes: list[int] = []
+        real = config_mod._atomic_write_bytes
+        monkeypatch.setattr(
+            config_mod, "_atomic_write_bytes",
+            lambda path, payload: (writes.append(1), real(path, payload))[1],
+        )
+        resp = client.put("/api/config/platforms/kimi", json={
+            "credential_slots": [
+                {"index": 0, "name": None, "api_key": ""},
+                {"index": None, "name": "套餐B", "api_key": "sk-b-12345"},
+            ],
+        })
+        assert resp.status_code == 200
+        assert len(writes) == 1  # 单事务:credentials + 顶层清除一次落盘
+        section = load_config()["platforms"]["kimi"]
+        assert section["credentials"] == [
+            {"name": "套餐1", "api_key": "env:KIMI_API_KEY"},
+            {"name": "套餐B", "api_key": "sk-b-12345"},
+        ]
+        assert "api_key" not in section
+
     def test_put_credential_slots_keep_and_replace(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
         tmp_config_path: Path,
@@ -931,14 +966,134 @@ class TestWebConfig:
             "clinepass", "llm-gateway",
         ]
 
-    def test_config_page_has_drag_handle(
+class TestConfigImport:
+    """一键导入 config.toml:管理员整体替换 config.toml,普通用户替换 user_configs。"""
+
+    IMPORT_TOML = """\
+[platforms.kimi]
+api_key = "sk-imported-key"
+
+[platforms.ollama]
+enabled = false
+api_key = "sk-ollama-imported"
+"""
+
+    def test_import_replaces_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.post("/api/config/import", json={"content": self.IMPORT_TOML})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "platforms": 2, "enabled": 1}
+        cfg = load_config()
+        # 整体替换:模板其它平台消失,仅剩导入的两键
+        assert set(cfg["platforms"]) == {"kimi", "ollama"}
+        assert cfg["platforms"]["kimi"]["api_key"] == "sk-imported-key"
+        assert cfg["platforms"]["ollama"]["enabled"] is False
+
+    def test_import_invalid_toml_keeps_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        before = load_config()
+        resp = client.post("/api/config/import", json={"content": "[platforms\nbad"})
+        assert resp.status_code == 400
+        assert "TOML 解析失败" in resp.json()["detail"]
+        assert load_config() == before
+
+    def test_import_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.post("/api/config/import", json={"content": ""})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "content 需为非空字符串"
+        resp = client.post("/api/config/import", json={"content": 42})
+        assert resp.status_code == 400
+        resp = client.post("/api/config/import", json={"content": "x = 1", "extra": 2})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "未知字段: extra"
+        resp = client.post("/api/config/import", json={"content": 'platforms = "x"'})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "platforms 需为表(字典)"
+        # 匿名 → 401
+        anon = TestClient(client.app)
+        resp = anon.post("/api/config/import", json={"content": self.IMPORT_TOML})
+        assert resp.status_code == 401
+
+    def test_import_refetches_usage(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, calls = _auth_client(monkeypatch, tmp_db_path)
+        assert client.get("/api/usage").status_code == 200
+        assert calls[0] == 1
+        resp = client.post("/api/config/import", json={"content": self.IMPORT_TOML})
+        assert resp.status_code == 200
+        # 配置哈希变化 → 新缓存条目,interval 内仍重拉
+        client.get("/api/usage")
+        assert calls[0] == 2
+
+    def test_user_import_replaces_own_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, calls = _auth_client(
+            monkeypatch, tmp_db_path, username="alice", admin=False
+        )
+        # 导入前先拉一次(空配置),导入后哈希变化 → 新缓存条目重拉
+        assert client.get("/api/usage").status_code == 200
+        assert calls[0] == 1
+        resp = client.post("/api/my/import", json={"content": self.IMPORT_TOML})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "platforms": 2, "enabled": 1}
+        # 落盘:alice 的 user_configs 被整体替换为导入内容
+        ucfg = store.get_user_config("alice")
+        assert set(ucfg["platforms"]) == {"kimi", "ollama"}
+        assert ucfg["platforms"]["kimi"]["api_key"] == "sk-imported-key"
+        assert ucfg["platforms"]["ollama"]["enabled"] is False
+        # config.toml 不受影响(模板原样保留)
+        assert load_config()["platforms"]["kimi"]["api_key"] == "env:KIMI_API_KEY"
+        # alice 的 usage 缓存重拉
+        assert client.get("/api/usage").status_code == 200
+        assert calls[0] == 2
+
+    def test_user_import_policy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        admin, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = admin.post("/api/my/import", json={"content": self.IMPORT_TOML})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "管理员请使用 /api/config"
+        alice, _ = _auth_client(
+            monkeypatch, tmp_db_path, username="alice", admin=False
+        )
+        # allow_user_providers 关 → 403
+        store.set_setting("allow_user_providers", "0")
+        resp = alice.post("/api/my/import", json={"content": self.IMPORT_TOML})
+        assert resp.status_code == 403
+        # 开 → 200
+        store.set_setting("allow_user_providers", "1")
+        resp = alice.post("/api/my/import", json={"content": self.IMPORT_TOML})
+        assert resp.status_code == 200
+
+    def test_config_page_has_import_hook(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
     ) -> None:
-        """页面 JS 依赖的拖放挂载点:缺失时卡片无法拖动排序。"""
+        """页面 JS 依赖的导入挂载点:缺失时按钮无法渲染。"""
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         html = client.get("/config").text
-        assert "drag-handle" in html
-        assert "dragstart" in html
+        assert "导入 config.toml" in html
 
 
 class TestRegistration:
@@ -1850,6 +2005,20 @@ class TestSecurityHardening:
             )
             assert resp.status_code == 401
 
+    def test_limiter_memory_bounded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """限流器内存有界:超过上限后最久未活动的客户端被淘汰,不无限累积。"""
+        from llm_usage.web import _LoginLimiter
+
+        limiter = _LoginLimiter()
+        limiter._max_entries = 3
+        for i in range(5):
+            assert limiter.check(f"ip-{i}") is None
+        assert len(limiter._fails) <= 3
+        assert "ip-0" not in limiter._fails  # 最旧的已被淘汰
+        assert "ip-4" in limiter._fails  # 最新的保留
+
     def test_security_headers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
     ) -> None:
@@ -1860,6 +2029,33 @@ class TestSecurityHardening:
             assert resp.headers["X-Frame-Options"] == "DENY"
             assert resp.headers["X-Content-Type-Options"] == "nosniff"
             assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+    def test_api_responses_are_not_cacheable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """/api/* 一律 Cache-Control: no-store(成功与 401 都不可缓存)。"""
+        _patch_fetch(monkeypatch)
+        store.create_user("admin", "secret1", is_admin=True)
+        client = TestClient(create_app({"platforms": {}}))
+        # 未认证 401
+        resp = client.get("/api/usage")
+        assert resp.status_code == 401
+        assert resp.headers["Cache-Control"] == "no-store"
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["Referrer-Policy"] == "no-referrer"
+        # 认证成功响应
+        r = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "secret1"}
+        )
+        assert r.status_code == 200
+        resp = client.get("/api/auth/state")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "no-store"
+        # 非 API 页面不受影响
+        resp = client.get("/login")
+        assert resp.status_code == 200
+        assert "Cache-Control" not in resp.headers
 
     def test_secure_cookie_env_flag(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
@@ -2041,6 +2237,29 @@ class TestProviderInstances:
         # 共享传播:alice 见 工作号K(admin)
         names = [p["display_name"] for p in alice.get("/api/usage").json()["platforms"]]
         assert names == ["工作号K(admin)"]
+
+    def test_admin_add_commits_section_and_counter_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """添加实例:新 section 与 instance_counters 高水位同一次原子落盘。"""
+        import llm_usage.config as config_mod
+
+        init_config(tmp_config_path)
+        client = self._client(monkeypatch, tmp_config_path)
+        writes: list[int] = []
+        real = config_mod._atomic_write_bytes
+        monkeypatch.setattr(
+            config_mod, "_atomic_write_bytes",
+            lambda path, payload: (writes.append(1), real(path, payload))[1],
+        )
+        resp = client.post("/api/config/providers", json={"type": "kimi"})
+        assert resp.status_code == 200
+        assert resp.json()["key"] == "kimi#2"
+        assert len(writes) == 1  # 单事务:section + 计数器一次落盘
+        cfg = load_config()
+        assert cfg["platforms"]["kimi#2"]["display_name"] == "Kimi Code #2"
+        assert cfg["instance_counters"]["kimi"] == 2
 
     def test_admin_delete_cascade_and_guards(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,

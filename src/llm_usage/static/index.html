@@ -175,6 +175,22 @@
     grid-column: 1 / -1;
     height: auto;
   }
+  .expanded-entry-grid {
+    display: grid;
+    grid-template-columns: repeat(var(--expanded-columns, 1), minmax(0, 1fr));
+    gap: 10px;
+    width: 100%;
+    margin-top: 2px;
+  }
+  .expanded-entry-column {
+    container-type: inline-size;
+    min-width: 0;
+    padding: 2px 9px 4px;
+    background: var(--surface-raised);
+    border: 1px solid color-mix(in srgb, var(--sep) 72%, transparent);
+    border-radius: 10px;
+  }
+  .platform > table[hidden] { display: none; }
   .platform-err, .platform-empty { padding: 2px 0; }
   .platform-err { color: var(--red); }
   .platform-warning {
@@ -588,6 +604,26 @@ var entryRotationTimers = [];   // 各卡片轮播的 setInterval 句柄,重渲�
 var ENTRY_ROTATE_MS = 5000;     // 轮播步进间隔
 var lastPlatformData = [];      // 最近一次成功渲染的平台数据,resize 试排复用
 var fitResizeTimer = 0;         // resize 防抖计时器
+var EXPANDED_STATE_KEY = "llm-usage-expanded-platforms";
+var expandedPlatformKeys = new Set();
+
+// 展开状态跨数据刷新和页面刷新保留，但只限当前标签页会话。
+try {
+  var storedExpandedKeys = JSON.parse(sessionStorage.getItem(EXPANDED_STATE_KEY) || "[]");
+  if (Array.isArray(storedExpandedKeys)) {
+    storedExpandedKeys.forEach(function (key) {
+      if (typeof key === "string") expandedPlatformKeys.add(key);
+    });
+  }
+} catch (_) { /* 隐私模式或无效缓存时使用空状态 */ }
+
+function setPlatformExpanded(stateKey, expanded) {
+  if (expanded) expandedPlatformKeys.add(stateKey);
+  else expandedPlatformKeys.delete(stateKey);
+  try {
+    sessionStorage.setItem(EXPANDED_STATE_KEY, JSON.stringify(Array.from(expandedPlatformKeys)));
+  } catch (_) { /* sessionStorage 不可用时仍保留内存状态 */ }
+}
 
 // ---- 主题切换 ----
 // data-theme 由 <head> 中的脚本在首屏前设置;这里同步按钮文字并处理点击。
@@ -642,6 +678,8 @@ fetch("/api/auth/state").then(function (r) { return r.json(); }).then(function (
 });
 
 document.getElementById("logout").addEventListener("click", async function () {
+  expandedPlatformKeys.clear();
+  try { sessionStorage.removeItem(EXPANDED_STATE_KEY); } catch (_) {}
   await fetch("/api/auth/logout", { method: "POST" });
   location.href = "/login";
 });
@@ -1036,7 +1074,57 @@ function appendTotalRows(body, entries) {
   body.appendChild(totalBar);
 }
 
-function platformCard(p, displayMode) {
+function buildExpandedGrid(entries, includeTotal, requestedColumns) {
+  var items = entries.map(function (entry) {
+    return { entry: entry, summary: false };
+  });
+  if (includeTotal) items.push({ entry: totalEntry(entries), summary: true });
+  var grid = el("div", "expanded-entry-grid");
+  var columnCount = Math.max(1, Math.min(requestedColumns || 1, items.length));
+  var itemsPerColumn = Math.floor(items.length / columnCount);
+  var extraItemColumns = items.length % columnCount;
+  var start = 0;
+  grid.style.setProperty("--expanded-columns", String(columnCount));
+  for (var columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+    var columnSize = itemsPerColumn + (columnIndex < extraItemColumns ? 1 : 0);
+    var columnItems = items.slice(start, start + columnSize);
+    start += columnSize;
+    var column = el("div", "expanded-entry-column");
+    var columnFrag = entryTableTpl.content.cloneNode(true);
+    var columnBody = columnFrag.querySelector("tbody");
+    var prevPlan = null;
+    columnItems.forEach(function (item) {
+      var entry = item.entry;
+      if (!item.summary && entry.plan && entry.plan !== prevPlan) {
+        var planRow = el("tr", "plan-head");
+        planRow.appendChild(td(entry.plan, "dim", 6));
+        columnBody.appendChild(planRow);
+      }
+      if (item.summary) {
+        var totalData = dataRow(entry);
+        var totalBar = barRow(entry.percent);
+        totalData.classList.add("summary-row");
+        totalBar.classList.add("summary-bar");
+        columnBody.appendChild(totalData);
+        columnBody.appendChild(totalBar);
+      } else {
+        appendEntryRows(columnBody, entry);
+      }
+      prevPlan = entry.plan;
+    });
+    column.appendChild(columnFrag);
+    grid.appendChild(column);
+  }
+  return grid;
+}
+
+function outerGridColumnCount() {
+  var columns = getComputedStyle(platformsEl).gridTemplateColumns.trim();
+  if (!columns || columns === "none") return 1;
+  return columns.split(/\s+/).length;
+}
+
+function platformCard(p, displayMode, stateKey) {
   var card = el("div", "card platform");
   var head = el("div", "platform-head");
   var name = el("span", "platform-name");
@@ -1098,10 +1186,24 @@ function platformCard(p, displayMode) {
     return card;
   }
   var frag = entryTableTpl.content.cloneNode(true);
+  var table = frag.querySelector("table");
   var body = frag.querySelector("tbody");
+  var expandedGrid = null;
+  var setExpandedContent = function (expanded, includeTotal) {
+    if (expandedGrid) {
+      expandedGrid.remove();
+      expandedGrid = null;
+    }
+    var expandedColumnCount = expanded ? outerGridColumnCount() : 1;
+    table.hidden = expanded;
+    if (expanded) {
+      expandedGrid = buildExpandedGrid(entries, includeTotal, expandedColumnCount);
+      card.appendChild(expandedGrid);
+    }
+  };
   if (independentCompacts) {
     var rotationOffset = 0;
-    var independentExpanded = false;
+    var independentExpanded = expandedPlatformKeys.has(stateKey);
     var advanceRotation = function () {
       if (independentExpanded) return;
       closeKeyPopovers();
@@ -1110,17 +1212,17 @@ function platformCard(p, displayMode) {
     };
     var renderIndependentRows = function () {
       closeKeyPopovers();
-      body.textContent = "";
       card.classList.toggle("is-expanded", independentExpanded);
       if (rotationIndicator) rotationIndicator.hidden = independentExpanded;
+      setExpandedContent(independentExpanded, true);
       if (independentExpanded) {
-        appendEntries(body, entries);
-        appendTotalRows(body, entries);
+        // 完整内容由多列展开网格承载，原表保留但隐藏以便快速收起。
       } else if (rotationSlotCount > 0) {
         renderRotatingRows(
           body, entries, rotationOffset, rotationIndicator, rotationSlotCount
         );
       } else {
+        body.textContent = "";
         appendTotalRows(body, entries);
       }
       entryToggle.textContent = independentExpanded
@@ -1140,6 +1242,7 @@ function platformCard(p, displayMode) {
     entryToggle.addEventListener("click", function (event) {
       event.stopPropagation();
       independentExpanded = !independentExpanded;
+      setPlatformExpanded(stateKey, independentExpanded);
       renderIndependentRows();
     });
     var reduceMotion = window.matchMedia &&
@@ -1154,12 +1257,15 @@ function platformCard(p, displayMode) {
       }, ENTRY_ROTATE_MS));
     }
   } else if (periodicCollapses) {
-    var expanded = false;
+    var expanded = expandedPlatformKeys.has(stateKey);
     var renderPeriodicRows = function () {
       closeKeyPopovers();
-      body.textContent = "";
-      appendEntries(body, expanded ? entries : collapsedEntries);
       card.classList.toggle("is-expanded", expanded);
+      setExpandedContent(expanded, false);
+      if (!expanded) {
+        body.textContent = "";
+        appendEntries(body, collapsedEntries);
+      }
       entryToggle.textContent = expanded
         ? "收起" : "+" + (entries.length - collapsedEntries.length);
       entryToggle.title = expanded
@@ -1171,6 +1277,7 @@ function platformCard(p, displayMode) {
     entryToggle.addEventListener("click", function (event) {
       event.stopPropagation();
       expanded = !expanded;
+      setPlatformExpanded(stateKey, expanded);
       renderPeriodicRows();
     });
     renderPeriodicRows();
@@ -1186,8 +1293,15 @@ function renderPlatformsAtMode(platforms, mode) {
   entryRotationTimers = [];
   document.documentElement.dataset.density = mode;
   platformsEl.textContent = "";
+  var identityCounts = Object.create(null);
   platforms.forEach(function (p) {
-    platformsEl.appendChild(platformCard(p, mode));
+    var identity = JSON.stringify([String(p.name || ""), String(p.display_name || "")]);
+    var occurrence = identityCounts[identity] || 0;
+    identityCounts[identity] = occurrence + 1;
+    var stateKey = JSON.stringify([
+      String(p.name || ""), String(p.display_name || ""), occurrence
+    ]);
+    platformsEl.appendChild(platformCard(p, mode, stateKey));
   });
 }
 

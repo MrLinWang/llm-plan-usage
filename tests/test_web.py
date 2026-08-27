@@ -955,7 +955,10 @@ class TestRegistration:
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         r = client.put("/api/settings", json={"registration_enabled": True})
         assert r.status_code == 200
-        assert r.json() == {"registration_enabled": True}
+        assert (
+            r.json()["registration_enabled"] is True
+            and r.json()["allow_user_providers"] is True
+        )
         anon = TestClient(client.app)
         r = anon.post(
             "/api/auth/register", json={"username": "alice", "password": "secret1"}
@@ -1034,6 +1037,94 @@ class TestRegistration:
         users_html = client.get("/users").text
         assert "reg-enabled" in users_html
         assert "注册设置" in users_html
+
+
+class TestUserProviderPolicy:
+    """allow_user_providers 站点开关:默认开;关闭后 /api/my/* 全部 403,
+    只读仪表盘接口不受影响;管理员永远不受影响。"""
+
+    def _bob_client(self, client: TestClient) -> TestClient:
+        """已登录普通用户 bob 的独立 client(共享同一 app/DB)。"""
+        bob = TestClient(client.app)
+        r = bob.post("/api/auth/login", json={"username": "bob", "password": "secret1"})
+        assert r.status_code == 200
+        return bob
+
+    def test_user_providers_allowed_by_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        store.create_user("bob", "secret1", is_admin=False)
+        state = self._bob_client(client).get("/api/auth/state").json()
+        assert state["allow_user_providers"] is True
+        bob = self._bob_client(client)
+        assert bob.get("/api/my/platforms").status_code == 200
+        resp = bob.post("/api/my/providers", json={"type": "kimi"})
+        assert resp.status_code == 200
+        assert resp.json()["key"] == "kimi#2"
+
+    def test_disable_blocks_my_endpoints_but_usage_reads(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        store.create_user("bob", "secret1", is_admin=False)
+        bob = self._bob_client(client)
+        # 开关开启时先给 bob 配一个实例,供 PUT/DELETE 门控验证(路径中 # 编码为 %23)
+        resp = bob.post("/api/my/providers", json={"type": "kimi"})
+        assert resp.status_code == 200
+        r = client.put("/api/settings", json={"allow_user_providers": False})
+        assert r.status_code == 200
+        assert client.get("/api/settings").json()["allow_user_providers"] is False
+        assert bob.get("/api/my/platforms").status_code == 403
+        assert bob.put(
+            "/api/my/platforms/kimi%232", json={"enabled": True}
+        ).status_code == 403
+        assert bob.post("/api/my/providers", json={"type": "kimi"}).status_code == 403
+        assert bob.delete("/api/my/platforms/kimi%232").status_code == 403
+        # 只读接口不受影响:普通用户仪表盘可用,管理员配置页 API 可用
+        assert bob.get("/api/usage").status_code == 200
+        assert client.get("/api/config").status_code == 200
+
+    def test_enable_restores_access(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        store.create_user("bob", "secret1", is_admin=False)
+        bob = self._bob_client(client)
+        assert client.put(
+            "/api/settings", json={"allow_user_providers": False}
+        ).status_code == 200
+        assert bob.get("/api/my/platforms").status_code == 403
+        assert client.put(
+            "/api/settings", json={"allow_user_providers": True}
+        ).status_code == 200
+        assert bob.get("/api/my/platforms").status_code == 200
+
+    def test_settings_put_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        r = client.put("/api/settings", json={"allow_user_providers": "yes"})
+        assert r.status_code == 400
+        assert r.json()["detail"] == "allow_user_providers 需为布尔值"
+        assert client.put("/api/settings", json={}).status_code == 400
+        # 单独 PUT registration_enabled → 200 且只改注册开关(逐字段循环回归)
+        r = client.put("/api/settings", json={"registration_enabled": True})
+        assert r.status_code == 200
+        body = client.get("/api/settings").json()
+        assert body["registration_enabled"] is True
+        assert body["allow_user_providers"] is True
+
+    def test_users_page_has_provider_toggle_hook(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """页面 JS 依赖的静态挂载点:开关卡片与普通用户模式门控分支。"""
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        users_html = client.get("/users").text
+        assert "user-providers-enabled" in users_html
+        assert "用户配置" in users_html
+        config_html = client.get("/config").text
+        assert "allow_user_providers" in config_html
 
 
 class TestUserStore:

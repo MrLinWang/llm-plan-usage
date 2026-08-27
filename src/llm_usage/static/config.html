@@ -978,6 +978,10 @@ api("/api/auth/state").then(function (r) { return r.json(); }).then(function (s)
   if (!s.user || !s.user.is_admin) {
     usersNavEl.style.display = "none";  // 普通用户无用户管理页
     currentUser = s.user.username;
+    if (s.allow_user_providers === false) {
+      statusEl.textContent = "管理员已关闭普通用户自行配置供应商";
+      return;
+    }
     loadMy();
     return;
   }

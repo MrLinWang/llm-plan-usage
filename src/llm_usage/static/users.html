@@ -233,6 +233,14 @@
   </div>
 
   <div class="card">
+    <div class="section-title">用户配置</div>
+    <label class="check">
+      <input id="user-providers-enabled" type="checkbox"> 允许普通用户自行添加/编辑自己的供应商
+    </label>
+    <div id="user-providers-err" class="form-err"></div>
+  </div>
+
+  <div class="card">
     <div class="section-title">修改我的密码</div>
     <form id="password-form">
       <label>原密码
@@ -401,14 +409,18 @@ document.getElementById("password-form").addEventListener("submit", async functi
   okEl.textContent = "密码已修改,其他登录会话已失效";
 });
 
-// ---- 注册开关:勾选即保存(与仪表盘 interval 下拉的即时生效模式一致) ----
+// ---- 站点开关:勾选即保存(与仪表盘 interval 下拉的即时生效模式一致) ----
 var regBox = document.getElementById("reg-enabled");
 var regErr = document.getElementById("reg-err");
+var userProvidersBox = document.getElementById("user-providers-enabled");
+var userProvidersErr = document.getElementById("user-providers-err");
 
 async function loadSettings() {
   var r = await api("/api/settings");
   if (!r.ok) { regErr.textContent = await detailOf(r); return; }
-  regBox.checked = !!(await r.json()).registration_enabled;
+  var s = await r.json();
+  regBox.checked = !!s.registration_enabled;
+  userProvidersBox.checked = !!s.allow_user_providers;
 }
 
 regBox.addEventListener("change", async function () {
@@ -423,6 +435,21 @@ regBox.addEventListener("change", async function () {
     if (!r.ok) { regErr.textContent = await detailOf(r); regBox.checked = !regBox.checked; }  // 失败回退
   } finally {
     regBox.disabled = false;
+  }
+});
+
+userProvidersBox.addEventListener("change", async function () {
+  userProvidersErr.textContent = "";
+  userProvidersBox.disabled = true;
+  try {
+    var r = await api("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allow_user_providers: userProvidersBox.checked }),
+    });
+    if (!r.ok) { userProvidersErr.textContent = await detailOf(r); userProvidersBox.checked = !userProvidersBox.checked; }  // 失败回退
+  } finally {
+    userProvidersBox.disabled = false;
   }
 });
 

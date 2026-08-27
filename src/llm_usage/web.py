@@ -80,7 +80,7 @@ _GATEWAY_GROUP_FIELDS = {"index", "name", "daily_limit", "api_keys"}
 _GATEWAY_KEY_FIELDS = {"index", "value", "name"}
 
 # PUT /api/settings 允许的字段(站点策略,存 history.db settings 表)
-_SETTINGS_KEYS = {"registration_enabled"}
+_SETTINGS_KEYS = {"registration_enabled", "allow_user_providers"}
 
 class _LoginLimiter:
     """Per-client sliding-window login throttle.
@@ -972,6 +972,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             "authenticated": user is not None,
             "needs_setup": store.count_users() == 0,
             "registration_enabled": store.get_setting("registration_enabled") == "1",
+            "allow_user_providers": store.get_setting("allow_user_providers") != "0",
             "user": (
                 {"username": user["username"], "is_admin": user["is_admin"]}
                 if user else None
@@ -1188,7 +1189,10 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
 
     @app.get("/api/settings")
     def settings_get(admin: dict[str, Any] = Depends(api_admin)) -> dict[str, Any]:
-        return {"registration_enabled": store.get_setting("registration_enabled") == "1"}
+        return {
+            "registration_enabled": store.get_setting("registration_enabled") == "1",
+            "allow_user_providers": _user_providers_allowed(),
+        }
 
     @app.put("/api/settings")
     def settings_put(
@@ -1198,11 +1202,18 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         extra = sorted(set(body) - _SETTINGS_KEYS)
         if extra:
             raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
-        value = body.get("registration_enabled")
-        if not isinstance(value, bool):
-            raise HTTPException(status_code=400, detail="registration_enabled 需为布尔值")
-        store.set_setting("registration_enabled", "1" if value else "0")
-        return {"registration_enabled": value}
+        known = sorted(set(body) & _SETTINGS_KEYS)
+        if not known:
+            raise HTTPException(status_code=400, detail="至少提供一个设置字段")
+        for name in known:
+            value = body[name]
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail=f"{name} 需为布尔值")
+            store.set_setting(name, "1" if value else "0")
+        return {
+            "registration_enabled": store.get_setting("registration_enabled") == "1",
+            "allow_user_providers": _user_providers_allowed(),
+        }
 
     @app.get("/api/provider-types")
     def provider_types_list(
@@ -1216,9 +1227,17 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     # 与 admin /api/config 同构:凭证槽 / gateway base_url+组 / 可见性均可编辑。
     # 管理员调用 → 400。
 
+    def _user_providers_allowed() -> bool:
+        """站点策略:普通用户能否自行配置供应商。缺省开,显式 "0" 才关。"""
+        return store.get_setting("allow_user_providers") != "0"
+
     def _non_admin(user: dict[str, Any]) -> dict[str, Any]:
         if user["is_admin"]:
             raise HTTPException(status_code=400, detail="管理员请使用 /api/config")
+        if not _user_providers_allowed():
+            raise HTTPException(
+                status_code=403, detail="未开放普通用户自行配置供应商"
+            )
         return user
 
     def _ensure_deletable(key: str, platforms_cfg: dict[str, Any]) -> None:

@@ -144,6 +144,14 @@ class TestWeb:
         assert 'id="more-menu-btn"' in html    # ⋯ 菜单按钮
         assert 'id="more-dropdown"' in html    # 折叠菜单容器
 
+    def test_index_has_nav_entries(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        html = client.get("/").text
+        assert 'id="nav-users"' in html    # 用户管理入口(JS 仅对管理员取消隐藏)
+        assert 'id="nav-config"' in html   # 供应商配置入口(管理员恒显,普通用户随开关)
+
     def test_refresh_forces_refetch(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
     ) -> None:

@@ -648,7 +648,7 @@ document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
 syncThemeButton();
 
 // ---- 更多菜单 ----
-// ⋯ 下拉:主题切换 + 管理员入口;点击菜单项/外部/Escape 关闭。
+// ⋯ 下拉:主题切换 + 导航入口(用户管理 admin-only / 供应商配置 管理员+开关开启时的普通用户);点击菜单项/外部/Escape 关闭。
 var moreBtn = document.getElementById("more-menu-btn");
 var moreDropdown = document.getElementById("more-dropdown");
 
@@ -668,15 +668,19 @@ document.addEventListener("keydown", function (e) {
 });
 
 // ---- 会话状态 ----
-// 未登录 → /login;管理员显示「用户管理/供应商配置」入口;退出按钮结束会话。
+// 未登录 → /login;「用户管理」仅管理员;「供应商配置」管理员恒显示,
+// 普通用户在站点开关开启时(allow_user_providers !== false)也显示;退出按钮结束会话。
 fetch("/api/auth/state").then(function (r) { return r.json(); }).then(function (s) {
   if (!s.authenticated) { location.href = "/login"; return; }
-  if (s.user && s.user.is_admin) {
-    document.getElementById("nav-users").hidden = false;
-    document.getElementById("nav-config").hidden = false;
+  if (s.user) {
+    if (s.user.is_admin) {
+      document.getElementById("nav-users").hidden = false;
+      document.getElementById("nav-config").hidden = false;
+    } else if (s.allow_user_providers !== false) {
+      document.getElementById("nav-config").hidden = false;
+    }
   }
 });
-
 document.getElementById("logout").addEventListener("click", async function () {
   expandedPlatformKeys.clear();
   try { sessionStorage.removeItem(EXPANDED_STATE_KEY); } catch (_) {}

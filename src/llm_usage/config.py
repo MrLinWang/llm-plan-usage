@@ -74,7 +74,10 @@ EXAMPLE_CONFIG = """\
 # Volcengine: needs AccessKey/SecretKey (AK/SK) with V4 signing, not Bearer API key.
 
 # 平台显示顺序:可选。取消注释并调整列表即可改变 show/tui/web 的显示顺序。
-# platform_order = ["kimi", "volcengine-coding", "volcengine-agent", "ollama", "opencode-go"]
+# platform_order = [
+#     "kimi", "volcengine-coding", "volcengine-agent", "ollama",
+#     "opencode-go", "clinepass", "commandcode", "llm-gateway",
+# ]
 
 [platforms.kimi]
 enabled = true
@@ -140,6 +143,15 @@ api_key = "env:CLINEPASS_API_KEY"         # Cline API key (app.cline.bot)
 # [[platforms.clinepass.credentials]]
 # name = "套餐A"
 # api_key = "env:CLINEPASS_API_KEY_A"
+
+[platforms.commandcode]
+enabled = true
+api_key = "env:COMMANDCODE_API_KEY"       # Command Code API key (Studio → API keys)
+# 多计费套餐:同一平台可有多个独立凭证(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.commandcode.credentials]]
+# name = "套餐A"
+# api_key = "env:COMMANDCODE_API_KEY_A"
 
 [platforms.llm-gateway]
 enabled = true

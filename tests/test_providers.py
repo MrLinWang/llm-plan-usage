@@ -1,12 +1,11 @@
-"""Provider tests: Kimi and Volcengine parsing via httpx.MockTransport.
+"""Provider tests: parsing + HTTP behavior for every registered provider.
 
-Covers the verification requirements from the plan:
-  - ``used = limit - remaining`` conversion (Kimi)
-  - millisecond resetTime parsing (Kimi)
-  - 404 fallback from /usages to /usage (Kimi)
-  - volcengine OpenAPI V4 signing: GetCodingPlanUsage (percent-only) + GetAFPUsage (used/total)
-  - gateway sanitized error strings (no raw exception text in results)
-  - error isolation (single platform failure doesn't crash)
+All live providers are exercised with ``httpx.MockTransport`` (no network):
+  - Kimi: ``used = limit - remaining`` conversion, ms resetTime, 404 fallback
+  - Volcengine: OpenAPI V4 signing, GetCodingPlanUsage (percent-only) + GetAFPUsage
+  - Ollama / OpenCode Go / ClinePass / Command Code: window parsing + neutral errors
+  - LLM Gateway: ``actual_cost`` extraction, groups, sanitized per-key errors
+  - Registry: dispatch, credential fan-out, instance keys, error isolation
 """
 
 from __future__ import annotations
@@ -37,6 +36,11 @@ from llm_usage.providers.llm_gateway import (
 from llm_usage.providers.clinepass import (
     ClinePassProvider,
     _parse_usage_payload as _parse_clinepass_payload,
+)
+from llm_usage.providers.commandcode import (
+    CommandCodeProvider,
+    _parse_usage_payload as _parse_commandcode_payload,
+    _plan_monthly_credits,
 )
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
@@ -635,6 +639,224 @@ class TestClinePassHttp:
 
 
 # ---------------------------------------------------------------------------
+# Command Code (live API)
+# ---------------------------------------------------------------------------
+
+def _commandcode_credits_payload() -> dict:
+    """/alpha/billing/credits response (GOAT plan, no envelope)."""
+    return {
+        "credits": {
+            "belowThreshold": False,
+            "creditThreshold": 0,
+            "monthlyCredits": 69.9966468915,
+            "purchasedCredits": 0,
+            "freeCredits": 0,
+        },
+        "windowLimits": {
+            "limited": True,
+            "exceeded": None,
+            "fiveHour": {"used": 0.0033531085, "cap": 14, "exceeded": False,
+                         "resetAt": 1789716175624},
+            "weekly": {"used": 0.0033531085, "cap": 35, "exceeded": False,
+                       "resetAt": 1790302975624},
+        },
+    }
+
+
+def _commandcode_subscription(status: str = "active",
+                              plan_id: str = "individual-goat") -> dict:
+    return {
+        "success": True,
+        "data": {
+            "status": status,
+            "planId": plan_id,
+            "currentPeriodStart": "2026-09-18T02:14:30.000Z",
+            "currentPeriodEnd": "2026-10-18T02:14:30.000Z",
+        },
+    }
+
+
+class TestCommandCodeParsing:
+    def test_windows_and_monthly_mapped_in_fixed_order(self) -> None:
+        entries = _parse_commandcode_payload(
+            _commandcode_credits_payload(),
+            _commandcode_subscription()["data"],
+            "commandcode",
+        )
+        assert [e.label for e in entries] == ["5小时", "每周", "每月"]
+        five_hour, weekly, monthly = entries
+        assert five_hour.used == 0.0033531085
+        assert five_hour.limit == 14.0
+        assert five_hour.remaining == 13.9966468915
+        assert five_hour.percent == 0.0
+        assert five_hour.reset_at == "2026-09-18T07:22:55.624000Z"
+        assert weekly.limit == 35.0
+        assert weekly.remaining == 34.9966468915
+        assert weekly.reset_at == "2026-09-25T02:22:55.624000Z"
+        # 每月 = 套餐总额 - 月度剩余
+        assert monthly.used == pytest.approx(0.0033531085)
+        assert monthly.limit == 70.0
+        assert monthly.remaining == 69.9966468915
+        assert monthly.reset_at == "2026-10-18T02:14:30.000Z"
+        for e in entries:
+            assert e.platform == "commandcode"
+            assert e.unit == "$"
+
+    def test_monthly_clamped_when_credits_exceed_plan_total(self) -> None:
+        payload = _commandcode_credits_payload()
+        payload["credits"]["monthlyCredits"] = 120.0  # 赠送额度推高剩余
+        entries = _parse_commandcode_payload(
+            payload, _commandcode_subscription()["data"], "commandcode"
+        )
+        monthly = entries[-1]
+        assert monthly.label == "每月"
+        assert monthly.used == 0.0
+        assert monthly.remaining == 70.0
+
+    def test_monthly_silently_skipped_for_unknown_or_inactive_plan(self) -> None:
+        payload = _commandcode_credits_payload()
+        for subscription in (
+            _commandcode_subscription(plan_id="individual-future")["data"],
+            _commandcode_subscription(status="canceled")["data"],
+        ):
+            entries = _parse_commandcode_payload(
+                payload, subscription, "commandcode"
+            )
+            assert [e.label for e in entries] == ["5小时", "每周"]
+
+    def test_incomplete_window_skipped_without_dropping_others(self) -> None:
+        payload = _commandcode_credits_payload()
+        del payload["windowLimits"]["fiveHour"]["cap"]
+        payload["windowLimits"]["weekly"]["used"] = "x"
+        entries = _parse_commandcode_payload(
+            payload, _commandcode_subscription()["data"], "commandcode"
+        )
+        assert [e.label for e in entries] == ["每月"]
+
+    def test_missing_or_malformed_payload_yields_no_entries(self) -> None:
+        assert _parse_commandcode_payload({}, None, "commandcode") == []
+        assert _parse_commandcode_payload(
+            {"windowLimits": []}, None, "commandcode"
+        ) == []
+        assert _parse_commandcode_payload(
+            {"credits": "junk"}, None, "commandcode"
+        ) == []
+        assert _parse_commandcode_payload(
+            {"windowLimits": "junk"}, None, "commandcode"
+        ) == []
+
+    def test_non_dict_subscription_degrades_to_window_rows(self) -> None:
+        entries = _parse_commandcode_payload(
+            _commandcode_credits_payload(), {"data": "junk"}, "commandcode"
+        )
+        assert [e.label for e in entries] == ["5小时", "每周"]
+
+    def test_plan_monthly_credits_longest_prefix(self) -> None:
+        assert _plan_monthly_credits("individual-pro-v1") == 80.0
+        assert _plan_monthly_credits("individual-pro") == 30.0
+        assert _plan_monthly_credits("individual-goat") == 70.0
+        assert _plan_monthly_credits("INDIVIDUAL-GOAT") == 70.0
+        assert _plan_monthly_credits("individual_pro_v1") == 80.0
+        assert _plan_monthly_credits("teams-pro") == 40.0
+        assert _plan_monthly_credits("unknown") is None
+        assert _plan_monthly_credits(None) is None
+        assert _plan_monthly_credits(7) is None
+
+
+class TestCommandCodeHttp:
+    def test_fetch_success_hits_both_endpoints(self) -> None:
+        seen: list[dict] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append({
+                "path": req.url.path,
+                "query": req.url.query,
+                "auth": req.headers.get("Authorization"),
+            })
+            if req.url.path == "/alpha/billing/credits":
+                return httpx.Response(200, json=_commandcode_credits_payload())
+            return httpx.Response(200, json=_commandcode_subscription())
+
+        provider = CommandCodeProvider(client=_mock_client(handler))
+        res = provider.fetch({
+            "api_key": "test-key", "display_name": "Command Code",
+            "_platform_key": "commandcode",
+        })
+        assert res.ok
+        assert res.platform == "commandcode"
+        assert res.warning is None
+        assert len(res.entries) == 3
+        assert [s["path"] for s in seen] == [
+            "/alpha/billing/credits", "/alpha/billing/subscriptions",
+        ]
+        # 个人 plan 不带 orgId 查询参数
+        for s in seen:
+            assert s["query"] == b""
+            assert s["auth"] == "Bearer test-key"
+
+    def test_subscription_failure_warns_and_keeps_windows(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/alpha/billing/credits":
+                return httpx.Response(200, json=_commandcode_credits_payload())
+            return httpx.Response(500, json={"error": "boom"})
+
+        provider = CommandCodeProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert res.ok
+        assert len(res.entries) == 2
+        assert res.warning == "订阅信息获取失败，已跳过每月额度"
+
+    def test_all_empty_payload_is_error(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"windowLimits": {"limited": False}})
+
+        provider = CommandCodeProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "响应中未找到用量数据"
+
+    def test_credits_401_neutral_error(self) -> None:
+        marker = "upstream-detail-xyz"
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={
+                "success": False,
+                "error": {"code": "UNAUTHORIZED", "status": 401,
+                          "message": marker},
+            })
+
+        provider = CommandCodeProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "bad-key"})
+        assert not res.ok
+        assert res.error == "认证失败(401)"
+        assert marker not in (res.error or "")
+        assert marker not in (res.warning or "")
+
+    def test_credits_http_error_not_echoed(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": "upstream detail xyz"})
+
+        provider = CommandCodeProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "请求失败(HTTP 500)"
+
+    def test_network_error_sanitized(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("boom")
+
+        provider = CommandCodeProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "网络错误"
+
+    def test_no_key_returns_unconfigured(self) -> None:
+        res = CommandCodeProvider().fetch({})
+        assert not res.ok
+        assert res.error == "未配置"
+
+
+# ---------------------------------------------------------------------------
 # LLM Gateway (local Sub2API-compatible gateway)
 # ---------------------------------------------------------------------------
 
@@ -946,10 +1168,10 @@ class TestGatewayHttp:
 # ---------------------------------------------------------------------------
 
 class TestRegistry:
-    def test_all_seven_providers_registered(self) -> None:
+    def test_all_providers_registered(self) -> None:
         assert set(PROVIDERS.keys()) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "llm-gateway",
         }
 
     def test_env_prefix_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:

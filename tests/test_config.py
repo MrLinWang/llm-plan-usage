@@ -40,6 +40,11 @@ class TestConfigInit:
         C.init_config(p)
         assert p.stat().st_mode & 0o777 == 0o600
 
+    def test_checked_in_example_matches_template(self) -> None:
+        """config.toml.example 是模板的检入副本;改动模板必须同步该文件。"""
+        example = Path(__file__).resolve().parents[1] / "config.toml.example"
+        assert example.read_text(encoding="utf-8") == C.EXAMPLE_CONFIG
+
 
 class TestConfigLoadSave:
     def test_load_missing_returns_empty(self, tmp_path: Path) -> None:

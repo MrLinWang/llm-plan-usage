@@ -72,6 +72,7 @@ CREDENTIAL_FIELDS: dict[str, list[str]] = {
     "ollama": ["api_key"],
     "opencode-go": ["api_key"],
     "clinepass": ["api_key"],
+    "commandcode": ["api_key"],
     "llm-gateway": [],  # 纯组式:凭证以 groups[].api_keys 配置,无顶层凭证字段
 }
 

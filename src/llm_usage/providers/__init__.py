@@ -15,6 +15,7 @@ from llm_usage.config import get_platform_order
 from llm_usage.models import PlatformResult, UsageEntry
 from llm_usage.providers.base import Provider
 from llm_usage.providers.clinepass import ClinePassProvider
+from llm_usage.providers.commandcode import CommandCodeProvider
 from llm_usage.providers.kimi import KimiProvider
 from llm_usage.providers.llm_gateway import LlmGatewayProvider
 from llm_usage.providers.ollama import OllamaProvider
@@ -34,6 +35,7 @@ PROVIDERS: dict[str, Provider] = {
     "ollama": OllamaProvider(),
     "opencode-go": OpenCodeGoProvider(),
     "clinepass": ClinePassProvider(),
+    "commandcode": CommandCodeProvider(),
     "llm-gateway": LlmGatewayProvider(),
 }
 
@@ -111,6 +113,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "ollama": "Ollama Cloud",
     "opencode-go": "OpenCode Go",
     "clinepass": "ClinePass",
+    "commandcode": "Command Code",
     "llm-gateway": "LLM Gateway",
 }
 

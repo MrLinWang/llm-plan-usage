@@ -68,15 +68,18 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | Ollama Cloud | 自动 API | `GET /api/usage`，Bearer |
 | OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer |
 | ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口 |
+| Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 |
 | LLM Gateway（本地 Sub2API 网关） | 自动 API | `GET /v1/usage`，Bearer；显示今日 `actual_cost` USD |
 
-以上 7 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
+以上 8 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
 `kimi#2`），见下方「同类型供应商实例」。
 
 ## 配置
 
 配置文件位于 `./config.toml`（当前目录）。API 密钥支持 `env:VARNAME` 前缀，
-从环境变量读取，避免明文存储在磁盘上。运行 `llm-usage config --init` 生成模板。
+从环境变量读取，避免明文存储在磁盘上。运行 `llm-usage config --init` 生成模板
+（仓库内另附只读参考 `config.toml.example`，内容与模板一致，可直接
+`cp config.toml.example config.toml`）。
 LLM Gateway 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填；
 `usage.today.actual_cost` 是今日自然日实际扣费，`cost` 仅作为旧接口无
 `actual_cost` 时的回退。API keys 以**组**为单位配置：每组共享一个每日额度，
@@ -114,7 +117,7 @@ api_keys = [
 provider 兼容，可手工编辑 `config.toml` 使用；Web 端会把这种配置当作一组展示，
 保存时自动迁移为 `groups` 并置 `use_groups = true`。
 
-### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass）
+### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass / commandcode）
 
 除 LLM Gateway 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
 **不同计费套餐**。每个凭证彼此完全独立——各自 fetch、各自展示、无共享限额、
@@ -124,7 +127,7 @@ provider 兼容，可手工编辑 `config.toml` 使用；Web 端会把这种配�
 `name = "套餐1"`）与旧的顶层单 Key 形态展示完全一致；两个及以上凭证才按
 套餐分区。
 
-Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass 为
+Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass/commandcode 为
 `api_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
 （火山为「添加 AK/SK」）即可增加新套餐；「套餐名」留空时服务端自动命名
 `套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后写回
@@ -244,8 +247,8 @@ PBKDF2-SHA256（60 万次迭代、随机盐）哈希存储，不落明文；站�
 ### 供应商配置
 
 管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证
-（kimi/ollama/opencode-go/clinepass 为 `api_key`；火山两个平台为 `access_key` + `secret_key`；
-llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass
+（kimi/ollama/opencode-go/clinepass/commandcode 为 `api_key`；火山两个平台为 `access_key` + `secret_key`；
+llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode
 以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
 命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
 （火山「添加 AK/SK」）追加新套餐槽。LLM Gateway 以**组**为单位编辑：
@@ -257,9 +260,14 @@ llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollam
 （如 `已设置 (sk-k…ey)`），`env:VARNAME` 引用原样显示；凭证值留空表示保留
 已保存的值，删除整个槽才会移除该凭证。保存立即写回 `./config.toml` 并使服务端
 用量缓存失效（下次刷新生效）：槽式保存写 `credentials` 数组并清除顶层凭证
-字段；LLM Gateway 的分组保存写 `groups` 并置 `use_groups = true`。LLM Gateway
-**一键导入 config.toml**：添加栏旁的「导入 config.toml」按钮可直接上传一个
-TOML 文件（`POST /api/config/import`），**整体替换**当前配置——管理员替换
+字段；LLM Gateway 的分组保存写 `groups` 并置 `use_groups = true`。
+**取消勾选「启用」不会删除该平台的凭证**：只提交 `enabled` 时仅更新开关；网页上点
+「保存」会连同凭证槽/分组一起提交，但槽内留空表示保留既有值，因此凭证值、套餐槽、
+网关分组都原样保存（旧式顶层单 Key 可能迁移为 `credentials` 数组，值不变）。
+之后重新勾选「启用」即可继续使用，无需重新填写。禁用期间该平台不出现在仪表盘上
+（拉取时会跳过），但「供应商配置」页仍能看到并编辑它。
+LLM Gateway **一键导入 config.toml**：添加栏旁的「导入 config.toml」按钮可
+直接上传一个 TOML 文件（`POST /api/config/import`），**整体替换**当前配置——管理员替换
 `./config.toml`，普通用户替换自己在 `history.db` 的 `user_configs`（把本地
 配置同步到在线服务）。适合迁移新机器/新部署时免手工逐平台填写；导入前有
 确认对话框，需保留现有配置时请先自行备份。导入内容与现状相同则不会触发
@@ -273,7 +281,7 @@ TOML 文件（`POST /api/config/import`），**整体替换**当前配置——�
 卡片；新实例默认**停用**，配好凭证后再勾选启用。管理员添加写入
 `./config.toml`（`POST /api/config/providers`），普通用户写入自己的
 `user_configs`（`POST /api/my/providers`）。删除走卡片上的「删除此供应商」
-按钮（确认框），该实例的共享设置一并级联移除；内置的 7 个基础平台不可删除。
+按钮（确认框），该实例的共享设置一并级联移除；内置的 8 个基础平台不可删除。
 实例编号单调递增不复用（删除 `kimi#2` 后再添加得到 `kimi#3`），避免历史快照
 歧义。终端侧无需配置：实例随所在平台的配置自动抓取并显示。
 

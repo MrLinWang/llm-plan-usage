@@ -497,6 +497,117 @@ class TestWebConfig:
         client.get("/api/usage")
         assert calls[0] == 2
 
+    def test_disable_preserves_credentials_and_reenable_works(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """禁用平台只写 enabled,凭证值必须保留;再次启用仍可用(回归)。
+
+        网页「保存」会同时提交 enabled + credential_slots(留空=保留既有值);
+        禁用不得因此丢凭证,否则用户无法事后重新启用。legacy 顶层 api_key 在
+        槽式保存时按其既有约定迁移进 credentials 数组 —— 存储形态可变,
+        凭证值必须不变。
+        """
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+
+        def _credential_value(section: dict) -> str:
+            """Section 里的凭证值(不区分 legacy 顶层 / credentials 数组形态)。"""
+            if isinstance(section.get("api_key"), str):
+                return section["api_key"]
+            slots = section.get("credentials")
+            assert isinstance(slots, list) and slots, section
+            return slots[0]["api_key"]
+
+        before = _credential_value(load_config()["platforms"]["opencode-go"])
+
+        # 模拟前端 payload:取消勾选启用 + 槽内输入留空(保留既有凭证)
+        view = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
+            "opencode-go"
+        ]
+        resp = client.put("/api/config/platforms/opencode-go", json={
+            "enabled": False,
+            "credential_slots": [
+                {"index": slot["index"], "name": None, "api_key": None}
+                for slot in view["credential_slots"]
+            ],
+        })
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
+        section = load_config()["platforms"]["opencode-go"]
+        assert section["enabled"] is False
+        assert _credential_value(section) == before  # 凭证未被禁用动作丢弃
+
+        # 视图仍带凭证(可在界面上重新启用)
+        view_after = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
+            "opencode-go"
+        ]
+        slot = view_after["credential_slots"][0]
+        assert slot["credentials"]["api_key"]["set"] is True
+
+        # 重新启用:凭证值仍不变
+        resp = client.put("/api/config/platforms/opencode-go", json={
+            "enabled": True,
+            "credential_slots": [
+                {"index": s["index"], "name": None, "api_key": None}
+                for s in view_after["credential_slots"]
+            ],
+        })
+        assert resp.status_code == 200
+        reenabled = load_config()["platforms"]["opencode-go"]
+        assert reenabled["enabled"] is True
+        assert _credential_value(reenabled) == before
+
+    def test_disable_with_only_enabled_field_keeps_credentials(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """只发 {"enabled": false} 时,section 内其它字段一字不改(含凭证)。"""
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        section = load_config()["platforms"]["opencode-go"]
+        before = {k: v for k, v in section.items() if k != "enabled"}
+
+        resp = client.put("/api/config/platforms/opencode-go",
+                          json={"enabled": False})
+        assert resp.status_code == 200
+        after = load_config()["platforms"]["opencode-go"]
+        assert after["enabled"] is False
+        assert {k: v for k, v in after.items() if k != "enabled"} == before
+
+    def test_disable_keeps_multi_slot_credentials_array(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """已是 credentials 数组(多套餐)时,禁用不会改写/丢弃该数组。"""
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        client.put("/api/config/platforms/opencode-go", json={
+            "credential_slots": [
+                {"index": None, "name": "套餐A", "api_key": "sk-a-11111111"},
+                {"index": None, "name": "套餐B", "api_key": "sk-b-22222222"},
+            ],
+        })
+        before = load_config()["platforms"]["opencode-go"]["credentials"]
+        assert [s["name"] for s in before] == ["套餐A", "套餐B"]
+
+        view = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
+            "opencode-go"
+        ]
+        resp = client.put("/api/config/platforms/opencode-go", json={
+            "enabled": False,
+            "visibility": {"type": "private", "targets": []},
+            "credential_slots": [
+                {"index": s["index"], "name": None, "api_key": None}
+                for s in view["credential_slots"]
+            ],
+        })
+        assert resp.status_code == 200
+        after = load_config()["platforms"]["opencode-go"]
+        assert after["enabled"] is False
+        assert after["credentials"] == before           # 数组原样保留
+        assert resp.json()["credential_slots"][:2]      # 视图仍可编辑
+
     def test_put_gateway_groups_persist_and_view(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
         tmp_config_path: Path,
@@ -936,7 +1047,7 @@ class TestWebConfig:
         assert calls[0] == 1
         new_order = [
             "opencode-go", "ollama", "volcengine-agent", "volcengine-coding", "kimi",
-            "clinepass", "llm-gateway",
+            "clinepass", "commandcode", "llm-gateway",
         ]
         resp = client.put("/api/config/order", json={"order": new_order})
         assert resp.status_code == 200
@@ -963,7 +1074,7 @@ class TestWebConfig:
         assert resp.status_code == 200
         assert resp.json()["order"] == [
             "ollama", "kimi", "volcengine-coding", "volcengine-agent", "opencode-go",
-            "clinepass", "llm-gateway",
+            "clinepass", "commandcode", "llm-gateway",
         ]
 
 class TestConfigImport:
@@ -1411,7 +1522,7 @@ class TestUserIsolation:
         admin_names = [p["name"] for p in client.get("/api/usage").json()["platforms"]]
         assert set(admin_names) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "llm-gateway",
         }
         assert calls[0] == 2  # alice 空配置 + admin 配置,各自缓存条目
 
@@ -1782,7 +1893,7 @@ class TestUserIsolation:
         keys = [p["key"] for p in data["platforms"]]
         assert keys == [
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "llm-gateway",
         ]
         for p in data["platforms"]:
             assert p["visibility"] == {"type": "private", "targets": []}
@@ -1794,7 +1905,8 @@ class TestUserIsolation:
                 assert p["base_url"] is None
                 assert p["groups"] == []  # 无凭证/无 legacy 单 key → 空组列表
             elif p["key"] in ("kimi", "volcengine-coding", "volcengine-agent",
-                              "ollama", "opencode-go", "clinepass"):
+                              "ollama", "opencode-go", "clinepass",
+                              "commandcode"):
                 assert set(p) == {
                     "key", "type", "display_name", "enabled", "visibility",
                     "credential_slots",
@@ -1816,6 +1928,41 @@ class TestUserIsolation:
         }
         raw = alice.get("/api/my/platforms").text
         assert "sk-alice-secret" not in raw
+
+    def test_my_disable_preserves_credentials(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """普通用户侧同样:禁用只写 enabled,自己 user_configs 里的凭证保留可复用。"""
+        init_config(tmp_config_path)
+        client, _ = self._config_client(monkeypatch, load_config())
+        alice = self._register(client, "alice")
+        assert alice.put("/api/my/platforms/opencode-go", json={
+            "enabled": True,
+            "credential_slots": [
+                {"index": None, "name": None, "api_key": "sk-alice-oc-123456"},
+            ],
+        }).status_code == 200
+        before = store.get_user_config("alice")["platforms"]["opencode-go"]
+        assert before["credentials"][0]["api_key"] == "sk-alice-oc-123456"
+
+        view = next(p for p in alice.get("/api/my/platforms").json()["platforms"]
+                    if p["key"] == "opencode-go")
+        resp = alice.put("/api/my/platforms/opencode-go", json={
+            "enabled": False,
+            "visibility": {"type": "private", "targets": []},
+            "credential_slots": [
+                {"index": s["index"], "name": None, "api_key": None}
+                for s in view["credential_slots"]
+            ],
+        })
+        assert resp.status_code == 200
+        after = store.get_user_config("alice")["platforms"]["opencode-go"]
+        assert after["enabled"] is False
+        assert after["credentials"] == before["credentials"]  # 凭证原样保留
+        view_after = next(p for p in alice.get("/api/my/platforms").json()["platforms"]
+                          if p["key"] == "opencode-go")
+        assert view_after["credential_slots"][0]["credentials"]["api_key"]["set"] is True
 
     def test_admin_cannot_use_my_api(self, monkeypatch: pytest.MonkeyPatch,
                                      tmp_db_path: Path,
@@ -2361,7 +2508,7 @@ class TestProviderInstances:
         client = self._client(monkeypatch, tmp_config_path)
         client.post("/api/config/providers", json={"type": "kimi"})
         order = ["kimi#2", "kimi", "volcengine-coding", "volcengine-agent",
-                 "ollama", "opencode-go", "clinepass", "llm-gateway"]
+                 "ollama", "opencode-go", "clinepass", "commandcode", "llm-gateway"]
         resp = client.put("/api/config/order", json={"order": order})
         assert resp.status_code == 200
         assert resp.json()["order"] == order  # 实例键不被过滤

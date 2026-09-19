@@ -11,6 +11,7 @@ All live providers are exercised with ``httpx.MockTransport`` (no network):
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -1567,3 +1568,305 @@ class TestFetchAllInstances:
         # 现存键只会进一步抬高,不会低于计数器
         assert next_instance_key({"kimi#2": {}}, "kimi", {"kimi": 5}) == "kimi#6"
         assert next_instance_key({}, "ollama", {}) == "ollama#2"
+
+
+# ---------------------------------------------------------------------------
+# 自动重试(max_retries,仅瞬时故障)
+# ---------------------------------------------------------------------------
+
+class _FlakyProvider:
+    """前 ``failures`` 次返回指定错误,之后返回成功用量。"""
+
+    name = "stub"
+    display_name = "Stub"
+    is_manual = False
+
+    def __init__(self, failures: int, error: str) -> None:
+        self.remaining = failures
+        self.error = error
+        self.calls = 0
+
+    def fetch(self, cfg: dict) -> PlatformResult:
+        self.calls += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            return PlatformResult(
+                cfg.get("_platform_key", "stub"),
+                cfg.get("display_name", "Stub"),
+                error=self.error,
+            )
+        return PlatformResult(
+            cfg.get("_platform_key", "stub"),
+            cfg.get("display_name", "Stub"),
+            entries=[UsageEntry("stub", "5小时", 1, 2, 1, 50.0,
+                                "2099-01-01T00:00:00Z", "%", False)],
+        )
+
+
+def _fetch_with(monkeypatch: pytest.MonkeyPatch, provider: Any,
+                platform: str = "kimi", **config: Any) -> list[PlatformResult]:
+    monkeypatch.setitem(PROVIDERS, platform, provider)
+    cfg: dict[str, Any] = {"platforms": {platform: {"enabled": True}}}
+    cfg.update(config)
+    return fetch_all(cfg)
+
+
+class TestFetchAllRetry:
+    def test_transient_failure_retries_until_success(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """网络错误 → 自动重试(默认 3 次预算内第 2 次成功)。"""
+        provider = _FlakyProvider(failures=1, error="网络错误")
+        results = _fetch_with(monkeypatch, provider)
+        assert provider.calls == 2
+        assert results[0].ok
+        assert len(results[0].entries) == 1
+        assert results[0].warning is None
+
+    def test_default_budget_means_three_extra_retries(
+        self, monkeypatch: pytest.MonkeyPatch, _no_retry_sleep: list[float],
+    ) -> None:
+        """max_retries=3 = 额外 3 次重试 → 最多 4 次请求、恰好 3 次退避等待。"""
+        provider = _FlakyProvider(failures=99, error="网络错误")
+        results = _fetch_with(monkeypatch, provider)
+        assert provider.calls == 1 + 3 == 4
+        assert len(_no_retry_sleep) == 3
+        assert not results[0].ok
+        assert results[0].error == "网络错误"  # 最后一次的错误原样保留
+
+    def test_warning_only_partial_result_is_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch, _no_retry_sleep: list[float],
+    ) -> None:
+        """带 warning 的部分成功(error is None)→ 不重试、不 sleep。
+
+        注:fetch_all 合并阶段不转发 provider 级 warning(既有行为,与本次重试
+        功能无关),因此这里只钉重试契约:成功结果一律不重试。
+        """
+
+        class _PartialProvider:
+            name = "llm-gateway"
+            display_name = "LLM Gateway"
+            is_manual = False
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fetch(self, cfg: dict) -> PlatformResult:
+                self.calls += 1
+                return PlatformResult(
+                    cfg.get("_platform_key", "llm-gateway"),
+                    cfg.get("display_name", "LLM Gateway"),
+                    entries=[UsageEntry("llm-gateway", "组1", 1.0, 10.0, 9.0,
+                                        10.0, None, "$", False)],
+                    warning="组1 key#2：网络错误",
+                )
+
+        provider = _PartialProvider()
+        monkeypatch.setitem(PROVIDERS, "llm-gateway", provider)
+        cfg = {"platforms": {"llm-gateway": {"enabled": True}}}
+        results = fetch_all(cfg)
+        assert provider.calls == 1
+        assert results[0].ok
+        assert len(results[0].entries) == 1
+        assert _no_retry_sleep == []
+
+    def test_retry_budget_configurable(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _FlakyProvider(failures=99, error="内部错误")
+        results = _fetch_with(monkeypatch, provider, max_retries=1)
+        assert provider.calls == 2
+        assert not results[0].ok
+
+    def test_zero_retries_disables_retry(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _FlakyProvider(failures=99, error="网络错误")
+        _fetch_with(monkeypatch, provider, max_retries=0)
+        assert provider.calls == 1
+
+    def test_invalid_max_retries_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for bad in ("3", True, -1, 2.5, None):
+            provider = _FlakyProvider(failures=99, error="网络错误")
+            _fetch_with(monkeypatch, provider, max_retries=bad)
+            assert provider.calls == 4, f"max_retries={bad!r}"
+
+    def test_oversized_max_retries_clamped(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _FlakyProvider(failures=99, error="网络错误")
+        _fetch_with(monkeypatch, provider, max_retries=999)
+        assert provider.calls == 11  # 1 + MAX_RETRIES_CAP(10)
+
+    def test_permanent_failures_are_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """未配置/认证失败/404/配置错误/无订阅 → 只尝试一次。"""
+        for error in (
+            "未配置",
+            "未配置（需要 AK/SK）",
+            "未配置 API key",
+            "未配置 base_url",
+            "认证失败(401)",
+            "认证失败(401)：请检查 API key",
+            "端点未找到(404)：请检查 base_url 配置是否正确。",
+            "配置错误：usage_path 必须以 / 开头",
+            "HTTP 403",
+            "无订阅或未找到用量数据",
+            "请求失败(HTTP 404)",
+        ):
+            provider = _FlakyProvider(failures=99, error=error)
+            results = _fetch_with(monkeypatch, provider)
+            assert provider.calls == 1, f"should not retry: {error}"
+            assert not results[0].ok
+
+    def test_http_statuses_decide_retry_for_5xx_and_429(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HTTP 500/503/408/429 重试;其余 4xx 不重试。"""
+        for error, expected in (
+            ("请求失败(HTTP 500)", 4),
+            ("请求失败(HTTP 503)", 4),
+            ("HTTP 500", 4),
+            ("请求失败(HTTP 429)", 4),
+            ("请求失败(HTTP 408)", 4),
+            ("请求失败(HTTP 400)", 1),
+            ("HTTP 403", 1),
+            ("认证失败(401)", 1),
+        ):
+            provider = _FlakyProvider(failures=99, error=error)
+            _fetch_with(monkeypatch, provider)
+            assert provider.calls == expected, f"{error} → {provider.calls}"
+
+    def test_parse_failures_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """响应解析失败(瞬时)重试。"""
+        for error in ("响应中未找到用量数据", "响应不是有效 JSON"):
+            provider = _FlakyProvider(failures=99, error=error)
+            _fetch_with(monkeypatch, provider)
+            assert provider.calls == 4, error
+
+    def test_crash_is_retried_then_sanitized(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """provider 抛异常 → 「内部错误」且重试;最终错误文案不泄露异常串。"""
+
+        class _BoomProvider:
+            name = "kimi"
+            display_name = "Kimi Code"
+            is_manual = False
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fetch(self, config: dict) -> PlatformResult:
+                self.calls += 1
+                raise RuntimeError("boom secret detail")
+
+        provider = _BoomProvider()
+        results = _fetch_with(monkeypatch, provider)
+        assert provider.calls == 4
+        assert results[0].error == "内部错误"
+
+    def test_backoff_is_exponential_and_capped(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """退避 0.5s→1s→2s,上限 5s。"""
+        from llm_usage.providers import _retry_backoff
+
+        assert [_retry_backoff(i) for i in range(5)] == [0.5, 1.0, 2.0, 4.0, 5.0]
+
+    def test_retry_sleeps_between_attempts(
+        self, monkeypatch: pytest.MonkeyPatch, _no_retry_sleep: list[float],
+    ) -> None:
+        provider = _FlakyProvider(failures=99, error="网络错误")
+        _fetch_with(monkeypatch, provider)
+        assert _no_retry_sleep == [0.5, 1.0, 2.0]
+
+    def test_retry_is_per_credential_task(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """多凭证:失败凭证独立重试,成功凭证不受影响(各 1 次)。"""
+
+        class _OneBadCredential:
+            name = "kimi"
+            display_name = "Kimi Code"
+            is_manual = False
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def fetch(self, cfg: dict) -> PlatformResult:
+                key = cfg.get("api_key")
+                self.calls.append(key)
+                if key == "bad":
+                    return PlatformResult(
+                        "kimi", "Kimi Code", error="网络错误"
+                    )
+                return PlatformResult(
+                    "kimi", "Kimi Code",
+                    entries=[UsageEntry("kimi", "5小时", 1, 2, 1, 50.0,
+                                        "2099-01-01T00:00:00Z", "%", False)],
+                )
+
+        provider = _OneBadCredential()
+        monkeypatch.setitem(PROVIDERS, "kimi", provider)
+        cfg = {
+            "platforms": {
+                "kimi": {
+                    "enabled": True,
+                    "credentials": [
+                        {"name": "套餐A", "api_key": "good"},
+                        {"name": "套餐B", "api_key": "bad"},
+                    ],
+                }
+            }
+        }
+        results = fetch_all(cfg)
+        assert provider.calls.count("bad") == 4
+        assert provider.calls.count("good") == 1
+        assert results[0].ok
+        assert "套餐B" in (results[0].warning or "")
+
+    def test_successful_fetch_does_not_sleep(
+        self, monkeypatch: pytest.MonkeyPatch, _no_retry_sleep: list[float],
+    ) -> None:
+        provider = _FlakyProvider(failures=0, error="网络错误")
+        results = _fetch_with(monkeypatch, provider)
+        assert provider.calls == 1
+        assert results[0].ok
+        assert _no_retry_sleep == []
+
+    def test_resolve_max_retries_defaults_and_bounds(self) -> None:
+        from llm_usage.providers import (
+            DEFAULT_MAX_RETRIES,
+            MAX_RETRIES_CAP,
+            resolve_max_retries,
+        )
+
+        assert resolve_max_retries({}) == DEFAULT_MAX_RETRIES == 3
+        assert resolve_max_retries({"max_retries": 0}) == 0
+        assert resolve_max_retries({"max_retries": 7}) == 7
+        assert resolve_max_retries({"max_retries": MAX_RETRIES_CAP + 5}) == MAX_RETRIES_CAP
+        assert resolve_max_retries({"max_retries": "5"}) == 3
+        assert resolve_max_retries({"max_retries": True}) == 3
+
+    def test_is_retryable_matrix(self) -> None:
+        from llm_usage.providers import is_retryable
+
+        assert is_retryable("网络错误")
+        assert is_retryable("内部错误")
+        assert is_retryable("请求失败(HTTP 502)")
+        assert is_retryable("HTTP 500")
+        assert is_retryable("请求失败(HTTP 429)")
+        assert is_retryable("响应中未找到用量数据")
+        assert is_retryable("InternalError")
+        assert not is_retryable(None)
+        assert not is_retryable("")
+        assert not is_retryable("未配置")
+        assert not is_retryable("认证失败(401)")
+        assert not is_retryable("端点未找到(404)：请检查 base_url 配置是否正确。")
+        assert not is_retryable("配置错误：a 与 b 重复")
+        assert not is_retryable("无订阅或未找到用量数据")
+        assert not is_retryable("HTTP 403")

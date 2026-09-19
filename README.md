@@ -80,6 +80,28 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 从环境变量读取，避免明文存储在磁盘上。运行 `llm-usage config --init` 生成模板
 （仓库内另附只读参考 `config.toml.example`，内容与模板一致，可直接
 `cp config.toml.example config.toml`）。
+
+### 自动重试
+
+单个供应商拉取失败时会自动重试**瞬时故障**：网络错误/超时、HTTP 408/429/5xx、
+响应解析失败、provider 内部异常。重试按平台（多凭证时按每个凭证独立）进行，
+采用指数退避 0.5s → 1s → 2s（单次上限 5s），不影响其他平台的并发拉取。
+认证失败(401)、未配置、404、配置错误、无订阅等**永久错误不重试**（重试结果
+必然相同，只会浪费请求）。
+
+次数由顶层键 `max_retries` 配置，默认 3 = 首次失败后**额外**重试 3 次（最多 4 次
+请求、3 次退避等待）；`0` 关闭重试。非法的负值/非整数回落默认值，超过 10 截断为 10。
+带提示（warning）的部分成功结果不重试：网关某分组部分 Key 失败时已有成功用量，
+重试只会重复请求。
+
+```toml
+max_retries = 3
+```
+
+`show`/`tui`/`web` 共用同一重试逻辑（Web 的 TTL 缓存内生效）。
+
+### LLM Gateway（本地 Sub2API 网关）
+
 LLM Gateway 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填；
 `usage.today.actual_cost` 是今日自然日实际扣费，`cost` 仅作为旧接口无
 `actual_cost` 时的回退。API keys 以**组**为单位配置：每组共享一个每日额度，

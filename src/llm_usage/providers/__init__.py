@@ -2,13 +2,18 @@
 
 A single platform failure never breaks the others: each provider's ``fetch``
 is run in a thread and any exception is caught into ``PlatformResult.error``.
+Transient failures (network/timeout, HTTP 408/429/5xx, parse failures, internal
+errors) are retried with exponential backoff; permanent failures (auth,
+unconfigured, 404, config errors, no subscription) are not — see ``fetch_all``.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
+from time import sleep as _sleep
 from typing import Any
 
 from llm_usage.config import get_platform_order
@@ -23,6 +28,32 @@ from llm_usage.providers.opencode_go import OpenCodeGoProvider
 from llm_usage.providers.volcengine import VolcengineProvider
 
 logger = logging.getLogger(__name__)
+
+# 自动重试:仅瞬时故障(网络/超时、HTTP 408/429/5xx、解析失败、内部异常)。
+# 次数由 config.toml 顶层 max_retries 配置(默认 3,0 = 关闭)。
+# 语义 = 首次失败后的**额外**尝试次数:3 → 最多 4 次请求、3 次退避等待。
+DEFAULT_MAX_RETRIES = 3
+MAX_RETRIES_CAP = 10
+RETRY_BACKOFF_BASE = 0.5
+RETRY_BACKOFF_CAP = 5.0
+
+# 瞬时错误文案标记:provider 层的中文脱敏文案,以及火山 OpenAPI 的瞬时错误码
+# (provider 直接回显 ResponseMetadata.Error.Code)。
+_RETRYABLE_MARKERS = (
+    "网络错误",
+    "内部错误",
+    "响应中未找到用量数据",
+    "响应不是有效 JSON",
+    "InternalError",
+    "ServiceUnavailable",
+    "Throttling",
+)
+
+# HTTP 状态码出现在文案里时(如「请求失败(HTTP 503)」「HTTP 500」)单独判定。
+_HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})")
+
+# 退避等待使用模块级别名 _sleep(见文件头部 import;不是全局 time.sleep),
+# 便于测试注入,避免污染其他模块的 time 行为。
 
 
 # Registry: platform key -> provider instance.
@@ -176,6 +207,44 @@ def _credential_specs(prepared: dict[str, Any]) -> list[tuple[dict[str, Any], st
     return specs
 
 
+def resolve_max_retries(config: dict[str, Any]) -> int:
+    """Retry budget from the top-level ``max_retries`` config key.
+
+    The value counts **extra attempts after the first failure**: the default
+    ``3`` means up to 4 total attempts (and 3 backoff sleeps).  ``0`` disables
+    retries.  Values that are not non-negative ints (including TOML booleans)
+    fall back to the default; oversized values clamp to :data:`MAX_RETRIES_CAP`.
+    """
+    value = config.get("max_retries")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return DEFAULT_MAX_RETRIES
+    return min(value, MAX_RETRIES_CAP)
+
+
+def is_retryable(error: str | None) -> bool:
+    """Whether a failed fetch is worth another attempt.
+
+    Retries only transient failures: network/timeout, HTTP 408/429/5xx, and
+    unusable responses (parse failures, missing usage data, provider crashes).
+    Permanent failures — 未配置 / 认证失败 / 配置错误 / 404 / 无订阅 — are
+    matched by nothing here and therefore never retried.
+    """
+    if not error:
+        return False
+    if any(marker in error for marker in _RETRYABLE_MARKERS):
+        return True
+    for status in _HTTP_STATUS_RE.findall(error):
+        code = int(status)
+        if code in (408, 429) or code >= 500:
+            return True
+    return False
+
+
+def _retry_backoff(attempt: int) -> float:
+    """Exponential backoff for retry ``attempt`` (0-based): 0.5s, 1s, 2s, … capped."""
+    return min(RETRY_BACKOFF_BASE * (2 ** attempt), RETRY_BACKOFF_CAP)
+
+
 def fetch_all(
     config: dict[str, Any],
     enabled_only: bool = True,
@@ -185,12 +254,15 @@ def fetch_all(
 
     Each provider runs in its own thread.  Any exception is caught and turned
     into a ``PlatformResult`` with an ``error`` so partial results still render.
-    Platforms configured with a ``credentials`` list fan out into one
-    independent fetch per credential (each = one billing plan); results are
-    merged back into a single ``PlatformResult`` per platform with every entry
-    tagged by its plan name.  Instance sections (``<base>#N``) dispatch to
-    their base provider and keep the instance key as ``PlatformResult.platform``;
-    results sort by base type so each instance renders right after it.
+    Transient failures are retried per task (platform × credential) up to the
+    top-level ``max_retries`` budget with exponential backoff; permanent
+    failures surface immediately.  Platforms configured with a ``credentials``
+    list fan out into one independent fetch per credential (each = one billing
+    plan); results are merged back into a single ``PlatformResult`` per platform
+    with every entry tagged by its plan name.  Instance sections (``<base>#N``)
+    dispatch to their base provider and keep the instance key as
+    ``PlatformResult.platform``; results sort by base type so each instance
+    renders right after it.
     """
     platforms_cfg: dict[str, Any] = config.get("platforms", {})
     tasks: list[tuple[str, Provider, dict[str, Any], str | None]] = []
@@ -210,20 +282,32 @@ def fetch_all(
     if not tasks:
         return results
 
+    retries = resolve_max_retries(config)
+
     def _run(p: Provider, cfg: dict[str, Any]) -> PlatformResult:
-        try:
-            res = p.fetch(cfg)
-            if res.platform and res.platform != cfg.get("_platform_key"):
-                # keep the canonical platform key
-                res.platform = cfg["_platform_key"]
-            return res
-        except Exception:  # noqa: BLE001 — isolate single-platform failure
-            logger.exception("provider %s crashed", cfg.get("_platform_key"))
-            return PlatformResult(
-                cfg["_platform_key"],
-                cfg.get("display_name", cfg["_platform_key"]),
-                error="内部错误",
+        attempt = 0
+        while True:
+            try:
+                res = p.fetch(cfg)
+                if res.platform and res.platform != cfg.get("_platform_key"):
+                    # keep the canonical platform key
+                    res.platform = cfg["_platform_key"]
+            except Exception:  # noqa: BLE001 — isolate single-platform failure
+                logger.exception("provider %s crashed", cfg.get("_platform_key"))
+                res = PlatformResult(
+                    cfg["_platform_key"],
+                    cfg.get("display_name", cfg["_platform_key"]),
+                    error="内部错误",
+                )
+            # 成功/永久失败/重试预算用尽 → 直接返回;只有瞬时故障继续重试
+            if res.ok or attempt >= retries or not is_retryable(res.error):
+                return res
+            logger.warning(
+                "provider %s fetch failed (%s); retry %d/%d",
+                cfg.get("_platform_key"), res.error, attempt + 1, retries,
             )
+            _sleep(_retry_backoff(attempt))
+            attempt += 1
 
     # 提交顺序 = 配置顺序(platform_order 之前);合并时按提交顺序累积,
     # 与现有“结果按注册表/平台顺序重排”的展示语义一致。

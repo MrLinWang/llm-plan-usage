@@ -39,3 +39,15 @@ def _fast_pbkdf2(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试用低迭代数:hash_password 读模块全局,
     verify_password 从存储串解析迭代数 → 双路径均生效。"""
     monkeypatch.setattr("llm_usage.store.PBKDF2_ITERATIONS", 1_000)
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """消除重试退避的真实等待;返回记录到的退避秒数供测试断言。
+
+    patch 模块级别名 ``llm_usage.providers._sleep``(from time import sleep as _sleep,
+    而非 patch 全局 time.sleep),避免污染其他模块的 time 行为。
+    """
+    slept: list[float] = []
+    monkeypatch.setattr("llm_usage.providers._sleep", slept.append)
+    return slept

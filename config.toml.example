@@ -9,6 +9,12 @@
 #     "opencode-go", "clinepass", "commandcode", "llm-gateway",
 # ]
 
+# 自动重试:可选,默认 3(首次失败后额外重试 3 次 = 最多 4 次请求)。
+# 瞬时故障(网络/超时、HTTP 408/429/5xx、响应解析失败、provider 内部异常)自动重试,
+# 指数退避 0.5s→1s→2s,单次上限 5s;认证失败/未配置/404 等永久错误不重试。
+# 0 = 关闭重试。
+# max_retries = 3
+
 [platforms.kimi]
 enabled = true
 api_key = "env:KIMI_API_KEY"            # or "sk-kimi-xxx"

@@ -65,7 +65,7 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | Kimi Code (Moonshot Coding Plan) | 自动 API | `GET /coding/v1/usages`，Bearer |
 | 火山方舟 Coding Plan | 自动 API | Volcengine OpenAPI `GetCodingPlanUsage`，AK/SK + V4 签名 |
 | 火山方舟 Agent Plan | 自动 API | Volcengine OpenAPI `GetAFPUsage`，AK/SK + V4 签名 |
-| Ollama Cloud | 自动 API | `GET /api/usage`，Bearer |
+| Ollama Cloud | 自动 API | `GET /api/balance`，Bearer；legacy 计划 5小时/每周 百分比窗口，credits 计划每月 `$` 额度池 |
 | OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer |
 | ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口 |
 | Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 |
@@ -80,6 +80,28 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 从环境变量读取，避免明文存储在磁盘上。运行 `llm-usage config --init` 生成模板
 （仓库内另附只读参考 `config.toml.example`，内容与模板一致，可直接
 `cp config.toml.example config.toml`）。
+
+### 自动重试
+
+单个供应商拉取失败时会自动重试**瞬时故障**：网络错误/超时、HTTP 408/429/5xx、
+响应解析失败、provider 内部异常。重试按平台（多凭证时按每个凭证独立）进行，
+采用指数退避 0.5s → 1s → 2s（单次上限 5s），不影响其他平台的并发拉取。
+认证失败(401)、未配置、404、配置错误、无订阅等**永久错误不重试**（重试结果
+必然相同，只会浪费请求）。
+
+次数由顶层键 `max_retries` 配置，默认 3 = 首次失败后**额外**重试 3 次（最多 4 次
+请求、3 次退避等待）；`0` 关闭重试。非法的负值/非整数回落默认值，超过 10 截断为 10。
+带提示（warning）的部分成功结果不重试：网关某分组部分 Key 失败时已有成功用量，
+重试只会重复请求。
+
+```toml
+max_retries = 3
+```
+
+`show`/`tui`/`web` 共用同一重试逻辑（Web 的 TTL 缓存内生效）。
+
+### LLM Gateway（本地 Sub2API 网关）
+
 LLM Gateway 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填；
 `usage.today.actual_cost` 是今日自然日实际扣费，`cost` 仅作为旧接口无
 `actual_cost` 时的回退。API keys 以**组**为单位配置：每组共享一个每日额度，
@@ -153,6 +175,24 @@ api_key = "sk-kimi-xxx"
 带 `plan` 字段。同一平台的部分凭证失败时该平台整体仍显示成功部分并附提示
 （不写历史快照）；全部失败才显示错误。没有 `credentials` 数组的旧配置
 （顶层单凭证）行为完全不变。
+
+## 运行日志
+
+所有命令（`show` / `tui` / `web` / `config` / `history`）都会把运行日志统一写入
+配置文件同目录下的 `log/` 文件夹（即 `./log/llm-usage.log`，仓库内已
+`.gitignore`；轮转：单文件 1MB，保留 3 个备份 `llm-usage.log.1`~`.3`），
+同时仍输出到 stderr——`show --json` 的 stdout 不受影响。日志含供应商拉取失败
+与自动重试、Web 启动/访问/错误、登录限流锁定等服务端细节（面向用户的错误文案
+仍是脱敏的通用文案，详见「安全说明」）；httpx 每次成功请求的 INFO 行已静音
+（压到 WARNING），避免刷屏与快速写满文件。可用环境变量 `LLM_USAGE_LOG`
+覆盖日志路径：
+
+```bash
+LLM_USAGE_LOG=/var/log/llm-usage.log llm-usage web
+```
+
+Docker 镜像中配置文件在 `/data/config.toml`，日志因此默认写到
+`/data/log/llm-usage.log`（随 `/data` 卷持久化，容器重建不丢），无需额外环境变量。
 
 ## 安全说明
 

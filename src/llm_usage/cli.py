@@ -12,6 +12,7 @@ from rich.syntax import Syntax
 
 from llm_usage import config as config_mod
 from llm_usage.display import render_history, render_key_breakdown, render_results, results_to_json
+from llm_usage.logging_setup import setup_cli_logging, setup_web_logging
 from llm_usage.providers import fetch_all
 from llm_usage.store import query_history, save_snapshot
 from llm_usage.tui import run_tui
@@ -61,6 +62,7 @@ def main() -> None:
               help="Also show per-key usage detail for multi-key groups (e.g. llm-gateway).")
 def show(as_json: bool, plain: bool, no_save: bool, show_keys: bool) -> None:
     """Fetch all platforms and display current usage."""
+    setup_cli_logging()
     cfg = _load()
     if not cfg.get("platforms"):
         console.print("[yellow]未配置任何平台。运行 `llm-usage config --init` 生成模板。[/yellow]")
@@ -88,6 +90,7 @@ def show(as_json: bool, plain: bool, no_save: bool, show_keys: bool) -> None:
               help="Refresh interval in seconds (default 60).")
 def tui(interval: float) -> None:
     """Interactive live-refreshing dashboard (q 退出, r 刷新, +/- 调间隔)."""
+    setup_cli_logging()
     cfg = _load()
     if not cfg.get("platforms"):
         console.print("[yellow]未配置任何平台。运行 `llm-usage config --init` 生成模板。[/yellow]")
@@ -118,12 +121,15 @@ def web(host: str, port: int, interval: float) -> None:
         sys.exit(2)
     from llm_usage.web import create_app
 
-    # 让 provider 崩溃等失败边界日志可见(正常路径无 INFO 噪音)
-    logging.basicConfig(level=logging.INFO)
-    # uvicorn.run 内部 dictConfig 会重置 logger 级别,但不会动 logger 上的
-    # Filter:用过滤器屏蔽 Upgrade 探测噪音(ERROR 与访问日志仍可见)
+    # provider 崩溃等失败边界日志可见,且与 CLI 同写一个日志文件;
+    # log_config=None 阻止 uvicorn 用自带 dictConfig 顶掉这条配置
+    setup_web_logging()
+    # uvicorn 收到 Connection: Upgrade 探测时打两条 WS 噪音 WARNING,
+    # 应用无 WS 路由:用过滤器屏蔽(ERROR 与访问日志仍可见)
     logging.getLogger("uvicorn.error").addFilter(_UvicornUpgradeNoiseFilter())
-    uvicorn.run(create_app(cfg, interval=interval), host=host, port=port)
+    uvicorn.run(
+        create_app(cfg, interval=interval), host=host, port=port, log_config=None
+    )
 
 
 # --- config -----------------------------------------------------------------
@@ -133,6 +139,7 @@ def web(host: str, port: int, interval: float) -> None:
 @click.option("--force", is_flag=True, help="Overwrite an existing config with --init.")
 def config(do_init: bool, force: bool) -> None:
     """Print config path and contents, or generate a template."""
+    setup_cli_logging()
     path = config_mod.config_path()
     if do_init:
         try:
@@ -157,6 +164,7 @@ def config(do_init: bool, force: bool) -> None:
 @click.option("--days", type=int, default=None, help="Lookback window in days.")
 def history(platform: str | None, days: int | None) -> None:
     """Show usage history snapshots."""
+    setup_cli_logging()
     rows = query_history(platform=platform, days=days)
     render_history(rows, console=console)
 

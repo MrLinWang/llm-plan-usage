@@ -176,6 +176,24 @@ api_key = "sk-kimi-xxx"
 （不写历史快照）；全部失败才显示错误。没有 `credentials` 数组的旧配置
 （顶层单凭证）行为完全不变。
 
+## 运行日志
+
+所有命令（`show` / `tui` / `web` / `config` / `history`）都会把运行日志统一写入
+配置文件同目录下的 `log/` 文件夹（即 `./log/llm-usage.log`，仓库内已
+`.gitignore`；轮转：单文件 1MB，保留 3 个备份 `llm-usage.log.1`~`.3`），
+同时仍输出到 stderr——`show --json` 的 stdout 不受影响。日志含供应商拉取失败
+与自动重试、Web 启动/访问/错误、登录限流锁定等服务端细节（面向用户的错误文案
+仍是脱敏的通用文案，详见「安全说明」）；httpx 每次成功请求的 INFO 行已静音
+（压到 WARNING），避免刷屏与快速写满文件。可用环境变量 `LLM_USAGE_LOG`
+覆盖日志路径：
+
+```bash
+LLM_USAGE_LOG=/var/log/llm-usage.log llm-usage web
+```
+
+Docker 镜像中配置文件在 `/data/config.toml`，日志因此默认写到
+`/data/log/llm-usage.log`（随 `/data` 卷持久化，容器重建不丢），无需额外环境变量。
+
 ## 安全说明
 
 - **文件权限**：`config.toml` 与 `history.db` 以 `0600` 创建（含明文 API 密钥、

@@ -3,7 +3,8 @@
 All live providers are exercised with ``httpx.MockTransport`` (no network):
   - Kimi: ``used = limit - remaining`` conversion, ms resetTime, 404 fallback
   - Volcengine: OpenAPI V4 signing, GetCodingPlanUsage (percent-only) + GetAFPUsage
-  - Ollama / OpenCode Go / ClinePass / Command Code: window parsing + neutral errors
+  - Ollama: dual-shape /api/balance parsing (legacy windows + credits pool)
+  - OpenCode Go / ClinePass / Command Code: window parsing + neutral errors
   - LLM Gateway: ``actual_cost`` extraction, groups, sanitized per-key errors
   - Registry: dispatch, credential fan-out, instance keys, error isolation
 """
@@ -391,28 +392,37 @@ class TestVolcengineHttp:
 # Ollama Cloud (live API)
 # ---------------------------------------------------------------------------
 
-def _ollama_usage_payload() -> dict:
-    """Ollama /api/usage response: usage is 0-1 float."""
+def _ollama_balance_payload_legacy() -> dict:
+    """Ollama /api/balance response for legacy plans (session/weekly limits)."""
     return {
-        "activity": {
-            "cost": "0.00000",
-            "period": {"type": "last_4_weeks",
-                        "starting_at": "2026-07-27T00:00:00Z",
-                        "ending_at": "2026-08-19T01:44:00Z"},
-            "models": [],
+        "included": {
+            "session": {"remaining_percent": 66.7,
+                        "resets_at": "2026-10-09T10:00:00Z"},
+            "weekly": {"remaining_percent": 86.4,
+                       "resets_at": "2026-10-12T00:00:00Z"},
         },
-        "limits": {
-            "session": {"usage": 0.333, "models": [{"name": "glm-5.2", "request_count": 133}]},
-            "weekly": {"usage": 0.136, "models": [{"name": "glm-5.2", "request_count": 504}]},
+        "purchased": {"balance_usd": 25},
+    }
+
+
+def _ollama_balance_payload_credits() -> dict:
+    """Ollama /api/balance response for credits-based plans (monthly pool)."""
+    return {
+        "included": {
+            "balance_usd": 72.5,
+            "allowance_usd": 100,
+            "period": {"from": "2026-09-15T09:30:00Z",
+                       "until": "2026-10-15T09:30:00Z"},
         },
+        "purchased": {"balance_usd": 25},
     }
 
 
 class TestOllamaHttp:
-    def test_fetch_success(self) -> None:
-        payload = _ollama_usage_payload()
+    def test_fetch_success_legacy_windows(self) -> None:
+        payload = _ollama_balance_payload_legacy()
         def handler(req: httpx.Request) -> httpx.Response:
-            assert req.url.path == "/api/usage"
+            assert req.url.path == "/api/balance"
             assert req.headers["Authorization"] == "Bearer test-key"
             return httpx.Response(200, json=payload)
         provider = OllamaProvider(client=_mock_client(handler))
@@ -420,11 +430,57 @@ class TestOllamaHttp:
                               "_platform_key": "ollama"})
         assert res.ok
         assert len(res.entries) == 2
+        # remaining_percent 66.7 → 33.3 used; 86.4 → 13.6 used
         assert res.entries[0].label == "5小时"
-        assert res.entries[0].percent == 33.3  # 0.333 * 100
+        assert res.entries[0].percent == 33.3
+        assert res.entries[0].reset_at == "2026-10-09T10:00:00Z"
+        assert res.entries[0].unit == "%"
         assert res.entries[1].label == "每周"
-        assert res.entries[1].percent == 13.6  # 0.136 * 100
+        assert res.entries[1].percent == 13.6
+        assert res.entries[1].reset_at == "2026-10-12T00:00:00Z"
         assert res.entries[0].is_manual is False
+
+    def test_fetch_success_credits_monthly(self) -> None:
+        payload = _ollama_balance_payload_credits()
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+        provider = OllamaProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "test-key", "display_name": "Ollama Cloud"})
+        assert res.ok
+        assert len(res.entries) == 1
+        entry = res.entries[0]
+        assert entry.label == "每月"
+        assert entry.unit == "$"
+        assert entry.used == 27.5  # allowance 100 - balance 72.5
+        assert entry.limit == 100
+        assert entry.remaining == 72.5
+        assert entry.percent == 27.5
+        assert entry.reset_at == "2026-10-15T09:30:00Z"
+
+    def test_fetch_no_usable_limits(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"included": {}, "purchased": {"balance_usd": 0}})
+        provider = OllamaProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "test-key"})
+        assert not res.ok
+        assert res.error == "响应中未找到用量数据"
+
+    def test_fetch_clamps_out_of_range_percent(self) -> None:
+        # 上游异常值(remaining_percent > 100 或负数)必须夹到 0-100,
+        # 否则显示层进度条填充会越界串行。
+        payload = {
+            "included": {
+                "session": {"remaining_percent": 120, "resets_at": "2026-10-09T10:00:00Z"},
+                "weekly": {"remaining_percent": -5, "resets_at": "2026-10-12T00:00:00Z"},
+            },
+            "purchased": {"balance_usd": 0},
+        }
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+        provider = OllamaProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "test-key"})
+        assert res.ok
+        assert [e.percent for e in res.entries] == [0.0, 100.0]
 
     def test_fetch_401(self) -> None:
         def handler(req: httpx.Request) -> httpx.Response:

@@ -581,6 +581,8 @@ function platformCard(p, isAdmin) {
         limitInput.type = "number";
         limitInput.min = "0";
         limitInput.step = "any";
+        limitInput.placeholder = "留空=用面板额度";
+        limitInput.title = "填了就覆盖网关面板的日报额度(面板的周/月额度不受影响)";
         limitInput.value = group.daily_limit === null || group.daily_limit === undefined
           ? "" : String(group.daily_limit);
         limitLabel.appendChild(limitInput);

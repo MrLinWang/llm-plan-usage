@@ -33,7 +33,7 @@ from llm_usage.providers.kimi import (
 )
 from llm_usage.providers.llm_gateway import (
     LlmGatewayProvider,
-    _parse_daily_usage,
+    _key_usage,
 )
 from llm_usage.providers.clinepass import (
     ClinePassProvider,
@@ -939,37 +939,55 @@ def _gateway_usage_payload() -> dict:
 
 
 class TestGatewayParsing:
-    def test_today_uses_actual_cost_not_list_price(self) -> None:
-        entries = _parse_daily_usage(_gateway_usage_payload(), "llm-gateway")
-        assert len(entries) == 1
-        entry = entries[0]
-        assert entry.label == "今日"
-        assert entry.used == 1.94
-        assert entry.unit == "$"
-        assert entry.limit is None
-        assert entry.percent is None
+    def test_today_falls_back_to_actual_cost(self) -> None:
+        usage = _key_usage(_gateway_usage_payload())
+        assert usage is not None
+        assert usage.usages == {"每日": 1.94}
+        # 老面板没有 subscription → 限额未知,由 config daily_limit 兜底
+        assert usage.limits == {}
+        assert usage.expires_at is None
+
+    def test_subscription_windows_drive_usage_and_limits(self) -> None:
+        usage = _key_usage({
+            "usage": {"today": {"actual_cost": "9.99"}},
+            "subscription": {
+                "daily_usage_usd": "1.5", "daily_limit_usd": 200,
+                "weekly_usage_usd": 19.5, "weekly_limit_usd": 1000,
+                "monthly_usage_usd": "19.5", "monthly_limit_usd": "4000",
+                "expires_at": "2027-10-10T03:23:54.367593-07:00",
+            },
+        })
+        assert usage is not None
+        # subscription 与 usage.today 口径不同时,以面板配额口径为准
+        assert usage.usages == {"每日": 1.5, "每周": 19.5, "每月": 19.5}
+        assert usage.limits == {"每日": 200.0, "每周": 1000.0, "每月": 4000.0}
+        assert usage.expires_at == "2027-10-10T03:23:54.367593-07:00"
+
+    def test_partial_subscription_reports_only_present_windows(self) -> None:
+        usage = _key_usage({"subscription": {"daily_usage_usd": 1.0}})
+        assert usage is not None
+        assert usage.usages == {"每日": 1.0}
+        assert usage.limits == {"每日": None}
 
     def test_daily_usage_is_fallback_when_today_missing(self) -> None:
-        entries = _parse_daily_usage(
-            {"usage": {"daily_usage": [{"actual_cost": "0.51"}, {"actual_cost": "1.94"}]}},
-            "llm-gateway",
+        usage = _key_usage(
+            {"usage": {"daily_usage": [{"actual_cost": "0.51"}, {"actual_cost": "1.94"}]}}
         )
-        assert entries[0].used == 1.94
+        assert usage is not None
+        assert usage.usages["每日"] == 1.94
 
     def test_top_level_daily_usage_is_fallback(self) -> None:
-        entries = _parse_daily_usage(
-            {"usage": {}, "daily_usage": [{"actual_cost": "1.94"}]}, "llm-gateway"
-        )
-        assert entries[0].used == 1.94
+        usage = _key_usage({"usage": {}, "daily_usage": [{"actual_cost": "1.94"}]})
+        assert usage is not None
+        assert usage.usages["每日"] == 1.94
 
     def test_cost_is_fallback_for_older_payload(self) -> None:
-        entries = _parse_daily_usage(
-            {"usage": {"today": {"cost": "3.88"}}}, "llm-gateway"
-        )
-        assert entries[0].used == 3.88
+        usage = _key_usage({"usage": {"today": {"cost": "3.88"}}})
+        assert usage is not None
+        assert usage.usages["每日"] == 3.88
 
-    def test_missing_cost_returns_no_entries(self) -> None:
-        assert _parse_daily_usage({"usage": {"today": {}}}, "llm-gateway") == []
+    def test_missing_cost_returns_none(self) -> None:
+        assert _key_usage({"usage": {"today": {}}}) is None
 
 
 class TestGatewayHttp:
@@ -1046,7 +1064,8 @@ class TestGatewayHttp:
             ],
         })
         assert result.ok
-        assert result.entries[0].label == "team-a"
+        # 老面板没有 subscription → 单行;plan 用分组名,限额取 config 覆盖
+        assert [(e.label, e.plan) for e in result.entries] == [("每日", "team-a")]
         assert result.entries[0].used == 2.0
         assert result.entries[0].limit == 10.0
         assert sorted(seen_auth) == ["Bearer key-a", "Bearer key-b"]
@@ -1191,7 +1210,7 @@ class TestGatewayHttp:
             "groups": [{"name": "team", "api_keys": ["group-key"]}],
         })
         assert result.ok
-        assert result.entries[0].label == "team"
+        assert [(e.label, e.plan) for e in result.entries] == [("每日", "team")]
 
     def test_use_groups_true_without_groups_is_error(self) -> None:
         provider = LlmGatewayProvider(client=_mock_client(lambda req: httpx.Response(200, json={})))
@@ -1216,8 +1235,98 @@ class TestGatewayHttp:
             "groups": [{"name": "team", "api_keys": ["group-key"]}],
         })
         assert result.ok
-        assert result.entries[0].label == "今日"
+        assert result.entries[0].label == "每日"
         assert result.entries[0].used == 1.94
+
+
+def _gateway_subscription_payload(daily: object = "1.5", weekly: object = "19.5",
+                                  monthly: object = "19.5") -> dict:
+    """面板当前返回形态:subscription 带日/周/月用量与限额 + 到期时间。"""
+    return {
+        "subscription": {
+            "daily_usage_usd": daily, "daily_limit_usd": 200,
+            "weekly_usage_usd": weekly, "weekly_limit_usd": 1000,
+            "monthly_usage_usd": monthly, "monthly_limit_usd": 4000,
+            "expires_at": "2027-10-10T03:23:54.367593-07:00",
+        }
+    }
+
+
+class TestGatewaySubscriptionWindows:
+    def test_group_yields_three_window_rows(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_gateway_subscription_payload())
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{"name": "测试组A", "api_keys": ["k1"]}],
+        })
+        assert result.ok
+        assert [(e.label, e.plan, e.used, e.limit) for e in result.entries] == [
+            ("每日", "测试组A", 1.5, 200.0),
+            ("每周", "测试组A", 19.5, 1000.0),
+            ("每月", "测试组A", 19.5, 4000.0),
+        ]
+        # 到期时间只挂在最长的窗口行;各 Key 明细只挂在每日行
+        assert [e.reset_at for e in result.entries] == [
+            None, None, "2027-10-10T03:23:54.367593-07:00",
+        ]
+        # 该时间是套餐到期:标记 reset_kind,过期后显示「已到期」而非「已重置」
+        assert [e.reset_kind for e in result.entries] == [None, None, "expires"]
+        assert [bool(e.key_breakdown) for e in result.entries] == [True, False, False]
+
+    def test_config_daily_limit_overrides_only_daily_window(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_gateway_subscription_payload())
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{"name": "组A", "daily_limit": 50, "api_keys": ["k1"]}],
+        })
+        assert [e.limit for e in result.entries] == [50.0, 1000.0, 4000.0]
+
+    def test_multi_key_group_sums_windows_across_keys(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            daily = "1.5" if req.headers["Authorization"] == "Bearer k1" else "0.5"
+            return httpx.Response(200, json=_gateway_subscription_payload(daily=daily))
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{"name": "组A", "api_keys": ["k1", "k2"]}],
+        })
+        assert (result.entries[0].label, result.entries[0].used) == ("每日", 2.0)
+        assert [e.limit for e in result.entries] == [400.0, 2000.0, 8000.0]
+
+    def test_failed_key_shrinks_limits_like_usage(self) -> None:
+        """失败 key 不参与限额合计(与用量同口径);提示说明这是部分结果。"""
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.headers["Authorization"] == "Bearer bad":
+                return httpx.Response(401)
+            return httpx.Response(200, json=_gateway_subscription_payload())
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test",
+            "groups": [{"name": "组A", "api_keys": ["good", "bad"]}],
+        })
+        assert result.ok
+        assert (result.entries[0].used, result.entries[0].limit) == (1.5, 200.0)
+        assert result.warning is not None and "401" in result.warning
+
+    def test_single_key_mode_windows_have_no_plan(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_gateway_subscription_payload())
+
+        provider = LlmGatewayProvider(client=_mock_client(handler))
+        result = provider.fetch({
+            "base_url": "http://llm-gateway.test", "api_key": "solo",
+        })
+        assert [(e.label, e.plan) for e in result.entries] == [
+            ("每日", None), ("每周", None), ("每月", None),
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1485,6 +1594,29 @@ class TestRegistryCredentialFanout:
             assert len(res.entries) == 2
             assert all(e.plan is None for e in res.entries)
         assert seen_auth == ["Bearer key-a", "Bearer key-a"]
+
+    def test_fetch_all_keeps_provider_set_plan_without_expansion(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """未做凭证展开的 provider 自带 plan(gateway 分组)不被覆盖成 None。"""
+        class _PlanProvider:
+            name = "llm-gateway"
+            display_name = "LLM Gateway"
+            is_manual = False
+
+            def fetch(self, config: dict) -> PlatformResult:
+                return PlatformResult(
+                    config.get("_platform_key", self.name),
+                    self.display_name,
+                    entries=[
+                        UsageEntry("llm-gateway", "每日", 1.0, 200.0, 199.0, 0.5,
+                                   None, "$", False, "测试组A"),
+                    ],
+                )
+
+        monkeypatch.setitem(PROVIDERS, "llm-gateway", _PlanProvider())
+        results = fetch_all({"platforms": {"llm-gateway": {"enabled": True}}})
+        assert [e.plan for e in results[0].entries] == ["测试组A"]
 
     def test_fetch_all_credentials_empty_list_uses_legacy_path(
         self, monkeypatch: pytest.MonkeyPatch,

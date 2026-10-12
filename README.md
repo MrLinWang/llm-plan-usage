@@ -69,7 +69,7 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer |
 | ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口 |
 | Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 |
-| LLM Gateway（本地 Sub2API 网关） | 自动 API | `GET /v1/usage`，Bearer；显示今日 `actual_cost` USD |
+| LLM Gateway（本地 Sub2API 网关） | 自动 API | `GET /v1/usage`，Bearer；读 `subscription` 出 每日/每周/每月 三行（旧版回退今日 `actual_cost`） |
 
 以上 8 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
 `kimi#2`），见下方「同类型供应商实例」。
@@ -102,11 +102,16 @@ max_retries = 3
 
 ### LLM Gateway（本地 Sub2API 网关）
 
-LLM Gateway 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填；
-`usage.today.actual_cost` 是今日自然日实际扣费，`cost` 仅作为旧接口无
-`actual_cost` 时的回退。API keys 以**组**为单位配置：每组共享一个每日额度，
-组内所有成功 Key 的 `actual_cost` 之和为该组用量，每组单独显示和保存历史。
-模板默认生成一组（`组1`，`env:LLM_GATEWAY_API_KEY`）：
+LLM Gateway 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填。
+provider 读网关 `/v1/usage` 的 `subscription` 段：**每个组的每个 Key** 各带一份
+日/周/月配额与用量，成功 Key 逐窗口求和，卡片上每组显示「每日 / 每周 / 每月」
+三行；限额默认取面板的 `daily_limit_usd` / `weekly_limit_usd` /
+`monthly_limit_usd`，组里填了 `daily_limit` 则**覆盖**每日额度（多 Key 组的限额
+为成功 Key 之和，只要有 Key 未上报就留空不画进度）。`subscription.expires_at`
+作为「每月」行的重置倒计时，且按**到期**语义显示（过期显示「已到期」而非
+「已重置」）。旧版网关没有 `subscription` 时退回 `usage.today.actual_cost`
+（`cost` 是更旧的回退）只出一行「每日」。API keys 以**组**为单位配置，每组单独
+显示和保存历史。模板默认生成一组（`组1`，`env:LLM_GATEWAY_API_KEY`）：
 
 ```toml
 [platforms.llm-gateway]
@@ -115,7 +120,7 @@ base_url = "http://127.0.0.1:18080"
 
 [[platforms.llm-gateway.groups]]
 name = "组1"
-# daily_limit = 100
+# daily_limit = 100        # 可选项:覆盖面板日报额度;留空则用面板值
 api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"]
 ```
 
@@ -228,9 +233,12 @@ Docker 镜像中配置文件在 `/data/config.toml`，日志因此默认写到
 ultra 三档密度试排（只压缩留白与次要列，不缩小正文），窗口尺寸变化后自动重新试排；
 每张卡片同时是独立的容器查询上下文，窄卡隐藏「限额/重置时间」次要列并把数字缩写为
 k/M/B（完整数值悬停可见）。entry 较多的平台默认精简展示：「+N」一键展开全部、再点收起；
-周期窗口平台折叠时优先保留 5小时/每周 等核心窗口；同一计费单位的平台改为 5 秒轮播
-切换（悬停、聚焦或切走标签页即暂停），并在尾部显示客户端合计的「全部合计」行
-（各条限额不完整时只合计已用，不虚构总进度）。
+周期窗口平台折叠时优先保留 5小时/每周 等核心窗口；非周期窗口且同一计费单位的平台改为
+5 秒轮播切换（悬停、聚焦或切走标签页即暂停），其尾部合计行只合计已用（限额不完整时
+不虚构总进度）。多账号卡片（LLM Gateway 分组、多凭证套餐）的合计与账号同构：一个
+「全部合计」标题行 + 各窗口行（每日/每周/每月），只合计同一窗口、单位一致且可加总的
+条目；收起时只显示最短窗口（网关=每日）一行，compact/ultra 密度下展开也只保留每个
+账号的最短窗口，且展开/收起后立刻重跑一次密度试排（不必调整窗口大小）。
 展开的卡片内容按外层卡片网格列数重排为多列；每个平台的展开状态保存在
 `sessionStorage`（仅当前标签页会话，跨数据刷新与页面刷新保留，退出登录时清除）。
 
@@ -292,7 +300,8 @@ llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollam
 以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
 命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
 （火山「添加 AK/SK」）追加新套餐槽。LLM Gateway 以**组**为单位编辑：
-默认一组「组1」，每组一个 API key 输入框 + 一个每日限额输入框（留空 = 不设限），
+默认一组「组1」，每组一个 API key 输入框 + 一个每日限额输入框（留空 = 用网关
+面板的日报额度；填了就覆盖该值，面板的周/月额度不受影响），
 组内可点「添加共享 Key」追加共享同一额度的 key，底部「添加组」新增分组；
 每个 Key 行还有一个可选的「Key 名称」输入框，名称会显示在仪表盘分组行的
 悬浮明细与 `show --keys` 的 Key 明细中（留空 = 保留现有名称）；
@@ -384,7 +393,8 @@ ruff check src tests && mypy src    # lint + 类型检查
 
 `重置倒计时` 列显示距下一次重置的剩余时间（如 `2天3小时`、`5小时20分`、`32分`），
 基于**当前系统时钟**在每次渲染时计算——`llm-usage tui` 中每秒刷新；重置时刻已过
-显示 `已重置`，无重置时间显示 `-`。该列与进度条百分比标签右对齐。
+显示 `已重置`，无重置时间显示 `-`。时间戳按语义区分：套餐到期（LLM Gateway 每月行）
+过期显示 `已到期`，网页端悬浮提示相应写作「到期时间」。该列与进度条百分比标签右对齐。
 
 Web 仪表盘同理：服务端 API 返回 UTC ISO 时间戳，浏览器端转换为本地时区显示，
 重置倒计时由前端每秒在客户端重算。

@@ -139,11 +139,17 @@ def _parse_utc(value: str) -> datetime | None:
     return dt
 
 
-def _fmt_countdown(reset_at: str | None, now: datetime | None = None) -> str:
+def _fmt_countdown(
+    reset_at: str | None,
+    now: datetime | None = None,
+    kind: str | None = None,
+) -> str:
     """Human-friendly time until ``reset_at``, e.g. "2天3小时", "5小时20分", "32分".
 
-    Returns "-" when there is no reset time or it is unparsable; "已重置"
-    when the reset time is already in the past.  Computed at render time so
+    Returns "-" when there is no reset time or it is unparsable.  A past
+    timestamp reads "已重置" for a window reset, or "已到期" when ``kind`` is
+    ``"expires"`` (a plan/subscription expiry, e.g. the gateway's 每月 row —
+    an expired plan is not a refreshed quota).  Computed at render time so
     the TUI countdown ticks with each Live refresh.  ``now`` is injectable
     for deterministic tests.
     """
@@ -155,7 +161,7 @@ def _fmt_countdown(reset_at: str | None, now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
     secs = int((dt - now).total_seconds())
     if secs <= 0:
-        return "已重置"
+        return "已到期" if kind == "expires" else "已重置"
     days, rem = divmod(secs, 86400)
     hours, rem = divmod(rem, 3600)
     minutes = rem // 60
@@ -177,7 +183,7 @@ def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status
         remaining = _fmt_value(entry.remaining, entry.unit) if entry.remaining is not None else "-"
 
     reset = _to_local_time(entry.reset_at) or "-"
-    countdown = _fmt_countdown(entry.reset_at)
+    countdown = _fmt_countdown(entry.reset_at, kind=entry.reset_kind)
 
     values = [name, entry.label, used, limit, remaining, reset, countdown, status]
     styles = ["bold" if is_first else "", "", "", "", "", "dim", "dim", ""]
@@ -345,6 +351,7 @@ def results_to_dict(results: list[PlatformResult]) -> dict[str, Any]:
                         "remaining": e.remaining,
                         "percent": e.percent,
                         "reset_at": e.reset_at,
+                        "reset_kind": e.reset_kind,
                         "unit": e.unit,
                         "is_manual": e.is_manual,
                         "plan": e.plan,

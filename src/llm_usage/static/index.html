@@ -343,7 +343,12 @@
   tbody tr:not(.bar-row):hover td { background: var(--hover); }
   .bold { font-weight: bold; }
   .dim { color: var(--dim); }
-  .plan-head td { padding-top: clamp(5px, 0.9vh, 8px); font-weight: 600; }
+  .plan-head td {
+    padding-top: clamp(5px, 0.9vh, 8px);
+    border-top: 1px solid color-mix(in srgb, var(--sep) 72%, transparent);
+    font-weight: 600;
+  }
+  tbody tr.plan-head:first-child td { border-top: none; }
   .summary-row td {
     padding-top: clamp(4px, 0.7vh, 7px);
     border-top: 1px dashed var(--sep);
@@ -762,13 +767,13 @@ function fmtResetCell(s) {
   return fmtLocal(d);
 }
 
-// _fmt_countdown(逐字一致)
-function fmtCountdown(resetAt, now) {
+// _fmt_countdown(逐字一致);kind="expires" 表示该时间是套餐到期而非窗口重置
+function fmtCountdown(resetAt, now, kind) {
   if (!resetAt) return "-";
   var d = parseReset(resetAt);
   if (!d) return "-";
   var secs = Math.floor((d.getTime() - now.getTime()) / 1000);
-  if (secs <= 0) return "已重置";
+  if (secs <= 0) return kind === "expires" ? "已到期" : "已重置";
   var days = Math.floor(secs / 86400);
   var rem = secs % 86400;
   var hours = Math.floor(rem / 3600);
@@ -818,10 +823,6 @@ function responsiveValueCell(wide, compact, cls, accessibleText) {
   cell.appendChild(wideSpan);
   cell.appendChild(compactSpan);
   return cell;
-}
-
-function isGatewayPlatform(platform) {
-  return String(platform && platform.name || "").split("#")[0] === "llm-gateway";
 }
 
 function periodRank(label) {
@@ -894,16 +895,20 @@ function totalEntry(entries) {
   var remaining = limit === null ? null : cleanTotal(Math.max(limit - used, 0));
   var percent = limit === null || limit === 0
     ? null : Math.round(Math.max(Math.min(used / limit * 100, 100), 0) * 10) / 10;
+  // 继承一致的重置时间与语义:时间或 reset_kind 不一致时都不继承,
+  // 避免到期时间被当成窗口重置(「已重置」)。
   var resets = entries.map(function (entry) { return entry.reset_at || null; });
-  var resetAt = resets.every(function (value) { return value === resets[0]; })
-    ? resets[0] : null;
+  var kinds = entries.map(function (entry) { return entry.reset_kind || null; });
+  var sameReset = resets.every(function (value) { return value === resets[0]; }) &&
+    kinds.every(function (value) { return value === kinds[0]; });
   return {
     label: "全部合计",
     used: used,
     limit: limit,
     remaining: remaining,
     percent: percent,
-    reset_at: resetAt,
+    reset_at: sameReset ? resets[0] : null,
+    reset_kind: sameReset ? kinds[0] : null,
     unit: sameUnit ? unit : "",
     plan: null,
     key_breakdown: null
@@ -999,9 +1004,12 @@ function dataRow(entry) {
   var reset = td(fmtResetCell(entry.reset_at), "dim reset-col");
   reset.title = fmtResetCell(entry.reset_at);
   tr.appendChild(reset);
-  var cd = td(fmtCountdown(entry.reset_at, new Date()), "num dim cd countdown-cell");
+  var cd = td(fmtCountdown(entry.reset_at, new Date(), entry.reset_kind), "num dim cd countdown-cell");
   cd.dataset.reset = entry.reset_at || "";
-  cd.title = entry.reset_at ? "重置时间 " + fmtResetCell(entry.reset_at) : "无重置时间";
+  cd.dataset.kind = entry.reset_kind || "";
+  cd.title = entry.reset_at
+    ? (entry.reset_kind === "expires" ? "到期时间 " : "重置时间 ") + fmtResetCell(entry.reset_at)
+    : "无重置时间";
   tr.appendChild(cd);
   return tr;
 }
@@ -1068,8 +1076,91 @@ function renderRotatingRows(body, entries, offset, indicator, slotCount) {
   }
 }
 
-function appendTotalRows(body, entries) {
-  var total = totalEntry(entries);
+// 展开网格的分列规则:以 plan(账户/套餐)为最小单位,同一账户的
+// 每日/每周/每月行绝不跨列;列数不超过 requestedColumns。
+function planColumnGroups(entries, requestedColumns) {
+  var groups = [];
+  entries.forEach(function (entry) {
+    var plan = entry.plan === undefined ? null : entry.plan;
+    if (groups.length === 0 || groups[groups.length - 1].plan !== plan) {
+      groups.push({ plan: plan, entries: [] });
+    }
+    groups[groups.length - 1].entries.push(entry);
+  });
+  var maxColumns = Math.max(1, Math.min(requestedColumns || 1, Math.max(entries.length, 1)));
+  var target = Math.ceil(entries.length / maxColumns);
+  var columns = [[]];
+  groups.forEach(function (group) {
+    var current = columns[columns.length - 1];
+    var count = 0;
+    current.forEach(function (g) { count += g.entries.length; });
+    // 当前列够满且还有列可开 → 整组换列;宁可列数少也不拆账户
+    if (current.length > 0 && count >= target && columns.length < maxColumns) {
+      columns.push([]);
+      current = columns[columns.length - 1];
+    }
+    current.push(group);
+  });
+  return columns;
+}
+
+// 卡片里的具名账号数(plan 去重;null 不计),用于多账号口径判断。
+function namedPlanCount(entries) {
+  var plans = [];
+  entries.forEach(function (e) {
+    if (e.plan && plans.indexOf(e.plan) < 0) plans.push(e.plan);
+  });
+  return plans.length;
+}
+
+// 空间不足(compact/ultra)展开时的口径:每个账号只留最短窗口一条(网关=每日)。
+// 调用方只对多账号周期卡片启用;无 plan 时全部条目视作一组(取最短窗口一条)。
+function shortestWindowEntries(entries) {
+  var plans = [];
+  entries.forEach(function (e) {
+    var plan = e.plan === undefined ? null : e.plan;
+    if (plans.indexOf(plan) < 0) plans.push(plan);
+  });
+  var picked = [];
+  plans.forEach(function (name) {
+    var best = null;
+    entries.forEach(function (e) {
+      var plan = e.plan === undefined ? null : e.plan;
+      if (plan !== name) return;
+      var rank = periodRank(e.label);
+      if (rank === null) return;
+      if (!best || rank < periodRank(best.label)) best = e;
+    });
+    if (best) picked.push(best);
+  });
+  return picked;
+}
+
+// 多账号卡片的分窗口合计:每日/每周/每月各一行,只汇总同一窗口的跨账号条目。
+// 该窗口必须同单位且可加总(百分比行、缺账号的窗口不出合计),避免出现虚假的「合计 0」。
+function windowTotals(entries) {
+  if (namedPlanCount(entries) < 2 || !hasPeriodWindows(entries)) return [];
+  var windows = [];
+  entries.forEach(function (e) {
+    if (periodRank(e.label) !== null && windows.indexOf(e.label) < 0) windows.push(e.label);
+  });
+  windows.sort(function (a, b) { return periodRank(a) - periodRank(b); });
+  var totals = [];
+  windows.forEach(function (label) {
+    var basis = entries.filter(function (e) { return e.label === label; });
+    if (basis.length < 2) return;
+    var unit = basis[0].unit;
+    if (!unit || unit === "%") return;
+    if (!basis.every(function (e) { return e.unit === unit; })) return;
+    var total = totalEntry(basis);
+    total.label = label;   // 行标签即窗口名;「全部合计」由块头承担
+    totals.push(total);
+  });
+  return totals;
+}
+
+// 合计数据行(+进度条):轮播路径单独使用;周期窗口合计走 appendTotalBlock
+function appendSummaryRows(body, total) {
   var totalData = dataRow(total);
   var totalBar = barRow(total.percent);
   totalData.classList.add("summary-row");
@@ -1078,47 +1169,54 @@ function appendTotalRows(body, entries) {
   body.appendChild(totalBar);
 }
 
-function buildExpandedGrid(entries, includeTotal, requestedColumns) {
-  var items = entries.map(function (entry) {
-    return { entry: entry, summary: false };
-  });
-  if (includeTotal) items.push({ entry: totalEntry(entries), summary: true });
+// 合计块与账号块同构:「全部合计」头行 + 各窗口数据行
+function appendTotalBlock(body, totals) {
+  var head = el("tr", "plan-head");
+  head.appendChild(td("全部合计", "dim", 6));
+  body.appendChild(head);
+  totals.forEach(function (total) { appendSummaryRows(body, total); });
+}
+
+// 轮播路径的合计:单行,行标签本身就是「全部合计」
+function appendTotalRows(body, entries) {
+  appendSummaryRows(body, totalEntry(entries));
+}
+
+function buildExpandedGrid(entries, totals, requestedColumns, summaryHead) {
+  var columns = planColumnGroups(entries, requestedColumns);
+  if (totals && totals.length > 0) {
+    columns[columns.length - 1].push({
+      plan: summaryHead || null, summary: true, entries: totals
+    });
+  }
   var grid = el("div", "expanded-entry-grid");
-  var columnCount = Math.max(1, Math.min(requestedColumns || 1, items.length));
-  var itemsPerColumn = Math.floor(items.length / columnCount);
-  var extraItemColumns = items.length % columnCount;
-  var start = 0;
-  grid.style.setProperty("--expanded-columns", String(columnCount));
-  for (var columnIndex = 0; columnIndex < columnCount; columnIndex++) {
-    var columnSize = itemsPerColumn + (columnIndex < extraItemColumns ? 1 : 0);
-    var columnItems = items.slice(start, start + columnSize);
-    start += columnSize;
+  grid.style.setProperty("--expanded-columns", String(columns.length));
+  columns.forEach(function (groups) {
     var column = el("div", "expanded-entry-column");
     var columnFrag = entryTableTpl.content.cloneNode(true);
     var columnBody = columnFrag.querySelector("tbody");
-    var prevPlan = null;
-    columnItems.forEach(function (item) {
-      var entry = item.entry;
-      if (!item.summary && entry.plan && entry.plan !== prevPlan) {
+    groups.forEach(function (group) {
+      if (group.plan) {
         var planRow = el("tr", "plan-head");
-        planRow.appendChild(td(entry.plan, "dim", 6));
+        planRow.appendChild(td(group.plan, "dim", 6));
         columnBody.appendChild(planRow);
       }
-      if (item.summary) {
-        var totalData = dataRow(entry);
-        var totalBar = barRow(entry.percent);
-        totalData.classList.add("summary-row");
-        totalBar.classList.add("summary-bar");
-        columnBody.appendChild(totalData);
-        columnBody.appendChild(totalBar);
-      } else {
-        appendEntryRows(columnBody, entry);
-      }
-      prevPlan = entry.plan;
+      group.entries.forEach(function (entry) {
+        if (group.summary) {
+          var totalData = dataRow(entry);
+          var totalBar = barRow(entry.percent);
+          totalData.classList.add("summary-row");
+          totalBar.classList.add("summary-bar");
+          columnBody.appendChild(totalData);
+          columnBody.appendChild(totalBar);
+        } else {
+          appendEntryRows(columnBody, entry);
+        }
+      });
     });
     column.appendChild(columnFrag);
     grid.appendChild(column);
-  }
+  });
   return grid;
 }
 
@@ -1136,8 +1234,16 @@ function platformCard(p, displayMode, stateKey) {
   head.appendChild(name);
   var entries = Array.isArray(p.entries) ? p.entries : [];
   var periodWindows = hasPeriodWindows(entries);
-  var independentRows = hasSingleUnit(entries) &&
-    (isGatewayPlatform(p) || !periodWindows);
+  var independentRows = hasSingleUnit(entries) && !periodWindows;
+  // 合计:轮播路径沿用「全部条目」的单行合计;周期窗口的多账号卡片
+  // 按窗口各出一行(每日/每周/每月),口径见 windowTotals。
+  var cardTotals = independentRows ? [totalEntry(entries)] : windowTotals(entries);
+  // 空间不足(compact/ultra)时,多账号卡片的展开视图也只保留每个账号的
+  // 最短窗口(网关=每日),合计随之只留最短窗口一行;单账号卡片保持全量展开
+  var denseExpand = !independentRows && periodWindows && displayMode !== "normal" &&
+    namedPlanCount(entries) >= 2;
+  var expandedEntries = denseExpand ? shortestWindowEntries(entries) : entries;
+  var expandedTotals = denseExpand ? cardTotals.slice(0, 1) : cardTotals;
   var rotationSlotCount = displayMode === "normal" ? 2 : displayMode === "compact" ? 1 : 0;
   var independentCompacts = !p.error && independentRows &&
     ((displayMode === "normal" && entries.length > 3) ||
@@ -1193,7 +1299,7 @@ function platformCard(p, displayMode, stateKey) {
   var table = frag.querySelector("table");
   var body = frag.querySelector("tbody");
   var expandedGrid = null;
-  var setExpandedContent = function (expanded, includeTotal) {
+  var setExpandedContent = function (expanded) {
     if (expandedGrid) {
       expandedGrid.remove();
       expandedGrid = null;
@@ -1201,7 +1307,10 @@ function platformCard(p, displayMode, stateKey) {
     var expandedColumnCount = expanded ? outerGridColumnCount() : 1;
     table.hidden = expanded;
     if (expanded) {
-      expandedGrid = buildExpandedGrid(entries, includeTotal, expandedColumnCount);
+      expandedGrid = buildExpandedGrid(
+        expandedEntries, expandedTotals, expandedColumnCount,
+        independentRows ? null : "全部合计"
+      );
       card.appendChild(expandedGrid);
     }
   };
@@ -1218,7 +1327,7 @@ function platformCard(p, displayMode, stateKey) {
       closeKeyPopovers();
       card.classList.toggle("is-expanded", independentExpanded);
       if (rotationIndicator) rotationIndicator.hidden = independentExpanded;
-      setExpandedContent(independentExpanded, true);
+      setExpandedContent(independentExpanded);
       if (independentExpanded) {
         // 完整内容由多列展开网格承载，原表保留但隐藏以便快速收起。
       } else if (rotationSlotCount > 0) {
@@ -1248,6 +1357,7 @@ function platformCard(p, displayMode, stateKey) {
       independentExpanded = !independentExpanded;
       setPlatformExpanded(stateKey, independentExpanded);
       renderIndependentRows();
+      refitLayout();
     });
     var reduceMotion = window.matchMedia &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1265,16 +1375,19 @@ function platformCard(p, displayMode, stateKey) {
     var renderPeriodicRows = function () {
       closeKeyPopovers();
       card.classList.toggle("is-expanded", expanded);
-      setExpandedContent(expanded, false);
+      setExpandedContent(expanded);
       if (!expanded) {
         body.textContent = "";
         appendEntries(body, collapsedEntries);
+        // 收起时只给最短窗口(网关=每日)的合计块;其余窗口合计在展开视图里看
+        if (cardTotals.length > 0) appendTotalBlock(body, cardTotals.slice(0, 1));
       }
       entryToggle.textContent = expanded
         ? "收起" : "+" + (entries.length - collapsedEntries.length);
       entryToggle.title = expanded
-        ? "收起到精简用量" : "展开其余 " +
-          (entries.length - collapsedEntries.length) + " 条用量";
+        ? "收起到精简用量"
+        : (denseExpand ? "展开各账号每日用量" : "展开其余 " +
+          (entries.length - collapsedEntries.length) + " 条用量");
       entryToggle.setAttribute("aria-label", entryToggle.title);
       entryToggle.setAttribute("aria-expanded", String(expanded));
     };
@@ -1283,6 +1396,7 @@ function platformCard(p, displayMode, stateKey) {
       expanded = !expanded;
       setPlatformExpanded(stateKey, expanded);
       renderPeriodicRows();
+      refitLayout();
     });
     renderPeriodicRows();
   } else {
@@ -1311,6 +1425,12 @@ function renderPlatformsAtMode(platforms, mode) {
 
 function pageFitsViewport() {
   return document.documentElement.scrollHeight <= Math.ceil(window.innerHeight) + 2;
+}
+
+// 展开/收起会改变卡片高度:立刻重跑一次密度试排,让「收起能放下、展开才
+// 溢出」的场景也能落到 compact/ultra 口径,而不是等下一次 resize/刷新
+function refitLayout() {
+  if (lastPlatformData && lastPlatformData.length) renderPlatforms(lastPlatformData);
 }
 
 // 从信息最多的模式开始试排；终极压缩仍放不下时保留自然滚动。
@@ -1454,7 +1574,9 @@ function tick() {
   var now = new Date();
   var cells = platformsEl.querySelectorAll("td.cd");
   for (var i = 0; i < cells.length; i++) {
-    cells[i].textContent = fmtCountdown(cells[i].dataset.reset || null, now);
+    cells[i].textContent = fmtCountdown(
+      cells[i].dataset.reset || null, now, cells[i].dataset.kind || null
+    );
   }
   var remain = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
   if (errorState) {

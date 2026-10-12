@@ -38,9 +38,16 @@ form (``true`` = groups only, ``false`` = single key only); when absent,
 groups win if any are configured.  When ``use_groups`` is false, any
 stored groups are ignored.
 
-Each group is queried once per key.  Its ``used`` value is the sum of all
-successful keys' ``usage.today.actual_cost`` values.  ``cost`` is only a
-compatibility fallback for older gateways.  As with every other platform,
+Each group is queried once per key and yields one row per **subscription
+window** the gateway reports — ``每日`` / ``每周`` / ``每月``, taken from the
+payload's ``subscription`` block (``{prefix}_usage_usd`` /
+``{prefix}_limit_usd``, ``expires_at``) and summed across the group's
+successful keys; the config ``daily_limit`` still overrides the ``每日``
+limit.  The plan expiry rides on the ``每月`` row (``reset_at``) — the
+gateway reports no per-window reset time.  Rows are grouped under the group
+name via ``UsageEntry.plan``.  Older payloads without ``subscription`` fall
+back to ``usage.today.actual_cost`` for a single ``每日`` row (``cost`` is
+the legacy price fallback).  As with every other platform,
 ``env:VARNAME`` reads the secret from an environment variable instead of
 storing it as plaintext in ``config.toml``.
 """
@@ -74,11 +81,27 @@ class _GatewayConfigError(ValueError):
     """A user-facing gateway configuration error, not a response parsing error."""
 
 
+# 面板 subscription 的窗口字段前缀: (行标签, JSON 字段前缀)。
+_WINDOWS = (
+    ("每日", "daily"),
+    ("每周", "weekly"),
+    ("每月", "monthly"),
+)
+
+
 @dataclass(frozen=True)
 class _KeyUsage:
-    """The successful daily cost returned by one API key."""
+    """One key's successful usage snapshot.
 
-    actual_cost: float
+    ``usages`` / ``limits`` map window labels (``每日``/``每周``/``每月``) to
+    USD usage and the gateway-reported quota (``None`` = not reported).
+    ``expires_at`` is the subscription expiry (raw ISO string from the
+    gateway, stored verbatim).
+    """
+
+    usages: dict[str, float]
+    limits: dict[str, float | None]
+    expires_at: str | None
 
 
 def _as_float(value: Any) -> float | None:
@@ -130,29 +153,33 @@ def _daily_cost(payload: dict[str, Any]) -> float | None:
     return actual_cost
 
 
-def _parse_daily_usage(
-    payload: dict[str, Any],
-    platform: str,
-    *,
-    label: str = "今日",
-    daily_limit: float | None = None,
-) -> list[UsageEntry]:
-    """Map one payload to a USD entry, optionally applying a group limit."""
-    actual_cost = _daily_cost(payload)
-    if actual_cost is None:
-        return []
-    return [
-        UsageEntry(
-            platform=platform,
-            label=label,
-            used=round(actual_cost, 8),
-            limit=daily_limit,
-            remaining=compute_remaining(actual_cost, daily_limit),
-            percent=compute_percent(actual_cost, daily_limit),
-            reset_at=None,
-            unit="$",
-        )
-    ]
+def _key_usage(payload: dict[str, Any]) -> _KeyUsage | None:
+    """Parse one key's usage payload; ``None`` when no daily number is usable.
+
+    The ``subscription`` block (current panels) drives every window.  Older
+    payloads have only ``usage.today``; those degrade to a single ``每日``
+    window with an unknown (``None``) quota.
+    """
+    usages: dict[str, float] = {}
+    limits: dict[str, float | None] = {}
+    expires_at: str | None = None
+    subscription = payload.get("subscription")
+    if isinstance(subscription, dict):
+        for window_label, prefix in _WINDOWS:
+            used = _as_float(subscription.get(f"{prefix}_usage_usd"))
+            if used is not None:
+                usages[window_label] = used
+                limits[window_label] = _as_float(subscription.get(f"{prefix}_limit_usd"))
+        raw_expiry = subscription.get("expires_at")
+        if isinstance(raw_expiry, str) and raw_expiry.strip():
+            expires_at = raw_expiry.strip()
+    if "每日" not in usages:
+        fallback = _daily_cost(payload)
+        if fallback is not None:
+            usages["每日"] = fallback
+    if "每日" not in usages:
+        return None
+    return _KeyUsage(usages=usages, limits=limits, expires_at=expires_at)
 
 
 def _error_from_response(response: httpx.Response) -> str:
@@ -272,6 +299,24 @@ def _validate_group_keys(groups: list[dict[str, Any]]) -> None:
             seen.add(key)
 
 
+def _window_limit(
+    window_label: str,
+    daily_override: float | None,
+    successes: dict[int, _KeyUsage],
+) -> float | None:
+    """Quota for one window, summed over keys; config ``daily_limit`` wins for 每日.
+
+    Returns ``None`` when any successful key does not report that window or
+    reports no quota for it — a partial sum would misstate the percent.
+    """
+    if window_label == "每日" and daily_override is not None:
+        return daily_override
+    limits = [usage.limits.get(window_label) for usage in successes.values()]
+    if not limits or any(value is None for value in limits):
+        return None
+    return round(sum(value for value in limits if value is not None), 8)
+
+
 class LlmGatewayProvider:
     """LLM Gateway live provider, configured entirely via ``config.toml``."""
 
@@ -299,10 +344,10 @@ class LlmGatewayProvider:
         payload = response.json()
         if not isinstance(payload, dict):
             raise RuntimeError("响应格式无效")
-        actual_cost = _daily_cost(payload)
-        if actual_cost is None:
+        usage = _key_usage(payload)
+        if usage is None:
             raise RuntimeError("响应中未找到今日 USD 用量")
-        return _KeyUsage(actual_cost=actual_cost)
+        return usage
 
     def _fetch_group(
         self,
@@ -311,8 +356,11 @@ class LlmGatewayProvider:
         client: httpx.Client,
         base_url: str,
         usage_path: str,
+        plan: str | None,
+        platform_key: str,
         fallback_limit: Any = None,
-    ) -> tuple[UsageEntry | None, list[str], list[dict[str, Any]]]:
+    ) -> tuple[list[UsageEntry], list[str], list[dict[str, Any]]]:
+        """Query every key of one group; one row per window the panel reports."""
         name = _group_name(group, index)
         daily_limit = _group_limit(group, fallback_limit)
         raw_entries = _group_raw_key_entries(group)
@@ -336,7 +384,7 @@ class LlmGatewayProvider:
                 keys.append((number, resolved))
         if not keys:
             failures = [failures_by_number[number] for number in sorted(failures_by_number)]
-            breakdown = [
+            breakdown: list[dict[str, Any]] = [
                 {
                     "number": number,
                     "name": key_names[number - 1],
@@ -346,9 +394,9 @@ class LlmGatewayProvider:
                 }
                 for number in sorted(failures_by_number)
             ]
-            return None, failures or [f"{name}：未配置 API key"], breakdown
+            return [], failures or [f"{name}：未配置 API key"], breakdown
 
-        successes_by_number: dict[int, float] = {}
+        successes: dict[int, _KeyUsage] = {}
         workers = min(MAX_KEY_WORKERS, len(keys))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
@@ -365,7 +413,7 @@ class LlmGatewayProvider:
                 number = futures[future]
                 label = key_names[number - 1] or f"key#{number}"
                 try:
-                    successes_by_number[number] = future.result().actual_cost
+                    successes[number] = future.result()
                 except RuntimeError as exc:  # _request_key 的既定中文文案,可直接展示
                     failures_by_number[number] = f"{name} {label}：{exc}"
                 except httpx.HTTPError:
@@ -381,11 +429,12 @@ class LlmGatewayProvider:
                 {
                     "number": number,
                     "name": key_names[number - 1],
-                    "used": successes_by_number[number],
+                    # 明细弹层按「今日」口径展示各 Key 用量
+                    "used": successes[number].usages.get("每日"),
                     "ok": True,
                     "error": None,
                 }
-                if number in successes_by_number
+                if number in successes
                 else {
                     "number": number,
                     "name": key_names[number - 1],
@@ -397,21 +446,39 @@ class LlmGatewayProvider:
             for number in range(1, len(raw_keys) + 1)
         ]
 
-        if not successes_by_number:
-            return None, failures or [f"{name}：没有成功的 key"], breakdown
-        used = round(sum(successes_by_number.values()), 8)
-        entry = UsageEntry(
-            platform="llm-gateway",
-            label=name,
-            used=used,
-            limit=daily_limit,
-            remaining=compute_remaining(used, daily_limit),
-            percent=compute_percent(used, daily_limit),
-            reset_at=None,
-            unit="$",
-            key_breakdown=breakdown,
+        if not successes:
+            return [], failures or [f"{name}：没有成功的 key"], breakdown
+
+        expires_at = next(
+            (usage.expires_at for usage in successes.values() if usage.expires_at),
+            None,
         )
-        return entry, failures, breakdown
+        entries: list[UsageEntry] = []
+        for window_label, _prefix in _WINDOWS:
+            reported = [
+                usage for usage in successes.values() if window_label in usage.usages
+            ]
+            if not reported:
+                continue
+            used = round(sum(usage.usages[window_label] for usage in reported), 8)
+            limit = _window_limit(window_label, daily_limit, successes)
+            entries.append(
+                UsageEntry(
+                    platform=platform_key,
+                    label=window_label,
+                    plan=plan,
+                    used=used,
+                    limit=limit,
+                    remaining=compute_remaining(used, limit),
+                    percent=compute_percent(used, limit),
+                    # 面板只给出套餐到期时间,挂在最长的窗口行上
+                    reset_at=expires_at if window_label == "每月" else None,
+                    reset_kind="expires" if window_label == "每月" and expires_at else None,
+                    unit="$",
+                    key_breakdown=breakdown if window_label == "每日" else None,
+                )
+            )
+        return entries, failures, breakdown
 
     def fetch(self, config: dict[str, Any]) -> PlatformResult:
         platform_key = config.get("_platform_key", self.name)
@@ -465,41 +532,43 @@ class LlmGatewayProvider:
                     "name": "今日",
                     "api_keys": [api_key],
                 }
-                entry, failures, _breakdown = self._fetch_group(
+                group_entries, group_failures, _breakdown = self._fetch_group(
                     group,
                     0,
                     client,
                     base_url,
                     usage_path,
+                    None,
+                    platform_key,
                     config.get("daily_limit"),
                 )
-                if entry is None:
+                if not group_entries:
                     return PlatformResult(
                         platform_key,
                         display_name,
-                        error=failures[0] if failures else "未配置 API key",
+                        error=group_failures[0] if group_failures else "未配置 API key",
                     )
                 return PlatformResult(
                     platform_key,
                     display_name,
-                    entries=[entry],
-                    warning="；".join(failures) if failures else None,
+                    entries=group_entries,
+                    warning="；".join(group_failures) if group_failures else None,
                 )
 
             entries: list[UsageEntry] = []
             failures: list[str] = []
             for index, group in enumerate(groups):
-                entry, group_failures, _breakdown = self._fetch_group(
+                group_entries, group_failures, _breakdown = self._fetch_group(
                     group,
                     index,
                     client,
                     base_url,
                     usage_path,
+                    _group_name(group, index),
+                    platform_key,
                     config.get("daily_limit"),
                 )
-                if entry is not None:
-                    entry.platform = platform_key
-                    entries.append(entry)
+                entries.extend(group_entries)
                 failures.extend(group_failures)
             if not entries:
                 return PlatformResult(

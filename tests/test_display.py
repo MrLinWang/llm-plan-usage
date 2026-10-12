@@ -96,7 +96,7 @@ class TestKeyBreakdown:
 
     def test_single_key_entry_is_skipped(self) -> None:
         e = UsageEntry(
-            "llm-gateway", "今日", 1.94, None, None, None, None, "$", False,
+            "llm-gateway", "每日", 1.94, None, None, None, None, "$", False,
             key_breakdown=[{"number": 1, "name": None, "used": 1.94, "ok": True, "error": None}],
         )
         r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
@@ -267,6 +267,26 @@ class TestDisplaySerialization:
         assert _fmt_countdown(None, now) == "-"
         assert _fmt_countdown("", now) == "-"
         assert _fmt_countdown("garbage", now) == "-"
+
+    def test_fmt_countdown_expiry_kind(self) -> None:
+        """到期时间(kind="expires")过期后是「已到期」,不是「已重置」。"""
+        now = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
+        assert _fmt_countdown("2027-08-19T12:00:00Z", now, kind="expires") == "365天0小时"
+        assert _fmt_countdown("2026-08-19T11:59:00Z", now, kind="expires") == "已到期"
+        assert _fmt_countdown("2026-08-19T11:59:00Z", now) == "已重置"  # 窗口重置语义不变
+
+    def test_expired_subscription_row_reads_expired(self) -> None:
+        """已到期的 gateway 每月行在终端渲染为「已到期」。"""
+        e = UsageEntry(
+            "llm-gateway", "每月", 19.5, 4000, 3980.5, 0.5,
+            "2026-08-01T00:00:00Z", "$", False, "测试组A", None, "expires",
+        )
+        r = PlatformResult("llm-gateway", "测试网关", entries=[e])
+        console, buf = _make_console()
+        render_results([r], console=console)
+        out = buf.getvalue()
+        assert "已到期" in out
+        assert "已重置" not in out
 
     def test_countdown_right_aligned(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # the countdown column is right-aligned: values of different widths

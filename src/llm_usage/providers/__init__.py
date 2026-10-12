@@ -338,7 +338,10 @@ def fetch_all(
         for plan, res in pairs:
             if res.error is None:
                 for entry in res.entries:
-                    entry.plan = plan
+                    # 凭证展开的平台以槽位名为准;未展开的 provider 可自带 plan
+                    # (如 gateway 的分组行),不要覆盖成 None
+                    if plan is not None:
+                        entry.plan = plan
                     entries.append(entry)
             else:
                 failures.append(f"{plan}：{res.error}" if plan else res.error)

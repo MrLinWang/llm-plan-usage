@@ -19,11 +19,18 @@ class UsageEntry:
         reset_at: when the window resets — ISO 8601 UTC (``Z`` or offset
             suffix; naive values are treated as UTC); ``None`` if N/A.  Only
             display converts it to local time; stored/JSON values stay UTC.
+        reset_kind: semantics of ``reset_at``: ``"expires"`` = a plan /
+            subscription expiry (e.g. the gateway's 每月 row) rather than a
+            quota refresh; ``None`` = window reset.  Display reads it to say
+            「已到期」 instead of 「已重置」 once the timestamp has passed.
         unit: display unit: ``"%"``, ``"次"``, ``"$"``, ``"tokens"``.
         is_manual: True for manually-entered values (no live API fetch).
-        plan: billing-plan name for multi-credential platforms (each
-            credential under one platform is its own independent plan);
-            ``None`` = legacy single-credential shape, no partitioning.
+        plan: billing-plan / group name used to partition the platform's rows
+            (multi-credential platforms: each credential is its own plan; the
+            LLM Gateway: each configured key group).  ``None`` = no
+            partitioning (a plain single-source platform).
+            ``fetch_all`` tags expanded credentials with the slot name and
+            otherwise keeps a provider-set plan.
         key_breakdown: optional per-key usage detail for entries aggregated
             from multiple API keys (e.g. a gateway's shared-quota groups).
             Each item is a dict: ``{"number": int, "name": str | None,
@@ -44,6 +51,7 @@ class UsageEntry:
     is_manual: bool = False
     plan: str | None = None
     key_breakdown: list[dict] | None = None
+    reset_kind: str | None = None
 
 
 @dataclass

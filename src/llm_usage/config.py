@@ -162,12 +162,14 @@ api_key = "env:COMMANDCODE_API_KEY"       # Command Code API key (Studio → API
 [platforms.llm-gateway]
 enabled = true
 base_url = "http://127.0.0.1:18080"      # gateway base URL
-# API keys 以组为单位配置,每组共享一个每日限额;可在 Web「供应商配置」页维护,
-# 或手工编辑。每个 key 可配置显示名称(CLI Key 明细 / Web 悬浮明细展示):
+# API keys 以组为单位配置;每组的每日/每周/每月额度与用量取自网关面板的
+# subscription(每组每个 key 各一份,成功 key 逐窗口求和),卡片显示三行。
+# 可在 Web「供应商配置」页维护,或手工编辑。每个 key 可配置显示名称
+# (CLI Key 明细 / Web 悬浮明细展示):
 #   api_keys = [{ name = "主Key", value = "env:LLM_GATEWAY_API_KEY" }]
 [[platforms.llm-gateway.groups]]
 name = "组1"
-# daily_limit = 100
+# daily_limit = 100        # 可选项:覆盖面板日报额度;留空则用面板值
 api_keys = ["env:LLM_GATEWAY_API_KEY"]
 """
 

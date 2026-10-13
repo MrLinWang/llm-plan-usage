@@ -140,7 +140,7 @@ def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 class UsageCache:
-    """TTL cache around fetch_all; refreshes at most once per interval."""
+    """TTL cache around fetch_all; explicit invalidation bypasses the interval."""
 
     def __init__(self, config: dict[str, Any], interval: float) -> None:
         self._config = config
@@ -197,6 +197,9 @@ class UserCaches:
     Each user's own config (and every distinct shared config) gets its own
     cache entry, keyed by the config's content hash so edits invalidate by
     hash mismatch on the next get() — no explicit invalidation needed.
+
+    Manual refresh invalidates the caller's own config and visible shared
+    owners' configs, never unrelated entries in this pool.
     """
 
     MAX_CACHES = 32
@@ -868,26 +871,37 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             return load_config()
         return store.get_user_config(user["username"])
 
-    def _usage_payload_for(user: dict[str, Any]) -> JSONResponse:
+    def _usage_payload_for(
+        user: dict[str, Any], *, force_refresh: bool = False,
+    ) -> JSONResponse:
+        """合并自身及可见共享平台;force_refresh 仅绕过这些来源的配置缓存。"""
         try:
             own = _config_for(user)
+            shares = store.list_shared_platforms(user["username"])
+            shared_configs: dict[str, dict[str, Any]] = {}
+            for share in shares:
+                owner = share["owner"]
+                if owner == user["username"] or owner in shared_configs:
+                    continue
+                owner_user = store.get_user(owner)
+                if owner_user is not None:
+                    shared_configs[owner] = _config_for(owner_user)
+            # 先统一失效再读取:多张共享卡片或不同所有者可能复用同一
+            # 配置哈希,不能在逐卡片合并时重复失效并重拉。
+            if force_refresh:
+                cache.invalidate_for(own)
+                for shared_config in shared_configs.values():
+                    cache.invalidate_for(shared_config)
             results, fetched_at = cache.get(own)
             # 自己的平台保留裸名;共享来的平台一律带 (owner) 后缀,
             # 同名冲突时每个来源都保留展示,不丢弃任何来源。
             merged: dict[str, PlatformResult] = {r.platform: r for r in results}
             extra: list[PlatformResult] = []
-            for share in store.list_shared_platforms(user["username"]):
+            for share in shares:
                 owner = share["owner"]
-                if owner == user["username"]:
-                    continue  # 自身来源不参与共享合并(自己的平台是裸名)
-                owner_user = store.get_user(owner)
-                if owner_user is None:
+                owner_cfg = shared_configs.get(owner)
+                if owner_cfg is None:
                     continue
-                owner_cfg = (
-                    load_config()
-                    if owner_user["is_admin"]
-                    else store.get_user_config(owner)
-                )
                 shared_results, shared_at = cache.get(owner_cfg)
                 if shared_at > fetched_at:
                     fetched_at = shared_at
@@ -1103,9 +1117,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
 
     @app.post("/api/refresh")
     def usage_refresh(user: dict[str, Any] = Depends(api_user)) -> JSONResponse:
-        """立即刷新:仅失效当前用户配置的缓存条目后重新 fetch,响应同构。"""
-        cache.invalidate_for(_config_for(user))
-        return _usage_payload_for(user)
+        """立即刷新当前仪表盘涉及的配置,不失效无关用户的缓存。"""
+        return _usage_payload_for(user, force_refresh=True)
 
     @app.post("/api/interval")
     def usage_interval(

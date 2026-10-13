@@ -2243,10 +2243,12 @@ class TestSecurityHardening:
 
 
 class TestRefreshIsolation:
+    """刷新自身及可见共享来源,但不驱逐无关用户的私有配置缓存。"""
+
     def test_refresh_only_invalidates_own_config(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
     ) -> None:
-        """POST /api/refresh 只失效自己的缓存条目,他人配置不重拉。"""
+        """无共享的用户刷新只失效自己的缓存,无关用户配置不重拉。"""
         calls = {"alice": 0, "bob": 0}
 
         def fake(cfg):
@@ -2281,6 +2283,81 @@ class TestRefreshIsolation:
         # bob 缓存仍新鲜 → 不变
         bob.get("/api/usage")
         assert calls == {"alice": 2, "bob": 1}
+
+    @pytest.mark.parametrize("viewer", ["alice", "admin"])
+    def test_refresh_updates_visible_shares_and_preserves_unrelated_cache(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path, viewer: str,
+    ) -> None:
+        """管理员/普通用户均重拉可见共享数据,且同一来源不因多张卡片重复拉取。"""
+        import httpx
+
+        from llm_usage.config import save_config
+        from llm_usage.providers import PROVIDERS
+        from llm_usage.providers.kimi import KimiProvider
+
+        owner = "admin" if viewer == "alice" else "alice"
+        used = {"alice": 10, "admin": 20, "extra": 30, "bob": 40}
+        calls = dict.fromkeys(used, 0)
+
+        def upstream(request: httpx.Request) -> httpx.Response:
+            key = request.headers["Authorization"].removeprefix("Bearer ")
+            calls[key] += 1
+            return httpx.Response(200, json={
+                "limits": [{
+                    "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                    "detail": {"limit": 100, "remaining": 100 - used[key]},
+                }],
+            })
+
+        for name in ("admin", "alice", "bob"):
+            store.create_user(name, "secret1", is_admin=name == "admin")
+            cfg = {"platforms": {"kimi": {"api_key": name, "display_name": name}}}
+            if name == owner:
+                cfg["platforms"]["kimi#2"] = {"api_key": "extra", "display_name": "extra"}
+            if name == "admin":
+                save_config(cfg)
+            else:
+                store.set_user_config(name, cfg)
+        store.set_platform_visibility(owner, "kimi", viewer)
+        store.set_platform_visibility(owner, "kimi#2", viewer)
+
+        with httpx.Client(transport=httpx.MockTransport(upstream)) as provider_client:
+            monkeypatch.setitem(PROVIDERS, "kimi", KimiProvider(client=provider_client))
+            app = create_app(load_config(), interval=3600)
+            client = TestClient(app)
+            bob = TestClient(app)
+            assert client.post(
+                "/api/auth/login", json={"username": viewer, "password": "secret1"},
+            ).status_code == 200
+            assert bob.post(
+                "/api/auth/login", json={"username": "bob", "password": "secret1"},
+            ).status_code == 200
+
+            before = client.get("/api/usage").json()
+            assert {p["display_name"]: p["entries"][0]["used"] for p in before["platforms"]} == {
+                viewer: used[viewer],
+                f"{owner}({owner})": used[owner],
+                f"extra({owner})": used["extra"],
+            }
+            assert bob.get("/api/usage").json()["platforms"][0]["entries"][0]["used"] == 40
+            assert calls == {"alice": 1, "admin": 1, "extra": 1, "bob": 1}
+
+            used.update({key: value + 50 for key, value in used.items()})
+            response = client.post("/api/refresh")
+            assert response.status_code == 200
+            refreshed = response.json()
+            assert {
+                p["display_name"]: p["entries"][0]["used"] for p in refreshed["platforms"]
+            } == {
+                viewer: used[viewer],
+                f"{owner}({owner})": used[owner],
+                f"extra({owner})": used["extra"],
+            }
+            # 同一所有者的两个共享平台各只重拉一次,不驱逐无关用户的缓存。
+            assert calls == {"alice": 2, "admin": 2, "extra": 2, "bob": 1}
+            assert bob.get("/api/usage").json()["platforms"][0]["entries"][0]["used"] == 40
+            assert calls["bob"] == 1
 
 
 class TestProviderInstances:

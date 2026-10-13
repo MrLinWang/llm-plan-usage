@@ -604,6 +604,8 @@ var lastFetchedLocal = null;  // 上次成功获取的本地时间 "HH:MM:SS"
 var nextAt = 0;               // 下一次轮询的时间戳(ms)
 var pollTimer = 0;
 var errorState = null;        // 拉取失败时的错误信息(保留旧卡片)
+var usageRequestId = 0;       // 仅最新请求可更新数据、错误、计时和等待状态
+var refreshing = false;      // tick() 保持等待提示,不显示旧轮询倒计时
 var currentInterval = 60;     // 服务端当前刷新间隔(秒),每次 render() 同步
 var entryRotationTimers = [];   // 各卡片轮播的 setInterval 句柄,重渲染前统一清理
 var ENTRY_ROTATE_MS = 5000;     // 轮播步进间隔
@@ -1474,20 +1476,35 @@ async function fetchUsage(url, init) {
   return data;
 }
 
-async function refresh() {
-  if (!lastFetchedLocal && !errorState) statusEl.textContent = "加载中…";
+async function refresh(force) {
+  var requestId = ++usageRequestId;
+  clearTimeout(pollTimer);  // 只取消排队轮询;在途请求由 requestId 隔离
+  refreshing = true;
+  if (force) refreshBtn.disabled = true;
+  tick();
   try {
-    render(await fetchUsage("/api/usage"));
+    var data = await fetchUsage(
+      force ? "/api/refresh" : "/api/usage", force ? { method: "POST" } : undefined
+    );
+    if (requestId !== usageRequestId) return;
+    render(data);
   } catch (e) {
-    if (e && e.message === "未登录") return;
+    if (requestId !== usageRequestId || (e && e.message === "未登录")) return;
     errorState = String((e && e.message) || e);
     schedule(10);  // 10s 后重试,不清空旧卡片
+  } finally {
+    if (requestId === usageRequestId) {
+      refreshing = false;
+      refreshBtn.disabled = false;
+      tick();
+    }
   }
 }
 
 // ---- 手动刷新与间隔控制 ----
-// 「马上刷新」POST /api/refresh:服务端失效缓存后立即重新 fetch_all,
-// 响应与 GET /api/usage 同构,直接走 render() 重新调度轮询。
+// 「马上刷新」POST /api/refresh:绕过自身及可见共享来源的配置缓存,
+// 不失效无关用户的缓存。等待时保留旧卡片,持续显示加载/刷新提示;
+// 仅最新请求的成功响应进入 render() 更新卡片并重新调度轮询。
 // 间隔下拉 POST /api/interval:修改服务端 TTL;所有已打开的页面在
 // 下次轮询响应的 interval 字段里收到新值后自行对齐。
 
@@ -1532,19 +1549,8 @@ INTERVAL_PRESETS.forEach(function (sec) {
 });
 intervalSelect.value = "60";  // 首次成功拉取前显示默认值
 
-refreshBtn.addEventListener("click", async function () {
-  clearTimeout(pollTimer);  // 取消已排队的自动轮询,以本次结果为准
-  refreshBtn.disabled = true;
-  statusEl.textContent = (lastFetchedLocal || errorState) ? "刷新中…" : "加载中…";
-  try {
-    render(await fetchUsage("/api/refresh", { method: "POST" }));
-  } catch (e) {
-    if (e && e.message === "未登录") return;
-    errorState = String((e && e.message) || e);
-    schedule(10);
-  } finally {
-    refreshBtn.disabled = false;
-  }
+refreshBtn.addEventListener("click", function () {
+  refresh(true);
 });
 
 intervalSelect.addEventListener("change", async function () {
@@ -1579,7 +1585,10 @@ function tick() {
     );
   }
   var remain = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
-  if (errorState) {
+  if (refreshing) {
+    statusEl.textContent = (lastFetchedLocal || errorState) ? "刷新中…" : "加载中…";
+    statusEl.className = "status";
+  } else if (errorState) {
     statusEl.textContent = "获取失败：" + errorState + " · " + remain + "s 后重试";
     statusEl.className = "status err";
   } else if (lastFetchedLocal) {

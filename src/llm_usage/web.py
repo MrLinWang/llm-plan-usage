@@ -44,6 +44,7 @@ from llm_usage.config import (
     set_platform_order,
     update_platform_config,
 )
+from llm_usage.config_schema import ConfigFormatError, to_accounts_config, to_runtime_config
 from llm_usage.display import results_to_dict
 from llm_usage.models import PlatformResult
 from llm_usage.opendesign_auth import (
@@ -54,7 +55,6 @@ from llm_usage.opendesign_auth import (
 from llm_usage.platform_keys import (
     PlatformKeyConflict,
     canonical_platform_key,
-    normalize_platform_config,
 )
 from llm_usage.providers import (
     DISPLAY_NAMES,
@@ -1329,8 +1329,10 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         if platforms is not None and not isinstance(platforms, dict):
             raise HTTPException(status_code=400, detail="platforms 需为表(字典)")
         try:
-            return normalize_platform_config(imported)
-        except PlatformKeyConflict as exc:
+            decoded = to_runtime_config(imported)
+            to_accounts_config(decoded)  # Validate before replacing either user's stored config.
+            return decoded
+        except (PlatformKeyConflict, ConfigFormatError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
 
     def _import_summary(imported: dict[str, Any]) -> dict[str, Any]:

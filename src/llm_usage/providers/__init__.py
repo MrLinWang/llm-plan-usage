@@ -17,6 +17,7 @@ from time import sleep as _sleep
 from typing import Any
 
 from llm_usage.config import get_platform_order
+from llm_usage.config_schema import to_runtime_config
 from llm_usage.models import PlatformResult, UsageEntry
 from llm_usage.platform_keys import canonical_platform_key, normalize_platform_config
 from llm_usage.providers.base import Provider
@@ -276,7 +277,7 @@ def fetch_all(
     ``PlatformResult.platform``; results sort by base type so each instance
     renders right after it.
     """
-    config = normalize_platform_config(config)
+    config = to_runtime_config(config)
     platforms_cfg: dict[str, Any] = config.get("platforms", {})
     tasks: list[tuple[str, Provider, dict[str, Any], str | None]] = []
     for platform, pcfg in platforms_cfg.items():

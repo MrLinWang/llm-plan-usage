@@ -137,10 +137,24 @@ def web(host: str, port: int, interval: float) -> None:
 @main.command()
 @click.option("--init", "do_init", is_flag=True, help="Generate example config template.")
 @click.option("--force", is_flag=True, help="Overwrite an existing config with --init.")
-def config(do_init: bool, force: bool) -> None:
+@click.option("--format", "do_format", is_flag=True, help="Rewrite config using unified account tables.")
+def config(do_init: bool, force: bool, do_format: bool) -> None:
     """Print config path and contents, or generate a template."""
     setup_cli_logging()
     path = config_mod.config_path()
+    if do_init and do_format:
+        raise click.UsageError("--init 与 --format 不能同时使用")
+    if do_format:
+        if not path.exists():
+            console.print("[red]配置文件不存在，请先运行 llm-usage config --init[/red]")
+            sys.exit(2)
+        try:
+            config_mod.mutate_config(lambda _: None, path)
+        except (RuntimeError, ValueError, TypeError, OSError) as exc:
+            console.print(f"[red]无法整理配置：{exc}[/red]")
+            sys.exit(2)
+        console.print(f"[green]已统一配置格式：{path}[/green]")
+        return
     if do_init:
         try:
             p = config_mod.init_config(path, overwrite=force)

@@ -1,24 +1,27 @@
 """Sub2API usage provider, including shared daily limits across API-key groups.
 
 Configuration lives entirely in ``config.toml``, same as every other
-provider — no side files.  The simple single-key form::
+provider — no side files.  The single-key form::
 
     [platforms.sub2api]
     enabled = true
     base_url = "http://127.0.0.1:18080"
+    [[platforms.sub2api.accounts]]
     api_key = "env:SUB2API_API_KEY"
 
-For multiple keys that share one daily quota, configure groups instead::
+For multiple keys that share one daily quota, configure one account per group::
 
     [platforms.sub2api]
     enabled = true
     base_url = "http://127.0.0.1:18080"
-    use_groups = true
 
-    [[platforms.sub2api.groups]]
+    [[platforms.sub2api.accounts]]
     name = "team-a"
     daily_limit = 100
     api_keys = ["env:SUB2API_TEAM_A_1", "env:SUB2API_TEAM_A_2"]
+
+The configuration adapter projects these accounts into the provider's runtime
+single-key/groups shape. Older configuration files remain supported.
 
 Each key may carry a display name — used in the per-key usage breakdown
 (``UsageEntry.key_breakdown``) rendered by ``show --keys`` and the web

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
+from llm_usage.config_schema import to_accounts_config, to_runtime_config
 from llm_usage.models import PlatformResult, UsageEntry
 from llm_usage.platform_keys import (
     PlatformKeyConflict,
@@ -574,14 +575,14 @@ def get_user_config(
         return {}
     if not isinstance(data, dict):
         return {}
-    return normalize_platform_config(data)
+    return to_runtime_config(data)
 
 
 def set_user_config(
     username: str, config: dict[str, Any], path: Path | None = None
 ) -> None:
     """INSERT OR REPLACE a user's own platform config."""
-    config = normalize_platform_config(config)
+    config = to_accounts_config(config)
     conn = _connect(path)
     try:
         conn.execute(
@@ -625,12 +626,13 @@ def mutate_user_config(
             data = json.loads(row[0]) if row else {}
         except (ValueError, TypeError):
             data = {}
-        config = normalize_platform_config(data if isinstance(data, dict) else {})
+        config = to_runtime_config(data if isinstance(data, dict) else {})
         result = mutation(config)
-        config = normalize_platform_config(config)
+        config = to_runtime_config(config)
+        persisted = to_accounts_config(config)
         conn.execute(
             "INSERT OR REPLACE INTO user_configs (username, config, updated_at) VALUES (?,?,?)",
-            (username, json.dumps(config, ensure_ascii=False), _now_iso()),
+            (username, json.dumps(persisted, ensure_ascii=False), _now_iso()),
         )
         conn.commit()
         return config, result

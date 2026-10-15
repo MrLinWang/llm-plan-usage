@@ -202,6 +202,14 @@
   }
   .group-actions { justify-content: space-between; }
   .group-actions .danger { color: var(--red); }
+  .opendesign-login { display: grid; gap: 8px; }
+  .opendesign-login [hidden] { display: none; }
+  .auth-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .auth-link { color: var(--cyan); overflow-wrap: anywhere; }
+  .auth-code { max-width: 240px; letter-spacing: 0.12em; font-weight: bold; }
+  .auth-manual summary { color: var(--dim); font-size: 12px; cursor: pointer; }
+  .auth-manual .fields { margin-top: 8px; }
+  button:disabled { opacity: 0.5; cursor: wait; }
   @media (max-width: 620px) {
     .group-head { align-items: stretch; flex-direction: column; }
     .group-head label.limit { max-width: none; }
@@ -341,7 +349,215 @@ var SLOT_FIELDS = {
   "opencode-go": ["api_key"],
   "clinepass": ["api_key"],
   "commandcode": ["api_key"],
+  "opendesign": ["control_key"],
 };
+
+// ---- OpenDesign 网页登录授权 ----
+// 凭证只经服务端保存,浏览器只持有短期授权会话与用户验证码。
+var openDesignLogins = new Set();
+
+function cleanupOpenDesignLogins() {
+  Array.from(openDesignLogins).forEach(function (login) { login.cancel(); });
+}
+window.addEventListener("pagehide", cleanupOpenDesignLogins);
+
+function openDesignLogin(editor, platformKey, onAuthorized, onActivity) {
+  var root = el("div", "opendesign-login");
+  var actions = el("div", "auth-actions");
+  var start = el("button", "pill-btn", "网页登录授权");
+  start.type = "button";
+  var cancel = el("button", "pill-btn", "取消授权");
+  cancel.type = "button";
+  cancel.hidden = true;
+  actions.appendChild(start);
+  actions.appendChild(cancel);
+  root.appendChild(actions);
+  var link = el("a", "auth-link", "打开 OpenDesign 登录并授权 ↗");
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.hidden = true;
+  root.appendChild(link);
+  var codeLabel = el("label", "", "授权码（官方页面需要时填写）");
+  codeLabel.hidden = true;
+  var code = document.createElement("input");
+  code.type = "text";
+  code.className = "auth-code";
+  code.readOnly = true;
+  code.setAttribute("aria-label", "OpenDesign 授权码");
+  code.addEventListener("click", function () { code.select(); });
+  codeLabel.appendChild(code);
+  root.appendChild(codeLabel);
+  var status = el("div", "hint", "登录对应的 OpenDesign 账号并确认授权，凭证会自动保存。");
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  root.appendChild(status);
+  var sessionId = null;
+  var timer = null;
+  var generation = 0;
+  var running = false;
+  var blocked = false;
+  var disposed = false;
+  var expiresAt = 0;
+  var intervalMs = 5000;
+  var login = { element: root, dispose: dispose, cancel: cancelLogin, setBlocked: setBlocked };
+
+  function setBlocked(value) {
+    blocked = value;
+    start.disabled = running || blocked || disposed;
+  }
+
+  function clearTimer() {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  }
+
+  function cancelSession(id) {
+    if (!id) return;
+    // 页面离开时也尽量取消;失败的服务端会话会由短期有效期回收。
+    fetch("/api/opendesign/auth/" + encodeURIComponent(id), {
+      method: "DELETE", headers: { "Content-Type": "application/json" },
+      body: "{}", keepalive: true,
+    }).catch(function () {});
+  }
+
+  function finish(message, successful) {
+    clearTimer();
+    sessionId = null;
+    running = false;
+    openDesignLogins.delete(login);
+    cancel.hidden = true;
+    link.hidden = true;
+    codeLabel.hidden = true;
+    status.className = successful ? "form-ok" : "hint";
+    status.textContent = message;
+    onActivity(false);
+    setBlocked(blocked);
+  }
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    generation += 1;
+    cancelSession(sessionId);
+    finish("授权已取消");
+  }
+
+  function cancelLogin() {
+    generation += 1;
+    cancelSession(sessionId);
+    finish("授权已取消，可重新登录授权。");
+  }
+
+  function expired() { return expiresAt > 0 && Date.now() >= expiresAt; }
+
+  function schedule(token) {
+    clearTimer();
+    if (expired()) { cancelSession(sessionId); finish("授权已过期，请重新登录授权。"); return; }
+    var delay = expiresAt > 0 ? Math.min(intervalMs, expiresAt - Date.now()) : intervalMs;
+    timer = setTimeout(function () { poll(token); }, Math.max(0, delay));
+  }
+
+  async function poll(token) {
+    if (token !== generation || !running) return;
+    if (expired()) { cancelSession(sessionId); finish("授权已过期，请重新登录授权。"); return; }
+    try {
+      var r = await api("/api/opendesign/auth/" + encodeURIComponent(sessionId), {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      if (token !== generation || !running) return;
+      if (!r.ok) {
+        if (r.status >= 500 || r.status === 429) throw new Error("稍后重试");
+        var detail = await detailOf(r);
+        if (token !== generation || !running) return;
+        cancelSession(sessionId);
+        finish(r.status === 404 ? "授权已过期，请重新登录授权。" : detail);
+        return;
+      }
+      var data = await r.json();
+      if (token !== generation || !running) return;
+      if (data.status === "authorized") {
+        try {
+          onAuthorized(data);
+          finish("授权成功，凭证已自动保存；其余修改请点保存。", true);
+        } catch (_) {
+          finish("授权已完成，但配置回显失败，请重新加载配置页。");
+        }
+      } else if (data.status === "pending") {
+        if (Number.isFinite(data.poll_interval_seconds) && data.poll_interval_seconds > 0) {
+          intervalMs = Math.max(1000, data.poll_interval_seconds * 1000);
+        }
+        status.textContent = "等待你在 OpenDesign 页面登录并确认授权…";
+        schedule(token);
+      } else {
+        var messages = {
+          expired: "授权已过期，请重新登录授权。",
+          denied: "你已拒绝本次授权，可重新登录授权。",
+          cancelled: "授权已取消，可重新登录授权。",
+        };
+        finish(messages[data.status] || "授权状态异常，请重新登录授权。");
+      }
+    } catch (e) {
+      if (token !== generation || !running) return;
+      if (e && e.message === "未登录") { dispose(); return; }
+      status.textContent = "暂时无法检查授权，稍后自动重试；也可取消后重试。";
+      schedule(token);
+    }
+  }
+
+  start.addEventListener("click", async function () {
+    if (running || blocked || disposed) return;
+    var token = ++generation;
+    running = true;
+    expiresAt = 0;
+    intervalMs = 5000;
+    openDesignLogins.add(login);
+    onActivity(true);
+    start.disabled = true;
+    cancel.hidden = false;
+    status.className = "hint";
+    status.textContent = "正在准备网页登录授权…";
+    try {
+      var r = await api("/api/opendesign/auth", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          platform: platformKey, index: editor.originalIndex == null ? null : editor.originalIndex,
+          name: editor.nameInput.value.trim() || null,
+        }),
+      });
+      if (!r.ok) throw new Error(await detailOf(r));
+      var data = await r.json();
+      if (token !== generation || !running) { cancelSession(data.id); return; }
+      sessionId = data.id;
+      var url = new URL(data.activation_url);
+      if (url.protocol !== "https:" || url.username || url.password ||
+          !(url.hostname === "open-design.ai" || url.hostname.endsWith(".open-design.ai"))) {
+        throw new Error("官方授权地址无效，请重试。");
+      }
+      if (!sessionId || typeof data.user_code !== "string" || data.status !== "pending") {
+        throw new Error("授权响应无效，请重试。");
+      }
+      expiresAt = Date.parse(data.expires_at);
+      if (!Number.isFinite(expiresAt)) throw new Error("授权有效期无效，请重试。");
+      if (Number.isFinite(data.poll_interval_seconds) && data.poll_interval_seconds > 0) {
+        intervalMs = Math.max(1000, data.poll_interval_seconds * 1000);
+      }
+      link.href = url.href;
+      link.hidden = false;
+      code.value = data.user_code;
+      codeLabel.hidden = false;
+      status.textContent = "点击上方链接，在 OpenDesign 页面登录并确认授权；本页会自动完成。";
+      // 使用普通链接打开官方页面,无需依赖浏览器允许异步弹窗。
+      link.focus();
+      schedule(token);
+    } catch (e) {
+      if (token !== generation || !running) return;
+      cancelSession(sessionId);
+      finish(e && e.message === "未登录" ? "登录已失效" : String(e.message || e));
+    }
+  });
+  cancel.addEventListener("click", cancelLogin);
+  return login;
+}
 
 // ---- 可见性控件(admin 与普通用户共用) ----
 // 三态:private / public(所有人)/ shared(勾选指定用户,来自 /api/users,排除自己)。
@@ -452,70 +668,134 @@ function platformCard(p, isAdmin) {
   displayNameLabel.appendChild(displayNameInput);
   fields.appendChild(displayNameLabel);
 
+  var maxBalanceInput = null;
+  if (p.type === "opendesign") {
+    var maxBalanceLabel = el("label", "", "最大余额 ($)");
+    maxBalanceInput = document.createElement("input");
+    maxBalanceInput.type = "number";
+    maxBalanceInput.min = "0";
+    maxBalanceInput.step = "any";
+    maxBalanceInput.placeholder = "留空=不显示余额进度条";
+    maxBalanceInput.value = p.max_balance > 0 ? String(p.max_balance) : "";
+    maxBalanceLabel.appendChild(maxBalanceInput);
+    fields.appendChild(maxBalanceLabel);
+    fields.appendChild(el("p", "dim", "用量进度 = (最大余额 - 当前余额) ÷ 最大余额；此上限适用于本供应商的每个账号。"));
+  }
+
   var slotEditors = [];
   var slotFields = SLOT_FIELDS[p.type] || null;
+  var slotAuthBusy = false;
+  var savingCard = false;
+  var addSlotButton = null;
+
+  function syncCredentialControls() {
+    var busy = slotAuthBusy || savingCard;
+    slotEditors.forEach(function (editor) {
+      editor.nameInput.disabled = busy;
+      Object.keys(editor.inputs).forEach(function (field) { editor.inputs[field].disabled = busy; });
+      editor.removeButton.disabled = busy;
+      if (editor.login) editor.login.setBlocked(busy);
+    });
+    if (addSlotButton) addSlotButton.disabled = busy;
+    if (save) save.disabled = busy;
+    if (del) del.disabled = busy;
+  }
+
+  function slotAuthActivity(busy) {
+    slotAuthBusy = busy;
+    syncCredentialControls();
+  }
+
+  function appendSlot(slot) {
+    var box = el("div", "group-editor");
+    var head = el("div", "group-head");
+    var nameLabel = el("label", "", "套餐名");
+    var nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.autocomplete = "off";
+    nameInput.placeholder = "套餐名（可选）";
+    if (slot.name) nameInput.value = slot.name;
+    nameLabel.appendChild(nameInput);
+    head.appendChild(nameLabel);
+    box.appendChild(head);
+
+    var slotFieldsEl = el("div", "fields");
+    var slotInputs = {};
+    slotFields.forEach(function (field) {
+      var cred = (slot.credentials || {})[field];
+      var label = el("label", "", field === "control_key" ? "账户控制密钥" : field);
+      var input = document.createElement("input");
+      input.type = "text";
+      input.autocomplete = "off";
+      input.placeholder = placeholderOf(cred);
+      slotInputs[field] = input;
+      label.appendChild(input);
+      slotFieldsEl.appendChild(label);
+    });
+
+    var editor = {
+      box: box, originalIndex: slot.index, nameInput: nameInput, inputs: slotInputs,
+      login: null, removeButton: null,
+    };
+    if (p.type === "opendesign") {
+      editor.login = openDesignLogin(editor, p.key, function (data) {
+        var slots = data.platform && data.platform.credential_slots;
+        var updated = Array.isArray(slots) && slots.find(function (s) {
+          return s.index === data.slot_index;
+        });
+        if (!updated) throw new Error("未收到授权结果，请重新加载配置。");
+        editor.originalIndex = updated.index;
+        editor.nameInput.value = updated.name || editor.nameInput.value;
+        // 刚完成的网页登录凭证优先于此输入框里授权前的草稿。
+        slotFields.forEach(function (field) {
+          editor.inputs[field].value = "";
+          editor.inputs[field].placeholder = placeholderOf((updated.credentials || {})[field]);
+        });
+      }, slotAuthActivity);
+      box.appendChild(editor.login.element);
+      var manual = el("details", "auth-manual");
+      manual.appendChild(el("summary", "", "手动填写控制密钥（可选）"));
+      manual.appendChild(slotFieldsEl);
+      box.appendChild(manual);
+    } else {
+      box.appendChild(slotFieldsEl);
+    }
+
+    var actions = el("div", "group-actions");
+    var removeSlot = el("button", "danger", "删除此凭证");
+    editor.removeButton = removeSlot;
+    removeSlot.type = "button";
+    removeSlot.addEventListener("click", function () {
+      if (slotAuthBusy || savingCard) return;
+      if (editor.login) editor.login.dispose();
+      box.remove();
+      slotEditors = slotEditors.filter(function (item) { return item !== editor; });
+    });
+    actions.appendChild(removeSlot);
+    box.appendChild(actions);
+    if (addSlotButton) slotsEditor.insertBefore(box, addSlotButton);
+    else slotsEditor.appendChild(box);
+    slotEditors.push(editor);
+    syncCredentialControls();
+  }
 
   var renderSlots = function (slots) {
     if (!slotFields) return;
     if (!Array.isArray(slots) || !slots.length) {
       slots = [{ index: null, name: null, credentials: {} }];
     }
+    slotEditors.forEach(function (editor) { if (editor.login) editor.login.dispose(); });
     slotEditors = [];
+    addSlotButton = null;
     slotsEditor.textContent = "";
-    slots.forEach(function (slot, position) {
-      var box = el("div", "group-editor");
-      var head = el("div", "group-head");
-      var nameLabel = el("label", "", "套餐名");
-      var nameInput = document.createElement("input");
-      nameInput.type = "text";
-      nameInput.autocomplete = "off";
-      nameInput.placeholder = "套餐名（可选）";
-      if (slot.name) nameInput.value = slot.name;
-      nameLabel.appendChild(nameInput);
-      head.appendChild(nameLabel);
-      box.appendChild(head);
-
-      var slotFieldsEl = el("div", "fields");
-      var slotInputs = {};
-      slotFields.forEach(function (field) {
-        var cred = (slot.credentials || {})[field];
-        var label = el("label", "", field);
-        var input = document.createElement("input");
-        input.type = "text";
-        input.autocomplete = "off";
-        input.placeholder = placeholderOf(cred);
-        slotInputs[field] = input;
-        label.appendChild(input);
-        slotFieldsEl.appendChild(label);
-      });
-      box.appendChild(slotFieldsEl);
-
-      var actions = el("div", "group-actions");
-      var removeSlot = el("button", "danger", "删除此凭证");
-      removeSlot.type = "button";
-      removeSlot.addEventListener("click", function () {
-        box.remove();
-        slotEditors = slotEditors.filter(function (item) { return item.box !== box; });
-      });
-      actions.appendChild(removeSlot);
-      box.appendChild(actions);
-      slotsEditor.appendChild(box);
-
-      slotEditors.push({
-        box: box,
-        originalIndex: slot.index,
-        nameInput: nameInput,
-        inputs: slotInputs,
-      });
+    slots.forEach(appendSlot);
+    addSlotButton = el("button", "", addSlotLabel);
+    addSlotButton.type = "button";
+    addSlotButton.addEventListener("click", function () {
+      if (slotAuthBusy || savingCard) return;
+      appendSlot({ index: null, name: null, credentials: {} });
     });
-    var addSlot = el("button", "", addSlotLabel);
-    addSlot.type = "button";
-    addSlot.addEventListener("click", function () {
-      var current = slotEditorsToSlots();
-      current.push({ index: null, name: null, credentials: {} });
-      renderSlots(current);
-    });
-    slotsEditor.appendChild(addSlot);
+    slotsEditor.appendChild(addSlotButton);
   };
 
   // 当前编辑器内容 → 槽数组(每字段空串 → null = 保留)
@@ -543,9 +823,12 @@ function platformCard(p, isAdmin) {
       addSlotLabel = "添加 AK/SK";
     }
     slotsEditor = el("div", "groups-editor");
+    if (p.type === "opendesign") {
+      fields.appendChild(el("p", "dim", "没有控制密钥也可通过网页登录授权；每个套餐可连接一个 OpenDesign 账号。"));
+    }
     fields.appendChild(slotsEditor);
     renderSlots(p.credential_slots || []);
-  } else if (p.type === "llm-gateway") {
+  } else if (p.type === "sub2api") {
     // base_url 是 gateway 的必填配置,直接在此编辑
     var baseUrlLabel = el("label", "", "base_url");
     baseUrlInput = document.createElement("input");
@@ -704,18 +987,28 @@ function platformCard(p, isAdmin) {
   var errEl = el("span", "form-err");
   var okEl = el("span", "form-ok");
   save.addEventListener("click", async function () {
+    if (slotAuthBusy || savingCard) return;
     errEl.textContent = "";
     okEl.textContent = "";
-    save.disabled = true;
+    savingCard = true;
+    syncCredentialControls();
     try {
       var body = { enabled: enableBox.checked, visibility: vis.getBody() };
       if (displayNameInput.value.trim()) {
         body.display_name = displayNameInput.value.trim();
       }
+      if (maxBalanceInput) {
+        var maxBalance = maxBalanceInput.value.trim();
+        var maxBalanceValue = maxBalance === "" ? 0 : Number(maxBalance);
+        if (!Number.isFinite(maxBalanceValue) || maxBalanceValue < 0) {
+          throw new Error("最大余额需为大于等于 0 的有限数字");
+        }
+        body.max_balance = maxBalanceValue;
+      }
       if (slotFields) {
         body.credential_slots = slotEditorsToSlots();
       }
-      if (p.type === "llm-gateway") {
+      if (p.type === "sub2api") {
         if (baseUrlInput && baseUrlInput.value.trim()) {
           body.base_url = baseUrlInput.value.trim();
         }
@@ -752,11 +1045,14 @@ function platformCard(p, isAdmin) {
       );
       if (!r.ok) { errEl.textContent = await detailOf(r); return; }
       var updated = await r.json();
+      if (maxBalanceInput) {
+        maxBalanceInput.value = updated.max_balance > 0 ? String(updated.max_balance) : "";
+      }
       // 用服务端返回的视图刷新(清空输入 + 新 placeholder)
       if (slotFields) {
         renderSlots(updated.credential_slots || []);
       }
-      if (p.type === "llm-gateway") {
+      if (p.type === "sub2api") {
         serverGroups = updated.groups || [];
         renderGroups(serverGroups);
         if (baseUrlInput) {
@@ -772,7 +1068,8 @@ function platformCard(p, isAdmin) {
     } catch (e) {
       if (e && e.message !== "未登录") errEl.textContent = String(e.message || e);
     } finally {
-      save.disabled = false;
+      savingCard = false;
+      syncCredentialControls();
     }
   });
   foot.appendChild(save);
@@ -783,8 +1080,10 @@ function platformCard(p, isAdmin) {
     var del = el("button", "danger", "删除此供应商");
     del.type = "button";
     del.addEventListener("click", async function () {
+      if (slotAuthBusy || savingCard) return;
       if (!window.confirm("删除后其共享设置一并移除，确定？")) return;
-      del.disabled = true;
+      savingCard = true;
+      syncCredentialControls();
       try {
         var r = await api(
           (isAdmin ? "/api/config/platforms/" : "/api/my/platforms/") +
@@ -796,7 +1095,8 @@ function platformCard(p, isAdmin) {
       } catch (e) {
         if (e && e.message !== "未登录") errEl.textContent = String(e.message || e);
       } finally {
-        del.disabled = false;
+        savingCard = false;
+        syncCredentialControls();
       }
     });
     foot.appendChild(del);
@@ -989,6 +1289,7 @@ async function loadCommon(render, isAdmin) {
     if (!r.ok) { statusEl.textContent = await detailOf(r); return; }
     var data = await r.json();
     currentOrder = (data.platforms || []).map(function (p) { return p.key; });
+    cleanupOpenDesignLogins();
     platformsEl.textContent = "";
     platformsEl.appendChild(await buildAddProviderRow(isAdmin));
     (data.platforms || []).forEach(function (p) {

@@ -28,7 +28,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -44,8 +44,18 @@ from llm_usage.config import (
     set_platform_order,
     update_platform_config,
 )
+from llm_usage.config_schema import ConfigFormatError, to_accounts_config, to_runtime_config
 from llm_usage.display import results_to_dict
 from llm_usage.models import PlatformResult
+from llm_usage.opendesign_auth import (
+    Authorization,
+    DeviceAuthorizationError,
+    DeviceAuthorizationManager,
+)
+from llm_usage.platform_keys import (
+    PlatformKeyConflict,
+    canonical_platform_key,
+)
 from llm_usage.providers import (
     DISPLAY_NAMES,
     PROVIDERS,
@@ -56,6 +66,7 @@ from llm_usage.providers import (
     resolve_provider_key,
     split_instance_key,
 )
+from llm_usage.providers.opendesign import parse_max_balance
 
 logger = logging.getLogger(__name__)
 
@@ -73,14 +84,15 @@ CREDENTIAL_FIELDS: dict[str, list[str]] = {
     "opencode-go": ["api_key"],
     "clinepass": ["api_key"],
     "commandcode": ["api_key"],
-    "llm-gateway": [],  # 纯组式:凭证以 groups[].api_keys 配置,无顶层凭证字段
+    "opendesign": ["control_key"],
+    "sub2api": [],  # 纯组式:凭证以 groups[].api_keys 配置,无顶层凭证字段
 }
 
 _CONFIG_FIELDS = {
-    "enabled", "display_name", "base_url", "api_key", "access_key", "secret_key",
+    "enabled", "display_name", "base_url", "api_key", "control_key", "access_key", "secret_key",
     "groups",
 }
-_CREDENTIAL_NAMES = {"api_key", "access_key", "secret_key"}
+_CREDENTIAL_NAMES = {"api_key", "control_key", "access_key", "secret_key"}
 _GATEWAY_GROUP_FIELDS = {"index", "name", "daily_limit", "api_keys"}
 _GATEWAY_KEY_FIELDS = {"index", "value", "name"}
 
@@ -572,6 +584,7 @@ def _existing_slot(
         return {
             "name": None,
             "api_key": current_section.get("api_key"),
+            "control_key": current_section.get("control_key"),
             "access_key": current_section.get("access_key"),
             "secret_key": current_section.get("secret_key"),
         }
@@ -653,8 +666,35 @@ def _validate_credential_slots(
     return canonical
 
 
+def _slot_migrated_fields(ptype: str) -> set[str]:
+    """Keep OpenDesign's independent model API key when moving control keys to slots."""
+    return {"control_key"} if ptype == "opendesign" else _CREDENTIAL_NAMES
+
+
+def _opendesign_slots(section: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_slots = section.get("credentials")
+    if isinstance(raw_slots, list) and raw_slots:
+        if not all(isinstance(slot, dict) for slot in raw_slots):
+            raise HTTPException(status_code=400, detail="凭证配置无效，请先修正配置")
+        return [dict(slot) for slot in raw_slots]
+    if section.get("control_key"):
+        return [{"control_key": section["control_key"], "name": "套餐1"}]
+    return []
+
+
+def _opendesign_auth_fingerprint(section: dict[str, Any] | None) -> str:
+    """Detect account edits or deletion while the user is authorizing."""
+    target = {
+        "present": section is not None,
+        "credentials": section.get("credentials") if section is not None else None,
+        "control_key": section.get("control_key") if section is not None else None,
+    }
+    return hashlib.sha256(json.dumps(target, sort_keys=True).encode()).hexdigest()
+
+
 def _platform_view(key: str) -> dict[str, Any]:
     """从磁盘读最新配置,返回单个平台的可编辑视图。"""
+    key = canonical_platform_key(key)
     ptype = _require_platform_type(key)
     section = get_platform_config(load_config(), key)
     view = {
@@ -667,7 +707,9 @@ def _platform_view(key: str) -> dict[str, Any]:
         view["credential_slots"] = _credential_slots_view(
             section, CREDENTIAL_FIELDS[ptype]
         )
-    if ptype == "llm-gateway":
+    if ptype == "opendesign":
+        view["max_balance"] = section.get("max_balance")
+    if ptype == "sub2api":
         view["base_url"] = section.get("base_url")
         view["groups"] = _gateway_groups_view(section)
     return view
@@ -763,7 +805,7 @@ def _sorted_platform_keys(
         base, n = split_instance_key(key)
         return (order.get(base, len(cfg_order)), reg.get(base, len(reg)), n or 0)
 
-    return sorted(dict.fromkeys(keys), key=sort_key)
+    return sorted(dict.fromkeys(canonical_platform_key(key) for key in keys), key=sort_key)
 
 
 def _validate_platform_fields(
@@ -773,23 +815,30 @@ def _validate_platform_fields(
     ptype = _require_platform_type(key)
     allowed = {
         "enabled", "visibility", "credential_slots", "base_url", "groups",
-        "display_name",
+        "display_name", "max_balance",
     }
     if allow_top_level_creds:
         allowed |= _CREDENTIAL_NAMES
     extra = sorted(set(body) - allowed)
     if extra:
         raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
+    if "max_balance" in body:
+        if ptype != "opendesign":
+            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: max_balance")
+        try:
+            parse_max_balance(body["max_balance"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     display_name = body.get("display_name")
     if isinstance(display_name, str) and len(display_name.strip()) > 64:
         raise HTTPException(status_code=400, detail="显示名称最长 64 字符")
-    if "groups" in body and ptype != "llm-gateway":
+    if "groups" in body and ptype != "sub2api":
         raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
-    if "base_url" in body and ptype != "llm-gateway":
+    if "base_url" in body and ptype != "sub2api":
         raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
-    if "credential_slots" in body and ptype == "llm-gateway":
+    if "credential_slots" in body and ptype == "sub2api":
         raise HTTPException(
-            status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
+            status_code=400, detail="平台 sub2api 不支持字段: credential_slots"
         )
     if "credential_slots" in body and not CREDENTIAL_FIELDS[ptype]:
         raise HTTPException(
@@ -806,13 +855,13 @@ def _validate_platform_fields(
 def _gateway_updates(
     key: str, body: dict[str, Any], section: dict[str, Any],
 ) -> dict[str, Any]:
-    """llm-gateway 专用:base_url 留空不改;groups 校验 + use_groups=True。
+    """sub2api 专用:base_url 留空不改;groups 校验 + use_groups=True。
 
     display_name 由调用方统一处理(两个端点均全平台支持)。
     """
     updates: dict[str, Any] = {}
     ptype = _platform_type(key)
-    if ptype != "llm-gateway":
+    if ptype != "sub2api":
         return updates
     base_url = body.get("base_url")
     if isinstance(base_url, str) and base_url.strip():
@@ -847,6 +896,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     cache = UserCaches(interval)
     limiter = _LoginLimiter()
     app = FastAPI(title="llm-usage")
+    app.state.opendesign_auth = DeviceAuthorizationManager()
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next: Any) -> Response:
@@ -1278,7 +1328,12 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         platforms = imported.get("platforms")
         if platforms is not None and not isinstance(platforms, dict):
             raise HTTPException(status_code=400, detail="platforms 需为表(字典)")
-        return imported
+        try:
+            decoded = to_runtime_config(imported)
+            to_accounts_config(decoded)  # Validate before replacing either user's stored config.
+            return decoded
+        except (PlatformKeyConflict, ConfigFormatError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
 
     def _import_summary(imported: dict[str, Any]) -> dict[str, Any]:
         """导入结果摘要:平台总数 + 启用数(缺省 enabled 视为启用,与 fetch_all 一致)。"""
@@ -1293,6 +1348,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         return {"ok": True, "platforms": len(platforms), "enabled": enabled}
 
     def _my_platform_view(user: dict[str, Any], key: str) -> dict[str, Any]:
+        key = canonical_platform_key(key)
         ptype = _require_platform_type(key)
         section = get_platform_config(
             store.get_user_config(user["username"]), key
@@ -1311,10 +1367,156 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             view["credential_slots"] = _credential_slots_view(
                 section, CREDENTIAL_FIELDS[ptype]
             )
-        if ptype == "llm-gateway":
+        if ptype == "opendesign":
+            view["max_balance"] = section.get("max_balance")
+        if ptype == "sub2api":
             view["base_url"] = section.get("base_url")
             view["groups"] = _gateway_groups_view(section)
         return view
+
+    # Device grants belong to this signed-in user and one persisted credential
+    # target. The browser only receives the official approval link and code.
+    def _opendesign_auth_user(user: dict[str, Any]) -> dict[str, Any]:
+        return user if user["is_admin"] else _non_admin(user)
+
+    def _opendesign_auth_owner(user: dict[str, Any]) -> str:
+        return f"{user['username']}:{user['created_at']}"
+
+    def _opendesign_section(cfg: dict[str, Any], key: str) -> dict[str, Any] | None:
+        platforms = cfg.get("platforms", {})
+        if not isinstance(platforms, dict):
+            raise HTTPException(status_code=400, detail="供应商配置无效")
+        section = platforms.get(key)
+        if "#" in key and section is None:
+            raise HTTPException(status_code=404, detail="平台未配置")
+        if section is not None and not isinstance(section, dict):
+            raise HTTPException(status_code=400, detail="供应商配置无效")
+        return section
+
+    @app.post("/api/opendesign/auth")
+    def opendesign_auth_start(
+        body: Annotated[dict[str, Any], Body()],
+        user: Annotated[dict[str, Any], Depends(api_user)],
+    ) -> dict[str, Any]:
+        user = _opendesign_auth_user(user)
+        if set(body) - {"platform", "index", "name"}:
+            raise HTTPException(status_code=400, detail="授权请求包含未知字段")
+        key = body.get("platform")
+        if not isinstance(key, str):
+            raise HTTPException(status_code=400, detail="platform 需为供应商键")
+        if _require_platform_type(key) != "opendesign":
+            raise HTTPException(status_code=400, detail="仅 OpenDesign 支持此授权方式")
+        index = body.get("index")
+        if index is not None and (
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+        ):
+            raise HTTPException(status_code=400, detail="index 需为非负整数或 null")
+        name = body.get("name")
+        if name is not None:
+            if not isinstance(name, str) or len(name.strip()) > 100:
+                raise HTTPException(status_code=400, detail="凭证名称需为 1-100 个字符")
+            name = name.strip() or None
+        section = _opendesign_section(_config_for(user), key)
+        slots = _opendesign_slots(section or {})
+        if index is not None and index >= len(slots):
+            raise HTTPException(status_code=400, detail="要授权的凭证不存在")
+        if name and any(
+            slot.get("name") == name for position, slot in enumerate(slots) if position != index
+        ):
+            raise HTTPException(status_code=400, detail="凭证名称重复")
+        try:
+            return app.state.opendesign_auth.start(
+                _opendesign_auth_owner(user), key, index=index, name=name,
+                fingerprint=_opendesign_auth_fingerprint(section),
+            )
+        except DeviceAuthorizationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+
+    @app.post("/api/opendesign/auth/{authorization_id}")
+    def opendesign_auth_poll(
+        authorization_id: str,
+        request: Request,
+        body: Annotated[dict[str, Any], Body()],
+        user: Annotated[dict[str, Any], Depends(api_user)],
+    ) -> dict[str, Any]:
+        user = _opendesign_auth_user(user)
+        if body:
+            raise HTTPException(status_code=400, detail="授权查询不接受额外字段")
+        owner = _opendesign_auth_owner(user)
+
+        def save_authorization(authorization: Authorization) -> dict[str, Any]:
+            def apply(cfg: dict[str, Any]) -> int:
+                current_user = _current_user(request)
+                if current_user is None or _opendesign_auth_owner(current_user) != owner:
+                    raise HTTPException(status_code=401, detail="请重新登录")
+                _opendesign_auth_user(current_user)
+                section = _opendesign_section(cfg, authorization.platform)
+                if _opendesign_auth_fingerprint(section) != authorization.fingerprint:
+                    raise HTTPException(
+                        status_code=409, detail="凭证已被修改，请刷新配置后重新授权",
+                    )
+                section = section if section is not None else {}
+                slots = _opendesign_slots(section)
+                index = authorization.index
+                if index is None:
+                    index = len(slots)
+                    slots.append({})
+                elif index >= len(slots):
+                    raise HTTPException(status_code=409, detail="凭证已被删除，请重新授权")
+                names = {
+                    slot["name"] for i, slot in enumerate(slots)
+                    if i != index and isinstance(slot.get("name"), str)
+                }
+                name = authorization.name or slots[index].get("name")
+                if not isinstance(name, str) or not name.strip():
+                    suffix = index + 1
+                    while f"套餐{suffix}" in names:
+                        suffix += 1
+                    name = f"套餐{suffix}"
+                if name in names:
+                    raise HTTPException(status_code=409, detail="凭证名称已被占用，请重新授权")
+                slots[index].update(name=name, control_key=authorization.control_key)
+                section["credentials"] = slots
+                section.pop("control_key", None)
+                section.setdefault("enabled", True)
+                cfg.setdefault("platforms", {})[authorization.platform] = section
+                return index
+
+            if user["is_admin"]:
+                _, slot_index = mutate_config(apply)
+                view = {
+                    **_platform_view(authorization.platform),
+                    "visibility": _visibility_view(user["username"]).get(
+                        authorization.platform, {"type": "private", "targets": []},
+                    ),
+                }
+            else:
+                _, slot_index = store.mutate_user_config(user["username"], apply)
+                view = _my_platform_view(user, authorization.platform)
+            return {"platform": view, "slot_index": slot_index}
+
+        try:
+            return app.state.opendesign_auth.poll(owner, authorization_id, save_authorization)
+        except DeviceAuthorizationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+        except HTTPException:
+            app.state.opendesign_auth.cancel(owner, authorization_id)
+            raise
+
+    @app.delete("/api/opendesign/auth/{authorization_id}")
+    def opendesign_auth_cancel(
+        authorization_id: str,
+        body: Annotated[dict[str, Any], Body()],
+        user: Annotated[dict[str, Any], Depends(api_user)],
+    ) -> dict[str, str]:
+        user = _opendesign_auth_user(user)
+        if body:
+            raise HTTPException(status_code=400, detail="取消授权不接受额外字段")
+        try:
+            app.state.opendesign_auth.cancel(_opendesign_auth_owner(user), authorization_id)
+        except DeviceAuthorizationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+        return {"status": "cancelled"}
 
     @app.get("/api/my/platforms")
     def my_platforms(
@@ -1336,6 +1538,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         user: dict[str, Any] = Depends(api_user),
     ) -> dict[str, Any]:
         user = _non_admin(user)
+        key = canonical_platform_key(key)
         _validate_platform_fields(key, body, allow_top_level_creds=False)
         ptype = _require_platform_type(key)
         visibility = _validate_visibility_body(body, user["username"])
@@ -1353,13 +1556,15 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             # 槽式保存后清除顶层凭证字段(单 JSON 原子写,无中间态问题)
-            for field in _CREDENTIAL_NAMES:
+            for field in _slot_migrated_fields(ptype):
                 section.pop(field, None)
         display_name = body.get("display_name")
         # 全平台通用;留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
         if isinstance(display_name, str) and display_name.strip():
             section["display_name"] = display_name.strip()
-        if ptype == "llm-gateway":
+        if "max_balance" in body:
+            section["max_balance"] = body["max_balance"] or 0
+        if ptype == "sub2api":
             section.update(_gateway_updates(key, body, section))
         store.set_user_config(user["username"], cfg)
         if visibility is not None:
@@ -1377,6 +1582,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         if extra:
             raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
         ptype = body.get("type")
+        if isinstance(ptype, str):
+            ptype = canonical_platform_key(ptype)
         if not isinstance(ptype, str) or ptype not in PROVIDERS:
             raise HTTPException(status_code=400, detail=f"未知供应商类型: {ptype}")
         cfg = store.get_user_config(user["username"])
@@ -1403,6 +1610,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     ) -> dict[str, bool]:
         """删除自己的供应商实例,级联清理其共享行。"""
         user = _non_admin(user)
+        key = canonical_platform_key(key)
         cfg = store.get_user_config(user["username"])
         _ensure_deletable(key, cfg.get("platforms", {}))
         cfg.get("platforms", {}).pop(key, None)
@@ -1447,6 +1655,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         body: dict[str, Any] = Body(...),
         admin: dict[str, Any] = Depends(api_admin),
     ) -> dict[str, Any]:
+        key = canonical_platform_key(key)
         _validate_platform_fields(key, body, allow_top_level_creds=True)
         ptype = _require_platform_type(key)
         visibility = _validate_visibility_body(body, admin["username"])
@@ -1462,6 +1671,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         # 全平台通用;留空 = 不修改;仅非空字符串写回
         if isinstance(display_name, str) and display_name.strip():
             updates["display_name"] = display_name.strip()
+        if "max_balance" in body:
+            updates["max_balance"] = body["max_balance"] or 0
         for field in CREDENTIAL_FIELDS[ptype]:
             value = body.get(field)
             # 留空 = 不修改;仅非空字符串写回
@@ -1480,7 +1691,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             update_platform_config(
                 key,
                 updates,
-                remove_fields=_CREDENTIAL_NAMES if "credential_slots" in body else (),
+                remove_fields=_slot_migrated_fields(ptype) if "credential_slots" in body else (),
             )
         if visibility is not None:
             _apply_visibility(admin["username"], key, visibility)
@@ -1501,6 +1712,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         if extra:
             raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
         ptype = body.get("type")
+        if isinstance(ptype, str):
+            ptype = canonical_platform_key(ptype)
         if not isinstance(ptype, str) or ptype not in PROVIDERS:
             raise HTTPException(status_code=400, detail=f"未知供应商类型: {ptype}")
 
@@ -1545,6 +1758,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         admin: dict[str, Any] = Depends(api_admin),
     ) -> dict[str, bool]:
         """删除管理员侧实例并级联清理其共享行。"""
+        key = canonical_platform_key(key)
         _ensure_deletable(key, load_config().get("platforms", {}))
         remove_platform_config(key)
         store.delete_platform_visibility(admin["username"], key)
@@ -1558,7 +1772,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         order = body.get("order")
         if not isinstance(order, list) or not all(isinstance(k, str) for k in order):
             raise HTTPException(status_code=400, detail="order 需为字符串数组")
-        known = [k for k in order if _platform_type(k) is not None]
+        canonical_order = dict.fromkeys(canonical_platform_key(key) for key in order)
+        known = [k for k in canonical_order if _platform_type(k) is not None]
         missing = [k for k in PROVIDERS if k not in known]
         full_order = known + missing
         set_platform_order(full_order)

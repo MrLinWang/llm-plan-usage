@@ -16,13 +16,22 @@ import os
 import secrets
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
+from llm_usage.config_schema import to_accounts_config, to_runtime_config
 from llm_usage.models import PlatformResult, UsageEntry
+from llm_usage.platform_keys import (
+    PlatformKeyConflict,
+    canonical_platform_key,
+    normalize_platform_config,
+    platform_key_aliases,
+)
 
 DB_PATH = Path.cwd() / "history.db"
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -76,6 +85,61 @@ def db_path() -> Path:
 _init_lock = threading.Lock()
 _init_done: set[str] = set()
 
+
+def _migrate_sub2api_keys(conn: sqlite3.Connection) -> None:
+    """Rename persisted provider references once, atomically and without data loss."""
+    marker = "migration_sub2api_keys_v1"
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute("SELECT 1 FROM settings WHERE key = ?", (marker,)).fetchone():
+            conn.commit()
+            return
+        conflicting_owners: set[str] = set()
+        for username, raw in conn.execute("SELECT username, config FROM user_configs").fetchall():
+            try:
+                config = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(config, dict):
+                continue
+            try:
+                normalized = normalize_platform_config(config)
+            except PlatformKeyConflict:
+                # Preserve both original accounts for the owner to resolve.
+                conflicting_owners.add(username)
+                continue
+            if normalized != config:
+                conn.execute(
+                    "UPDATE user_configs SET config = ? WHERE username = ?",
+                    (json.dumps(normalized, ensure_ascii=False), username),
+                )
+        for (key,) in conn.execute("SELECT DISTINCT platform FROM snapshots").fetchall():
+            canonical = canonical_platform_key(key)
+            if canonical != key:
+                conn.execute(
+                    "UPDATE snapshots SET platform = ? WHERE platform = ?", (canonical, key),
+                )
+        for owner, key, target in conn.execute(
+            "SELECT owner, platform, target FROM user_shares",
+        ).fetchall():
+            canonical = canonical_platform_key(key)
+            if canonical == key or owner in conflicting_owners:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO user_shares (owner, platform, target) VALUES (?,?,?)",
+                (owner, canonical, target),
+            )
+            conn.execute(
+                "DELETE FROM user_shares WHERE owner = ? AND platform = ? AND target = ?",
+                (owner, key, target),
+            )
+        conn.execute("INSERT INTO settings (key, value) VALUES (?, '1')", (marker,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _init_schema(conn: sqlite3.Connection, path: Path) -> None:
     """每个数据库文件在进程内只执行一次 DDL(测试多库互不干扰)。"""
     key = str(path)
@@ -89,6 +153,7 @@ def _init_schema(conn: sqlite3.Connection, path: Path) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
         if "plan" not in cols:
             conn.execute("ALTER TABLE snapshots ADD COLUMN plan TEXT")
+        _migrate_sub2api_keys(conn)
         _init_done.add(key)
 
 
@@ -138,7 +203,7 @@ def save_snapshot(
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         ts,
-                        res.platform,
+                        canonical_platform_key(res.platform),
                         e.label,
                         e.used,
                         e.limit,
@@ -173,8 +238,9 @@ def query_history(
         clauses: list[str] = []
         params: list[Any] = []
         if platform:
-            clauses.append("platform = ?")
-            params.append(platform)
+            aliases = platform_key_aliases(platform)
+            clauses.append("platform IN (" + ",".join("?" for _ in aliases) + ")")
+            params.extend(aliases)
         if days is not None:
             import datetime as _dt
 
@@ -186,7 +252,10 @@ def query_history(
         sql += " ORDER BY ts ASC"
         cur = conn.execute(sql, params)
         cols = [c[0] for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
+        for row in rows:
+            row["platform"] = canonical_platform_key(row["platform"])
+        return rows
     finally:
         conn.close()
 
@@ -506,13 +575,14 @@ def get_user_config(
         return {}
     if not isinstance(data, dict):
         return {}
-    return data
+    return to_runtime_config(data)
 
 
 def set_user_config(
     username: str, config: dict[str, Any], path: Path | None = None
 ) -> None:
     """INSERT OR REPLACE a user's own platform config."""
+    config = to_accounts_config(config)
     conn = _connect(path)
     try:
         conn.execute(
@@ -537,6 +607,39 @@ def delete_user_config(username: str, path: Path | None = None) -> None:
         conn.close()
 
 
+def mutate_user_config(
+    username: str, mutation: Callable[[dict[str, Any]], _T], path: Path | None = None,
+) -> tuple[dict[str, Any], _T]:
+    """Atomically merge an authorization result into the latest user config.
+
+    The callback runs inside a write transaction, so deleting an account or
+    finishing another authorization cannot replace an older config snapshot.
+    Exceptions roll back without persisting credentials.
+    """
+    conn = _connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT config FROM user_configs WHERE username = ?", (username,),
+        ).fetchone()
+        try:
+            data = json.loads(row[0]) if row else {}
+        except (ValueError, TypeError):
+            data = {}
+        config = to_runtime_config(data if isinstance(data, dict) else {})
+        result = mutation(config)
+        config = to_runtime_config(config)
+        persisted = to_accounts_config(config)
+        conn.execute(
+            "INSERT OR REPLACE INTO user_configs (username, config, updated_at) VALUES (?,?,?)",
+            (username, json.dumps(persisted, ensure_ascii=False), _now_iso()),
+        )
+        conn.commit()
+        return config, result
+    finally:
+        conn.close()
+
+
 def list_shared_platforms(
     username: str, path: Path | None = None
 ) -> list[dict[str, str]]:
@@ -553,7 +656,8 @@ def list_shared_platforms(
             "ORDER BY s.owner",
             (username,),
         ).fetchall()
-        return [{"owner": r[0], "platform": r[1]} for r in rows]
+        canonical_rows = dict.fromkeys((r[0], canonical_platform_key(r[1])) for r in rows)
+        return [{"owner": owner, "platform": key} for owner, key in canonical_rows]
     finally:
         conn.close()
 
@@ -569,7 +673,8 @@ def list_my_visibility(
             "ORDER BY platform, target",
             (username,),
         ).fetchall()
-        return [{"platform": r[0], "target": r[1]} for r in rows]
+        canonical_rows = dict.fromkeys((canonical_platform_key(r[0]), r[1]) for r in rows)
+        return [{"platform": key, "target": target} for key, target in canonical_rows]
     finally:
         conn.close()
 
@@ -578,11 +683,14 @@ def set_platform_visibility(
     username: str, platform: str, target: str, path: Path | None = None
 ) -> None:
     """Replace one platform's visibility rows; empty ``target`` = clear only."""
+    aliases = platform_key_aliases(platform)
+    platform = aliases[0]
     conn = _connect(path)
     try:
         conn.execute(
-            "DELETE FROM user_shares WHERE owner = ? AND platform = ?",
-            (username, platform),
+            "DELETE FROM user_shares WHERE owner = ? AND platform IN ("
+            + ",".join("?" for _ in aliases) + ")",
+            (username, *aliases),
         )
         if target:
             conn.execute(
@@ -602,11 +710,14 @@ def replace_platform_visibility(
     Targets are the deduped normalized user list from the visibility API:
     ``["*"]`` = public, ``[]`` = private, otherwise per-user targets.
     """
+    aliases = platform_key_aliases(platform)
+    platform = aliases[0]
     conn = _connect(path)
     try:
         conn.execute(
-            "DELETE FROM user_shares WHERE owner = ? AND platform = ?",
-            (username, platform),
+            "DELETE FROM user_shares WHERE owner = ? AND platform IN ("
+            + ",".join("?" for _ in aliases) + ")",
+            (username, *aliases),
         )
         for target in targets:
             conn.execute(
@@ -622,11 +733,13 @@ def delete_platform_visibility(
     username: str, platform: str, path: Path | None = None
 ) -> None:
     """Delete every share row of one owned platform (instance-removal cascade)."""
+    aliases = platform_key_aliases(platform)
     conn = _connect(path)
     try:
         conn.execute(
-            "DELETE FROM user_shares WHERE owner = ? AND platform = ?",
-            (username, platform),
+            "DELETE FROM user_shares WHERE owner = ? AND platform IN ("
+            + ",".join("?" for _ in aliases) + ")",
+            (username, *aliases),
         )
         conn.commit()
     finally:

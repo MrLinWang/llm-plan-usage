@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +20,10 @@ class TestConfigInit:
         assert "[platforms.kimi]" in text
         assert "[platforms.ollama]" in text
         assert "[platforms.opencode-go]" in text
-        assert "[platforms.llm-gateway]" in text
-        # 多计费套餐注释(注释行,不进 TOML 本体)
-        assert "credentials" in text
+        assert "[platforms.opendesign]" in text
+        assert "[platforms.sub2api]" in text
+        assert "[[platforms.kimi.accounts]]" in text
+        assert "[[platforms.sub2api.accounts]]" in text
 
     def test_init_refuses_overwrite_without_flag(self, tmp_path: Path) -> None:
         p = tmp_path / "config.toml"
@@ -47,6 +49,38 @@ class TestConfigInit:
 
 
 class TestConfigLoadSave:
+    @pytest.mark.parametrize("api_key", ["x", "env:KIMI_API_KEY", "sk-" + "a" * 120])
+    def test_account_table_format_is_stable_for_short_and_long_keys(
+        self, tmp_path: Path, api_key: str,
+    ) -> None:
+        path = tmp_path / "config.toml"
+        original = {"platforms": {
+            "kimi": {"api_key": api_key, "enabled": False},
+            "sub2api": {"enabled": True, "base_url": "https://sub2api.test", "groups": [
+                {"name": "共享账号", "api_keys": [{"name": "主 Key", "value": "env:KEY"}]},
+            ]},
+        }}
+        C.save_config(original, path)
+        text = path.read_text()
+        assert "[[platforms.kimi.accounts]]" in text
+        assert "[[platforms.sub2api.accounts]]" in text
+        assert "[[platforms.sub2api.accounts.api_keys]]" in text
+        assert "accounts = [" not in text
+        raw = tomllib.loads(text)
+        assert raw["platforms"]["kimi"] == {"enabled": False, "accounts": [{"api_key": api_key}]}
+        assert C.load_config(path) == original
+        C.save_config(C.load_config(path), path)
+        assert path.read_text() == text
+
+    def test_account_formatter_handles_quoted_instance_and_extension_keys(self) -> None:
+        original = {"platforms": {"kimi#2": {
+            "enabled": True, "api_key": "env:KIMI_API_KEY",
+            "附加设置": {"quoted = key": {"a.b": [1, 2]}},
+        }}}
+        text = C.format_config(original)
+        assert '[[platforms."kimi#2".accounts]]' in text
+        assert C.to_runtime_config(tomllib.loads(text)) == original
+
     def test_load_missing_returns_empty(self, tmp_path: Path) -> None:
         assert C.load_config(tmp_path / "nonexistent.toml") == {}
 
@@ -109,6 +143,10 @@ class TestEnvPrefix:
         C.init_config(p)
         cfg = C.load_config(p)
         assert cfg["platforms"]["kimi"]["api_key"] == "env:KIMI_API_KEY"
+        assert cfg["platforms"]["opendesign"]["control_key"] == "env:OPENDESIGN_CONTROL_KEY"
+        assert cfg["platforms"]["opendesign"]["base_url"] == (
+            "https://amr-link.open-design.ai/v1"
+        )
 
 
 class TestPlatformOrder:
@@ -124,3 +162,40 @@ class TestPlatformOrder:
         ]
         assert C.get_platform_order({"platform_order": "kimi"}) == []
         assert C.get_platform_order({}) == []
+
+
+class TestConfigFormatCommand:
+    def test_format_migrates_current_file_without_printing_credentials(
+        self, tmp_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from click.testing import CliRunner
+
+        from llm_usage.cli import main
+
+        monkeypatch.setattr("llm_usage.cli.setup_cli_logging", lambda: None)
+        tmp_config_path.write_text('[platforms.kimi]\nenabled = true\napi_key = "private-key"\n')
+        result = CliRunner().invoke(main, ["config", "--format"])
+        assert result.exit_code == 0, result.output
+        assert "private-key" not in result.output
+        assert "已统一配置格式" in result.output
+        raw = tomllib.loads(tmp_config_path.read_text())
+        assert raw["platforms"]["kimi"]["accounts"] == [{"api_key": "private-key"}]
+        assert tmp_config_path.stat().st_mode & 0o777 == 0o600
+        before = tmp_config_path.read_bytes()
+        assert CliRunner().invoke(main, ["config", "--format"]).exit_code == 0
+        assert tmp_config_path.read_bytes() == before
+
+    def test_format_error_preserves_the_file(
+        self, tmp_config_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from click.testing import CliRunner
+
+        from llm_usage.cli import main
+
+        monkeypatch.setattr("llm_usage.cli.setup_cli_logging", lambda: None)
+        original = '[platforms.kimi]\naccounts = "private-invalid-value"\n'
+        tmp_config_path.write_text(original)
+        result = CliRunner().invoke(main, ["config", "--format"])
+        assert result.exit_code == 2
+        assert "private-invalid-value" not in result.output
+        assert tmp_config_path.read_text() == original

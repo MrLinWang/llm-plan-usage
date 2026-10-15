@@ -20,7 +20,7 @@ class TestConfigInit:
         assert "[platforms.ollama]" in text
         assert "[platforms.opencode-go]" in text
         assert "[platforms.opendesign]" in text
-        assert "[platforms.llm-gateway]" in text
+        assert "[platforms.sub2api]" in text
         # 多计费套餐注释(注释行,不进 TOML 本体)
         assert "credentials" in text
 

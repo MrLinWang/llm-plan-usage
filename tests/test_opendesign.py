@@ -54,6 +54,37 @@ def _client(payload: Any = None, *, fail_path: str = "", status: int = 200) -> h
 
 
 class TestOpenDesign:
+    @pytest.mark.parametrize("balance,maximum,percent", [
+        (100, 100, 0), (25, 100, 75), (0, 100, 100), (-2, 100, 100),
+        (150, 100, 0), (12.5, 50, 75), (25, 0, None), (25, None, None),
+    ])
+    def test_wallet_progress_uses_configured_scale_without_inventing_spend(
+        self, balance, maximum, percent,
+    ) -> None:
+        payload = _payload()
+        payload["balanceUsd"] = str(balance)
+        with _client(payload) as client:
+            result = OpenDesignProvider(client).fetch({
+                "control_key": CONTROL_KEY, "max_balance": maximum,
+            })
+        assert result.ok
+        wallet = result.entries[-1]
+        assert (wallet.used, wallet.remaining) == (0, balance)
+        assert wallet.limit == (maximum or None)
+        assert wallet.percent == percent
+        assert result.entries[0].percent == 60  # credit windows keep usage semantics
+        assert results_to_dict([result])["platforms"][0]["entries"][-1]["percent"] == percent
+
+    @pytest.mark.parametrize("maximum", [-1, True, "100", [], float("nan"), float("inf")])
+    def test_invalid_wallet_scale_never_sends_request(self, maximum) -> None:
+        def handler(request):
+            pytest.fail("invalid display scales must be rejected before HTTP")
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = OpenDesignProvider(client).fetch({
+                "control_key": CONTROL_KEY, "max_balance": maximum,
+            })
+        assert result.error and result.error.startswith("配置错误")
+
     def test_live_shape_and_json(self) -> None:
         with _client() as client:
             result = OpenDesignProvider(client=client).fetch({
@@ -66,7 +97,7 @@ class TestOpenDesign:
         assert result.ok and result.warning is None
         assert result.platform == "opendesign#2" and result.display_name == "设计账户"
         five_hour, weekly, wallet = result.entries
-        assert [e.label for e in result.entries] == ["5小时", "每周", "余额"]
+        assert [e.label for e in result.entries] == ["5小时", "每周", "余额用量"]
         assert {e.platform for e in result.entries} == {"opendesign#2"}
         assert (five_hour.used, five_hour.limit, five_hour.remaining, five_hour.percent) == (
             60, 100, 40, 60,
@@ -182,7 +213,7 @@ class TestOpenDesign:
         body = _payload()
         body["codingPlan"]["windows"][0][field] = value
         entries, warning = _parse_usage_payload(body, "opendesign", WORKSPACE)
-        assert [e.label for e in entries] == ["5小时", "余额"]
+        assert [e.label for e in entries] == ["5小时", "余额用量"]
         assert warning
 
     def test_missing_balance_keeps_window_data_with_warning(self) -> None:
@@ -205,7 +236,7 @@ class TestOpenDesign:
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
             monkeypatch.setitem(PROVIDERS, "opendesign", OpenDesignProvider(client))
             results = fetch_all({"platforms": {"opendesign#2": {
-                "enabled": True, "credentials": [
+                "enabled": True, "max_balance": 50, "credentials": [
                     {"name": "账户A", "control_key": "env:DESIGN_CONTROL"},
                     {"name": "账户B", "control_key": "env:DESIGN_CONTROL"},
                 ],
@@ -213,5 +244,8 @@ class TestOpenDesign:
         assert len(results) == 1 and results[0].ok
         assert {e.plan for e in results[0].entries} == {"账户A", "账户B"}
         assert all(e.platform == "opendesign#2" for e in results[0].entries)
+        wallets = [e for e in results[0].entries if e.label == "余额用量"]
+        assert len(wallets) == 2
+        assert all((e.limit, e.percent) == (50, 75.3) for e in wallets)
         assert all(r.headers["authorization"] == f"Bearer {CONTROL_KEY}" for r in attempts)
         assert len(attempts) == 5  # one transient failure plus two successful calls per slot

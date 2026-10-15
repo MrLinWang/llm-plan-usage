@@ -5,7 +5,7 @@ All live providers are exercised with ``httpx.MockTransport`` (no network):
   - Volcengine: OpenAPI V4 signing, GetCodingPlanUsage (percent-only) + GetAFPUsage
   - Ollama: dual-shape /api/balance parsing (legacy windows + credits pool)
   - OpenCode Go / ClinePass / Command Code: window parsing + neutral errors
-  - LLM Gateway: ``actual_cost`` extraction, groups, sanitized per-key errors
+  - Sub2API: ``actual_cost`` extraction, groups, sanitized per-key errors
   - Registry: dispatch, credential fan-out, instance keys, error isolation
 """
 
@@ -31,8 +31,8 @@ from llm_usage.providers.kimi import (
     _parse_usage_payload,
     _window_label,
 )
-from llm_usage.providers.llm_gateway import (
-    LlmGatewayProvider,
+from llm_usage.providers.sub2api import (
+    Sub2ApiProvider,
     _key_usage,
 )
 from llm_usage.providers.clinepass import (
@@ -914,7 +914,7 @@ class TestCommandCodeHttp:
 
 
 # ---------------------------------------------------------------------------
-# LLM Gateway (local Sub2API-compatible gateway)
+# Sub2API
 # ---------------------------------------------------------------------------
 
 def _gateway_usage_payload() -> dict:
@@ -1001,12 +1001,12 @@ class TestGatewayHttp:
             assert req.headers["Authorization"] == "Bearer secret"
             return httpx.Response(200, json=_gateway_usage_payload())
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
             "api_key": "env:GATEWAY_TEST_KEY",
-            "base_url": "http://llm-gateway.test",
-            "_platform_key": "llm-gateway",
-            "display_name": "LLM Gateway",
+            "base_url": "http://sub2api.test",
+            "_platform_key": "sub2api",
+            "display_name": "Sub2API",
         })
         assert result.ok
         assert result.entries[0].used == 1.94
@@ -1017,10 +1017,10 @@ class TestGatewayHttp:
             assert req.headers["Authorization"] == "Bearer explicit"
             return httpx.Response(200, json=_gateway_usage_payload())
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
             "api_key": "explicit",
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "usage_path": "/custom-usage",
         })
         assert result.ok
@@ -1029,22 +1029,22 @@ class TestGatewayHttp:
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(401, json={"code": "INVALID_API_KEY"})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
             "api_key": "invalid",
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
         })
         assert not result.ok
         assert "401" in result.error
-        assert "LLM_GATEWAY_API_KEY" in result.error
+        assert "SUB2API_API_KEY" in result.error
 
     def test_no_key_returns_unconfigured(self) -> None:
-        result = LlmGatewayProvider().fetch({"base_url": "http://llm-gateway.test"})
+        result = Sub2ApiProvider().fetch({"base_url": "http://sub2api.test"})
         assert not result.ok
         assert result.error == "未配置 API key"
 
     def test_no_base_url_returns_error(self) -> None:
-        result = LlmGatewayProvider().fetch({"api_key": "secret"})
+        result = Sub2ApiProvider().fetch({"api_key": "secret"})
         assert not result.ok
         assert result.error == "未配置 base_url"
 
@@ -1056,9 +1056,9 @@ class TestGatewayHttp:
             cost = "1.25" if req.headers["Authorization"] == "Bearer key-a" else "0.75"
             return httpx.Response(200, json={"usage": {"today": {"actual_cost": cost}}})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [
                 {"name": "team-a", "daily_limit": 10, "api_keys": ["key-a", "key-b"]},
             ],
@@ -1076,9 +1076,9 @@ class TestGatewayHttp:
                 return httpx.Response(401)
             return httpx.Response(200, json={"usage": {"today": {"actual_cost": "2"}}})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{"name": "team", "api_keys": ["good", "bad"]}],
         })
         assert result.ok
@@ -1090,18 +1090,18 @@ class TestGatewayHttp:
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(401)
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{"name": "team", "api_keys": ["bad-a", "bad-b"]}],
         })
         assert not result.ok
         assert result.entries == []
 
     def test_duplicate_key_across_groups_is_a_config_error(self) -> None:
-        provider = LlmGatewayProvider(client=_mock_client(lambda req: httpx.Response(200, json={})))
+        provider = Sub2ApiProvider(client=_mock_client(lambda req: httpx.Response(200, json={})))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [
                 {"name": "a", "api_keys": ["shared"]},
                 {"name": "b", "api_keys": ["shared"]},
@@ -1117,9 +1117,9 @@ class TestGatewayHttp:
                 return httpx.Response(401)
             return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.25"}}})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{
                 "name": "team-a",
                 "api_keys": [
@@ -1138,7 +1138,7 @@ class TestGatewayHttp:
         assert "备份 Key" in breakdown[1]["error"]
         # 旧别名形式 key_names 同样生效
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{
                 "name": "team-b",
                 "api_keys": ["key-good"],
@@ -1149,7 +1149,7 @@ class TestGatewayHttp:
         assert breakdown[0]["name"] == "团队 B"
         # 同时配置时,条目内 name 优先于 key_names 别名
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{
                 "name": "team-c",
                 "api_keys": [{"name": "条目名", "value": "key-good"}],
@@ -1167,9 +1167,9 @@ class TestGatewayHttp:
             cost = "1.25" if auth == "Bearer key-a" else "0.75"
             return httpx.Response(200, json={"usage": {"today": {"actual_cost": cost}}})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{
                 "name": "team-a", "daily_limit": 10,
                 "api_keys": ["key-a", "key-b", "key-c"],
@@ -1190,8 +1190,8 @@ class TestGatewayHttp:
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.94"}}})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
-        result = provider.fetch({"base_url": "http://llm-gateway.test", "api_key": "solo"})
+        provider = Sub2ApiProvider(client=_mock_client(handler))
+        result = provider.fetch({"base_url": "http://sub2api.test", "api_key": "solo"})
         assert result.ok
         breakdown = result.entries[0].key_breakdown
         assert breakdown == [{"number": 1, "name": None, "used": 1.94, "ok": True, "error": None}]
@@ -1201,10 +1201,10 @@ class TestGatewayHttp:
             assert req.headers["Authorization"] == "Bearer group-key"
             return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.25"}}})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         # api_key 已配置但被忽略:显式分组模式只走 groups
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "api_key": "solo-key",
             "use_groups": True,
             "groups": [{"name": "team", "api_keys": ["group-key"]}],
@@ -1213,9 +1213,9 @@ class TestGatewayHttp:
         assert [(e.label, e.plan) for e in result.entries] == [("每日", "team")]
 
     def test_use_groups_true_without_groups_is_error(self) -> None:
-        provider = LlmGatewayProvider(client=_mock_client(lambda req: httpx.Response(200, json={})))
+        provider = Sub2ApiProvider(client=_mock_client(lambda req: httpx.Response(200, json={})))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test", "api_key": "solo",
+            "base_url": "http://sub2api.test", "api_key": "solo",
             "use_groups": True,
         })
         assert not result.ok
@@ -1226,10 +1226,10 @@ class TestGatewayHttp:
             assert req.headers["Authorization"] == "Bearer solo-key"
             return httpx.Response(200, json={"usage": {"today": {"actual_cost": "1.94"}}})
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         # 磁盘上还留着分组,但显式单 Key 模式忽略它们
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "api_key": "solo-key",
             "use_groups": False,
             "groups": [{"name": "team", "api_keys": ["group-key"]}],
@@ -1257,9 +1257,9 @@ class TestGatewaySubscriptionWindows:
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=_gateway_subscription_payload())
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{"name": "测试组A", "api_keys": ["k1"]}],
         })
         assert result.ok
@@ -1280,9 +1280,9 @@ class TestGatewaySubscriptionWindows:
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=_gateway_subscription_payload())
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{"name": "组A", "daily_limit": 50, "api_keys": ["k1"]}],
         })
         assert [e.limit for e in result.entries] == [50.0, 1000.0, 4000.0]
@@ -1292,9 +1292,9 @@ class TestGatewaySubscriptionWindows:
             daily = "1.5" if req.headers["Authorization"] == "Bearer k1" else "0.5"
             return httpx.Response(200, json=_gateway_subscription_payload(daily=daily))
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{"name": "组A", "api_keys": ["k1", "k2"]}],
         })
         assert (result.entries[0].label, result.entries[0].used) == ("每日", 2.0)
@@ -1307,9 +1307,9 @@ class TestGatewaySubscriptionWindows:
                 return httpx.Response(401)
             return httpx.Response(200, json=_gateway_subscription_payload())
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test",
+            "base_url": "http://sub2api.test",
             "groups": [{"name": "组A", "api_keys": ["good", "bad"]}],
         })
         assert result.ok
@@ -1320,9 +1320,9 @@ class TestGatewaySubscriptionWindows:
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=_gateway_subscription_payload())
 
-        provider = LlmGatewayProvider(client=_mock_client(handler))
+        provider = Sub2ApiProvider(client=_mock_client(handler))
         result = provider.fetch({
-            "base_url": "http://llm-gateway.test", "api_key": "solo",
+            "base_url": "http://sub2api.test", "api_key": "solo",
         })
         assert [(e.label, e.plan) for e in result.entries] == [
             ("每日", None), ("每周", None), ("每月", None),
@@ -1337,7 +1337,7 @@ class TestRegistry:
     def test_all_providers_registered(self) -> None:
         assert set(PROVIDERS.keys()) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "opendesign", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
         }
 
     def test_env_prefix_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1624,8 +1624,8 @@ class TestRegistryCredentialFanout:
     ) -> None:
         """未做凭证展开的 provider 自带 plan(gateway 分组)不被覆盖成 None。"""
         class _PlanProvider:
-            name = "llm-gateway"
-            display_name = "LLM Gateway"
+            name = "sub2api"
+            display_name = "Sub2API"
             is_manual = False
 
             def fetch(self, config: dict) -> PlatformResult:
@@ -1633,13 +1633,13 @@ class TestRegistryCredentialFanout:
                     config.get("_platform_key", self.name),
                     self.display_name,
                     entries=[
-                        UsageEntry("llm-gateway", "每日", 1.0, 200.0, 199.0, 0.5,
+                        UsageEntry("sub2api", "每日", 1.0, 200.0, 199.0, 0.5,
                                    None, "$", False, "测试组A"),
                     ],
                 )
 
-        monkeypatch.setitem(PROVIDERS, "llm-gateway", _PlanProvider())
-        results = fetch_all({"platforms": {"llm-gateway": {"enabled": True}}})
+        monkeypatch.setitem(PROVIDERS, "sub2api", _PlanProvider())
+        results = fetch_all({"platforms": {"sub2api": {"enabled": True}}})
         assert [e.plan for e in results[0].entries] == ["测试组A"]
 
     def test_fetch_all_credentials_empty_list_uses_legacy_path(
@@ -1684,7 +1684,7 @@ class TestInstanceKeys:
     def test_resolve_provider_key(self) -> None:
         assert resolve_provider_key("kimi") == "kimi"
         assert resolve_provider_key("kimi#2") == "kimi"
-        assert resolve_provider_key("llm-gateway#3") == "llm-gateway"
+        assert resolve_provider_key("sub2api#3") == "sub2api"
         assert resolve_provider_key("foo") is None
         assert resolve_provider_key("foo#9") is None
 
@@ -1856,8 +1856,8 @@ class TestFetchAllRetry:
         """
 
         class _PartialProvider:
-            name = "llm-gateway"
-            display_name = "LLM Gateway"
+            name = "sub2api"
+            display_name = "Sub2API"
             is_manual = False
 
             def __init__(self) -> None:
@@ -1866,16 +1866,16 @@ class TestFetchAllRetry:
             def fetch(self, cfg: dict) -> PlatformResult:
                 self.calls += 1
                 return PlatformResult(
-                    cfg.get("_platform_key", "llm-gateway"),
-                    cfg.get("display_name", "LLM Gateway"),
-                    entries=[UsageEntry("llm-gateway", "组1", 1.0, 10.0, 9.0,
+                    cfg.get("_platform_key", "sub2api"),
+                    cfg.get("display_name", "Sub2API"),
+                    entries=[UsageEntry("sub2api", "组1", 1.0, 10.0, 9.0,
                                         10.0, None, "$", False)],
                     warning="组1 key#2：网络错误",
                 )
 
         provider = _PartialProvider()
-        monkeypatch.setitem(PROVIDERS, "llm-gateway", provider)
-        cfg = {"platforms": {"llm-gateway": {"enabled": True}}}
+        monkeypatch.setitem(PROVIDERS, "sub2api", provider)
+        cfg = {"platforms": {"sub2api": {"enabled": True}}}
         results = fetch_all(cfg)
         assert provider.calls == 1
         assert results[0].ok

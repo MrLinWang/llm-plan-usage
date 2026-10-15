@@ -128,6 +128,7 @@ const first = slotBoxes(card)[0], other = slotBoxes(card)[1];
 inputFor(first, '账户控制密钥').value = 'unsaved-old-control-key';
 inputFor(other, '账户控制密钥').value = 'other-account-draft';
 inputFor(card, '显示名称').value = '尚未保存的新名称';
+inputFor(card, '最大余额 ($)').value = '50';
 // The first checkbox is the platform's enabled field.
 const enabled = nodes(card).find(e => e.tag === 'input' && e.type === 'checkbox');
 enabled.checked = true;
@@ -152,6 +153,7 @@ assert.equal(inputFor(first, '账户控制密钥').value, '');
 assert.equal(inputFor(first, '账户控制密钥').placeholder, '已设置 (vela…12)');
 assert.equal(inputFor(other, '账户控制密钥').value, 'other-account-draft');
 assert.equal(inputFor(card, '显示名称').value, '尚未保存的新名称');
+assert.equal(inputFor(card, '最大余额 ($)').value, '50');
 assert.equal(enabled.checked, true);
 assert.match(first.textContent, /授权成功，凭证已自动保存/);
 // Adding a slot must preserve manual input drafts in every previous slot.
@@ -168,10 +170,38 @@ answers.push(response(platform([credentialSlot(0), credentialSlot(1), credential
 await button(card, '保存').click();
 const saved = JSON.parse(requests.at(-1).body);
 assert.equal(saved.enabled, true); assert.equal(saved.display_name, '尚未保存的新名称');
+assert.equal(saved.max_balance, 50);
 assert.equal(saved.credential_slots[0].control_key, null);
 assert.equal(saved.credential_slots[1].control_key, 'other-account-draft');
 assert.equal(saved.credential_slots[2].index, 2);
 assert.ok(requests.at(-1).url.startsWith('/api/config/platforms/'));
+""")
+
+
+def test_wallet_scale_editor_saves_clears_and_validates_in_both_modes() -> None:
+    _run_scenario(r"""
+for (const isAdmin of [true, false]) {
+  const p = {...platform([credentialSlot(0)]), max_balance: 100};
+  const card = platformCard(p, isAdmin);
+  const input = inputFor(card, '最大余额 ($)');
+  assert.equal(input.value, '100');
+  input.value = '-1';
+  const previous = requests.length;
+  await button(card, '保存').click();
+  assert.equal(requests.length, previous);
+  assert.match(card.textContent, /最大余额需为/);
+  input.value = '250.5';
+  answers.push(response({...p, max_balance: 250.5}));
+  await button(card, '保存').click();
+  assert.equal(JSON.parse(requests.at(-1).body).max_balance, 250.5);
+  assert.equal(input.value, '250.5');
+  assert.ok(requests.at(-1).url.startsWith(isAdmin ? '/api/config/' : '/api/my/'));
+  input.value = '';
+  answers.push(response({...p, max_balance: 0}));
+  await button(card, '保存').click();
+  assert.equal(JSON.parse(requests.at(-1).body).max_balance, 0);
+  assert.equal(input.value, '');
+}
 """)
 
 

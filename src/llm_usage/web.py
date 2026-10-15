@@ -51,6 +51,11 @@ from llm_usage.opendesign_auth import (
     DeviceAuthorizationError,
     DeviceAuthorizationManager,
 )
+from llm_usage.platform_keys import (
+    PlatformKeyConflict,
+    canonical_platform_key,
+    normalize_platform_config,
+)
 from llm_usage.providers import (
     DISPLAY_NAMES,
     PROVIDERS,
@@ -61,6 +66,7 @@ from llm_usage.providers import (
     resolve_provider_key,
     split_instance_key,
 )
+from llm_usage.providers.opendesign import parse_max_balance
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +85,7 @@ CREDENTIAL_FIELDS: dict[str, list[str]] = {
     "clinepass": ["api_key"],
     "commandcode": ["api_key"],
     "opendesign": ["control_key"],
-    "llm-gateway": [],  # 纯组式:凭证以 groups[].api_keys 配置,无顶层凭证字段
+    "sub2api": [],  # 纯组式:凭证以 groups[].api_keys 配置,无顶层凭证字段
 }
 
 _CONFIG_FIELDS = {
@@ -688,6 +694,7 @@ def _opendesign_auth_fingerprint(section: dict[str, Any] | None) -> str:
 
 def _platform_view(key: str) -> dict[str, Any]:
     """从磁盘读最新配置,返回单个平台的可编辑视图。"""
+    key = canonical_platform_key(key)
     ptype = _require_platform_type(key)
     section = get_platform_config(load_config(), key)
     view = {
@@ -700,7 +707,9 @@ def _platform_view(key: str) -> dict[str, Any]:
         view["credential_slots"] = _credential_slots_view(
             section, CREDENTIAL_FIELDS[ptype]
         )
-    if ptype == "llm-gateway":
+    if ptype == "opendesign":
+        view["max_balance"] = section.get("max_balance")
+    if ptype == "sub2api":
         view["base_url"] = section.get("base_url")
         view["groups"] = _gateway_groups_view(section)
     return view
@@ -796,7 +805,7 @@ def _sorted_platform_keys(
         base, n = split_instance_key(key)
         return (order.get(base, len(cfg_order)), reg.get(base, len(reg)), n or 0)
 
-    return sorted(dict.fromkeys(keys), key=sort_key)
+    return sorted(dict.fromkeys(canonical_platform_key(key) for key in keys), key=sort_key)
 
 
 def _validate_platform_fields(
@@ -806,23 +815,30 @@ def _validate_platform_fields(
     ptype = _require_platform_type(key)
     allowed = {
         "enabled", "visibility", "credential_slots", "base_url", "groups",
-        "display_name",
+        "display_name", "max_balance",
     }
     if allow_top_level_creds:
         allowed |= _CREDENTIAL_NAMES
     extra = sorted(set(body) - allowed)
     if extra:
         raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
+    if "max_balance" in body:
+        if ptype != "opendesign":
+            raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: max_balance")
+        try:
+            parse_max_balance(body["max_balance"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     display_name = body.get("display_name")
     if isinstance(display_name, str) and len(display_name.strip()) > 64:
         raise HTTPException(status_code=400, detail="显示名称最长 64 字符")
-    if "groups" in body and ptype != "llm-gateway":
+    if "groups" in body and ptype != "sub2api":
         raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: groups")
-    if "base_url" in body and ptype != "llm-gateway":
+    if "base_url" in body and ptype != "sub2api":
         raise HTTPException(status_code=400, detail=f"平台 {key} 不支持字段: base_url")
-    if "credential_slots" in body and ptype == "llm-gateway":
+    if "credential_slots" in body and ptype == "sub2api":
         raise HTTPException(
-            status_code=400, detail="平台 llm-gateway 不支持字段: credential_slots"
+            status_code=400, detail="平台 sub2api 不支持字段: credential_slots"
         )
     if "credential_slots" in body and not CREDENTIAL_FIELDS[ptype]:
         raise HTTPException(
@@ -839,13 +855,13 @@ def _validate_platform_fields(
 def _gateway_updates(
     key: str, body: dict[str, Any], section: dict[str, Any],
 ) -> dict[str, Any]:
-    """llm-gateway 专用:base_url 留空不改;groups 校验 + use_groups=True。
+    """sub2api 专用:base_url 留空不改;groups 校验 + use_groups=True。
 
     display_name 由调用方统一处理(两个端点均全平台支持)。
     """
     updates: dict[str, Any] = {}
     ptype = _platform_type(key)
-    if ptype != "llm-gateway":
+    if ptype != "sub2api":
         return updates
     base_url = body.get("base_url")
     if isinstance(base_url, str) and base_url.strip():
@@ -1312,7 +1328,10 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         platforms = imported.get("platforms")
         if platforms is not None and not isinstance(platforms, dict):
             raise HTTPException(status_code=400, detail="platforms 需为表(字典)")
-        return imported
+        try:
+            return normalize_platform_config(imported)
+        except PlatformKeyConflict as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
 
     def _import_summary(imported: dict[str, Any]) -> dict[str, Any]:
         """导入结果摘要:平台总数 + 启用数(缺省 enabled 视为启用,与 fetch_all 一致)。"""
@@ -1327,6 +1346,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         return {"ok": True, "platforms": len(platforms), "enabled": enabled}
 
     def _my_platform_view(user: dict[str, Any], key: str) -> dict[str, Any]:
+        key = canonical_platform_key(key)
         ptype = _require_platform_type(key)
         section = get_platform_config(
             store.get_user_config(user["username"]), key
@@ -1345,7 +1365,9 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             view["credential_slots"] = _credential_slots_view(
                 section, CREDENTIAL_FIELDS[ptype]
             )
-        if ptype == "llm-gateway":
+        if ptype == "opendesign":
+            view["max_balance"] = section.get("max_balance")
+        if ptype == "sub2api":
             view["base_url"] = section.get("base_url")
             view["groups"] = _gateway_groups_view(section)
         return view
@@ -1514,6 +1536,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         user: dict[str, Any] = Depends(api_user),
     ) -> dict[str, Any]:
         user = _non_admin(user)
+        key = canonical_platform_key(key)
         _validate_platform_fields(key, body, allow_top_level_creds=False)
         ptype = _require_platform_type(key)
         visibility = _validate_visibility_body(body, user["username"])
@@ -1537,7 +1560,9 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         # 全平台通用;留空 = 不修改;仅非空字符串写回(与 admin 约定一致)
         if isinstance(display_name, str) and display_name.strip():
             section["display_name"] = display_name.strip()
-        if ptype == "llm-gateway":
+        if "max_balance" in body:
+            section["max_balance"] = body["max_balance"] or 0
+        if ptype == "sub2api":
             section.update(_gateway_updates(key, body, section))
         store.set_user_config(user["username"], cfg)
         if visibility is not None:
@@ -1555,6 +1580,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         if extra:
             raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
         ptype = body.get("type")
+        if isinstance(ptype, str):
+            ptype = canonical_platform_key(ptype)
         if not isinstance(ptype, str) or ptype not in PROVIDERS:
             raise HTTPException(status_code=400, detail=f"未知供应商类型: {ptype}")
         cfg = store.get_user_config(user["username"])
@@ -1581,6 +1608,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     ) -> dict[str, bool]:
         """删除自己的供应商实例,级联清理其共享行。"""
         user = _non_admin(user)
+        key = canonical_platform_key(key)
         cfg = store.get_user_config(user["username"])
         _ensure_deletable(key, cfg.get("platforms", {}))
         cfg.get("platforms", {}).pop(key, None)
@@ -1625,6 +1653,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         body: dict[str, Any] = Body(...),
         admin: dict[str, Any] = Depends(api_admin),
     ) -> dict[str, Any]:
+        key = canonical_platform_key(key)
         _validate_platform_fields(key, body, allow_top_level_creds=True)
         ptype = _require_platform_type(key)
         visibility = _validate_visibility_body(body, admin["username"])
@@ -1640,6 +1669,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         # 全平台通用;留空 = 不修改;仅非空字符串写回
         if isinstance(display_name, str) and display_name.strip():
             updates["display_name"] = display_name.strip()
+        if "max_balance" in body:
+            updates["max_balance"] = body["max_balance"] or 0
         for field in CREDENTIAL_FIELDS[ptype]:
             value = body.get(field)
             # 留空 = 不修改;仅非空字符串写回
@@ -1679,6 +1710,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         if extra:
             raise HTTPException(status_code=400, detail="未知字段: " + ", ".join(extra))
         ptype = body.get("type")
+        if isinstance(ptype, str):
+            ptype = canonical_platform_key(ptype)
         if not isinstance(ptype, str) or ptype not in PROVIDERS:
             raise HTTPException(status_code=400, detail=f"未知供应商类型: {ptype}")
 
@@ -1723,6 +1756,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         admin: dict[str, Any] = Depends(api_admin),
     ) -> dict[str, bool]:
         """删除管理员侧实例并级联清理其共享行。"""
+        key = canonical_platform_key(key)
         _ensure_deletable(key, load_config().get("platforms", {}))
         remove_platform_config(key)
         store.delete_platform_visibility(admin["username"], key)
@@ -1736,7 +1770,8 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         order = body.get("order")
         if not isinstance(order, list) or not all(isinstance(k, str) for k in order):
             raise HTTPException(status_code=400, detail="order 需为字符串数组")
-        known = [k for k in order if _platform_type(k) is not None]
+        canonical_order = dict.fromkeys(canonical_platform_key(key) for key in order)
+        known = [k for k in canonical_order if _platform_type(k) is not None]
         missing = [k for k in PROVIDERS if k not in known]
         full_order = known + missing
         set_platform_order(full_order)

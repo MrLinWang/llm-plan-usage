@@ -668,6 +668,20 @@ function platformCard(p, isAdmin) {
   displayNameLabel.appendChild(displayNameInput);
   fields.appendChild(displayNameLabel);
 
+  var maxBalanceInput = null;
+  if (p.type === "opendesign") {
+    var maxBalanceLabel = el("label", "", "最大余额 ($)");
+    maxBalanceInput = document.createElement("input");
+    maxBalanceInput.type = "number";
+    maxBalanceInput.min = "0";
+    maxBalanceInput.step = "any";
+    maxBalanceInput.placeholder = "留空=不显示余额进度条";
+    maxBalanceInput.value = p.max_balance > 0 ? String(p.max_balance) : "";
+    maxBalanceLabel.appendChild(maxBalanceInput);
+    fields.appendChild(maxBalanceLabel);
+    fields.appendChild(el("p", "dim", "用量进度 = (最大余额 - 当前余额) ÷ 最大余额；此上限适用于本供应商的每个账号。"));
+  }
+
   var slotEditors = [];
   var slotFields = SLOT_FIELDS[p.type] || null;
   var slotAuthBusy = false;
@@ -814,7 +828,7 @@ function platformCard(p, isAdmin) {
     }
     fields.appendChild(slotsEditor);
     renderSlots(p.credential_slots || []);
-  } else if (p.type === "llm-gateway") {
+  } else if (p.type === "sub2api") {
     // base_url 是 gateway 的必填配置,直接在此编辑
     var baseUrlLabel = el("label", "", "base_url");
     baseUrlInput = document.createElement("input");
@@ -983,10 +997,18 @@ function platformCard(p, isAdmin) {
       if (displayNameInput.value.trim()) {
         body.display_name = displayNameInput.value.trim();
       }
+      if (maxBalanceInput) {
+        var maxBalance = maxBalanceInput.value.trim();
+        var maxBalanceValue = maxBalance === "" ? 0 : Number(maxBalance);
+        if (!Number.isFinite(maxBalanceValue) || maxBalanceValue < 0) {
+          throw new Error("最大余额需为大于等于 0 的有限数字");
+        }
+        body.max_balance = maxBalanceValue;
+      }
       if (slotFields) {
         body.credential_slots = slotEditorsToSlots();
       }
-      if (p.type === "llm-gateway") {
+      if (p.type === "sub2api") {
         if (baseUrlInput && baseUrlInput.value.trim()) {
           body.base_url = baseUrlInput.value.trim();
         }
@@ -1023,11 +1045,14 @@ function platformCard(p, isAdmin) {
       );
       if (!r.ok) { errEl.textContent = await detailOf(r); return; }
       var updated = await r.json();
+      if (maxBalanceInput) {
+        maxBalanceInput.value = updated.max_balance > 0 ? String(updated.max_balance) : "";
+      }
       // 用服务端返回的视图刷新(清空输入 + 新 placeholder)
       if (slotFields) {
         renderSlots(updated.credential_slots || []);
       }
-      if (p.type === "llm-gateway") {
+      if (p.type === "sub2api") {
         serverGroups = updated.groups || [];
         renderGroups(serverGroups);
         if (baseUrlInput) {

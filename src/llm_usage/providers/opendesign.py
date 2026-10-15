@@ -55,6 +55,16 @@ def _number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def parse_max_balance(value: Any) -> float | None:
+    """A user-supplied wallet scale in USD; absent/zero disables the bar."""
+    if value is None:
+        return None
+    number = _number(value)
+    if not isinstance(value, (int, float)) or number is None or number < 0:
+        raise ValueError("最大余额需为大于等于 0 的有限数字")
+    return number or None
+
+
 def _reset_time(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -78,6 +88,7 @@ def _window_label(duration: int) -> str:
 
 def _parse_usage_payload(
     payload: dict[str, Any], platform: str, workspace_id: str,
+    max_balance: float | None = None,
 ) -> tuple[list[UsageEntry], str | None]:
     """Keep workspace credit windows and its wallet in their native units."""
     if payload.get("workspaceId") != workspace_id:
@@ -125,11 +136,13 @@ def _parse_usage_payload(
 
     balance = _number(payload.get("balanceUsd"))
     if balance is not None:
-        # A balance proves neither spend nor a total allowance.  Show it only
-        # in "remaining", leaving the limit and percentage unknown.
+        # The optional limit is a user-selected display scale, not an upstream
+        # allowance. Keep spend unknown and show depletion relative to the scale.
         entries.append(UsageEntry(
-            platform=platform, label="余额", used=0.0, limit=None,
-            remaining=balance, percent=None, reset_at=None, unit="$",
+            platform=platform, label="余额用量", used=0.0, limit=max_balance,
+            remaining=balance,
+            percent=compute_percent(max_balance - balance, max_balance) if max_balance else None,
+            reset_at=None, unit="$",
         ))
     else:
         partial = True
@@ -149,6 +162,10 @@ class OpenDesignProvider:
     def fetch(self, config: dict[str, Any]) -> PlatformResult:
         display_name = config.get("display_name") or self.display_name
         platform = config.get("_platform_key", self.name)
+        try:
+            max_balance = parse_max_balance(config.get("max_balance"))
+        except ValueError as exc:
+            return PlatformResult(platform, display_name, error=f"配置错误：{exc}")
         key = config.get("control_key")
         legacy_key = config.get("api_key")
         if not key and isinstance(legacy_key, str) and legacy_key.startswith("vela_ctrl_"):
@@ -182,7 +199,7 @@ class OpenDesignProvider:
             response.raise_for_status()
             payload = response.json()
             entries, warning = (
-                _parse_usage_payload(payload, platform, workspace_id)
+                _parse_usage_payload(payload, platform, workspace_id, max_balance)
                 if isinstance(payload, dict) else ([], None)
             )
             if not entries:

@@ -12,6 +12,7 @@ from rich.console import Console
 
 from llm_usage.display import (
     _fmt_countdown,
+    _percent_color,
     _to_local_time,
     render_history,
     render_key_breakdown,
@@ -49,16 +50,54 @@ class _FixedNow(datetime):
 
 
 class TestDisplay:
+    @pytest.mark.parametrize("balance,percent,color", [
+        (100, 0, "green"), (75, 25, "green"), (20, 80, "yellow"), (5, 95, "red"),
+        (0, 100, "red"), (150, 0, "green"), (-2, 100, "red"),
+    ])
+    def test_wallet_scale_renders_usage_bar_and_survives_history(
+        self, tmp_db_path: Path, balance: float, percent: float, color: str,
+    ) -> None:
+        entry = UsageEntry("opendesign", "余额用量", 0, 100, balance, percent, None, "$")
+        result = PlatformResult("opendesign", "OpenDesign", entries=[entry])
+        console, buf = _make_console()
+        render_results([result], console=console)
+        row = next(line for line in buf.getvalue().splitlines() if "余额用量" in line)
+        assert row.split()[3:6] == ["-", "$100", f"${balance:g}"]
+        assert f"{percent:g}%" in buf.getvalue()
+        assert f"余{percent:g}%" not in buf.getvalue()
+        assert _percent_color(percent) == color
+        if percent == 0:
+            assert "█" not in buf.getvalue()
+        if percent == 100:
+            assert "░" not in buf.getvalue()
+        assert save_snapshot([result]) == 1
+        console, buf = _make_console()
+        render_history(query_history(), console=console)
+        row = next(line for line in buf.getvalue().splitlines() if "余额用量" in line)
+        assert [cell.strip() for cell in row.split("│")[5:8]] == ["-", "100", f"${balance:g}"]
+        assert f"{percent:g}%" in row
+        assert f"余{percent:g}%" not in row
+
+    def test_old_balance_snapshot_percentage_is_rendered_as_usage(
+        self, tmp_db_path: Path,
+    ) -> None:
+        entry = UsageEntry("opendesign", "余额", 0, 100, 100, 100, None, "$")
+        assert save_snapshot([PlatformResult("opendesign", "OpenDesign", entries=[entry])]) == 1
+        console, buf = _make_console()
+        render_history(query_history(), console=console)
+        row = next(line for line in buf.getvalue().splitlines() if "余额用量" in line)
+        assert row.split("│")[-2].strip() == "0%"
+
     @pytest.mark.parametrize("balance", [0.0, 12.5, -0.5])
     def test_balance_only_displays_remaining_without_inventing_usage_or_limit(
         self, balance: float,
     ) -> None:
-        entry = UsageEntry("opendesign", "余额", 0, None, balance, None, None, "$")
+        entry = UsageEntry("opendesign", "余额用量", 0, None, balance, None, None, "$")
         console, buf = _make_console()
         render_results([PlatformResult("opendesign", "OpenDesign", entries=[entry])],
                        console=console)
         output = buf.getvalue()
-        row = next(line for line in output.splitlines() if "余额" in line)
+        row = next(line for line in output.splitlines() if "余额用量" in line)
         assert row.split()[3:6] == ["-", "-", f"${balance:g}"]
         assert "∞" not in output
         assert "%" not in row
@@ -93,13 +132,13 @@ class TestDisplay:
 class TestKeyBreakdown:
     def test_multi_key_entry_renders_a_table(self) -> None:
         e = UsageEntry(
-            "llm-gateway", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
+            "sub2api", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
             key_breakdown=[
                 {"number": 1, "name": "主 Key", "used": 1.25, "ok": True, "error": None},
                 {"number": 2, "name": None, "used": None, "ok": False, "error": "认证失败(401)"},
             ],
         )
-        r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
+        r = PlatformResult("sub2api", "Sub2API", entries=[e])
         console, buf = _make_console()
         render_key_breakdown([r], console=console)
         out = buf.getvalue()
@@ -110,10 +149,10 @@ class TestKeyBreakdown:
 
     def test_single_key_entry_is_skipped(self) -> None:
         e = UsageEntry(
-            "llm-gateway", "每日", 1.94, None, None, None, None, "$", False,
+            "sub2api", "每日", 1.94, None, None, None, None, "$", False,
             key_breakdown=[{"number": 1, "name": None, "used": 1.94, "ok": True, "error": None}],
         )
-        r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
+        r = PlatformResult("sub2api", "Sub2API", entries=[e])
         console, buf = _make_console()
         render_key_breakdown([r], console=console)
         assert "没有多 Key 分组的用量明细" in buf.getvalue()
@@ -141,13 +180,13 @@ class TestDisplaySerialization:
 
     def test_results_to_json_includes_key_breakdown(self) -> None:
         e = UsageEntry(
-            "llm-gateway", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
+            "sub2api", "team-a", 2.0, 10, 8.0, 20.0, None, "$", False,
             key_breakdown=[
                 {"number": 1, "name": "主 Key", "used": 1.25, "ok": True, "error": None},
                 {"number": 2, "name": None, "used": None, "ok": False, "error": "认证失败(401)"},
             ],
         )
-        r = PlatformResult("llm-gateway", "LLM Gateway", entries=[e])
+        r = PlatformResult("sub2api", "Sub2API", entries=[e])
         data = json.loads(results_to_json([r]))
         breakdown = data["platforms"][0]["entries"][0]["key_breakdown"]
         assert breakdown == [
@@ -224,14 +263,14 @@ class TestDisplaySerialization:
 
     @pytest.mark.parametrize("balance", [0.0, 12.5, -0.5])
     def test_balance_snapshot_history_shows_remaining(self, tmp_db_path, balance) -> None:
-        entry = UsageEntry("opendesign", "余额", 0, None, balance, None, None, "$")
+        entry = UsageEntry("opendesign", "余额用量", 0, None, balance, None, None, "$")
         assert save_snapshot([PlatformResult("opendesign", "OpenDesign", entries=[entry])]) == 1
         console, buf = _make_console()
         render_history(query_history(platform="opendesign"), console=console)
         output = buf.getvalue()
         assert "剩余" in output and f"${balance:g}" in output
         assert "∞" not in output
-        row = next(line for line in output.splitlines() if "余额" in line)
+        row = next(line for line in output.splitlines() if "余额用量" in line)
         assert [cell.strip() for cell in row.split("│")[5:8]] == ["-", "-", f"${balance:g}"]
 
     def test_render_history_with_rows(self) -> None:
@@ -304,10 +343,10 @@ class TestDisplaySerialization:
     def test_expired_subscription_row_reads_expired(self) -> None:
         """已到期的 gateway 每月行在终端渲染为「已到期」。"""
         e = UsageEntry(
-            "llm-gateway", "每月", 19.5, 4000, 3980.5, 0.5,
+            "sub2api", "每月", 19.5, 4000, 3980.5, 0.5,
             "2026-08-01T00:00:00Z", "$", False, "测试组A", None, "expires",
         )
-        r = PlatformResult("llm-gateway", "测试网关", entries=[e])
+        r = PlatformResult("sub2api", "测试网关", entries=[e])
         console, buf = _make_console()
         render_results([r], console=console)
         out = buf.getvalue()

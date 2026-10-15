@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from llm_usage.models import PlatformResult, UsageEntry
+from llm_usage.models import PlatformResult, UsageEntry, compute_percent
 
 # Percent thresholds for color coding.
 RED_THRESHOLD = 95.0
@@ -28,7 +28,7 @@ YELLOW_THRESHOLD = 80.0
 # CJK header widths: 平台=4, 窗口=4, 已用=4, 限额=4, 剩余=4, 重置时间=8, 重置倒计时=10, 状态=4
 COLS = [
     ("platform",  "平台",       22, "left"),
-    ("window",    "窗口",       6,  "left"),
+    ("window",    "窗口",       8,  "left"),
     ("used",      "已用",       10, "right"),
     ("limit",     "限额",       10, "right"),
     ("remaining", "剩余",       10, "right"),
@@ -176,10 +176,10 @@ def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status
     """Build one data line (no bar) as a styled Text."""
     name = display_name if is_first else ""
     if (
-        entry.label == "余额" and entry.limit is None and entry.used == 0.0
-        and entry.percent is None and entry.remaining is not None
+        entry.label in ("余额", "余额用量") and entry.used == 0.0 and entry.remaining is not None
     ):
-        used = limit = "-"
+        used = "-"
+        limit = _fmt_value(entry.limit, entry.unit) if entry.limit is not None else "-"
         remaining = _fmt_value(entry.remaining, entry.unit)
     elif entry.limit is None and entry.used == 0.0 and entry.percent is not None:
         used = limit = remaining = "-"
@@ -191,7 +191,8 @@ def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status
     reset = _to_local_time(entry.reset_at) or "-"
     countdown = _fmt_countdown(entry.reset_at, kind=entry.reset_kind)
 
-    values = [name, entry.label, used, limit, remaining, reset, countdown, status]
+    label = "余额用量" if entry.label == "余额" else entry.label
+    values = [name, label, used, limit, remaining, reset, countdown, status]
     styles = ["bold" if is_first else "", "", "", "", "", "dim", "dim", ""]
     parts: list[tuple[str, str]] = []
     for i, ((_, _, width, align), val, style) in enumerate(zip(COLS, values, styles)):
@@ -400,11 +401,17 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
         percent = r.get("percent")
         used_str = str(r.get("used", ""))
         remaining = r.get("remaining")
-        if (
-            r.get("label") == "余额" and limit is None and r.get("used") == 0
-            and percent is None and remaining is not None
-        ):
-            used_str = limit_str = "-"
+        label = str(r.get("label", ""))
+        balance_only = (
+            label in ("余额", "余额用量") and r.get("used") == 0 and remaining is not None
+        )
+        if balance_only:
+            used_str = "-"
+            if limit is None:
+                limit_str = "-"
+            # Recompute from the snapshot's balance/scale so older snapshots
+            # that stored a remaining percentage also display usage progress.
+            percent = compute_percent(limit - remaining, limit) if limit else None
         remaining_str = _fmt_value(remaining, r.get("unit", ""))
         color = _percent_color(percent)
         percent_str = f"{percent:g}%" if percent is not None else "-"
@@ -412,7 +419,7 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
             ts,
             str(r.get("platform", "")),
             str(r.get("plan") or "-"),
-            str(r.get("label", "")),
+            "余额用量" if label == "余额" else label,
             used_str,
             limit_str,
             remaining_str,

@@ -11,11 +11,14 @@ class UsageEntry:
 
     Attributes:
         platform: provider key, e.g. ``"kimi"``, ``"volcengine-coding"``.
-        label: window label shown to user, e.g. ``"5小时"``, ``"每周"``, ``"余额"``.
+        label: window label shown to user, e.g. ``"5小时"``, ``"每周"``, ``"余额用量"``.
         used: amount consumed so far.
-        limit: total allowed; ``None`` means unlimited / unknown.
+        limit: total allowed; ``None`` means unlimited / unknown. For a wallet
+            balance row, this is the optional user-configured display maximum.
         remaining: amount left; ``None`` if not computable.
         percent: ``used / limit * 100`` (0–100); ``None`` when limit is unknown.
+            Wallet balance rows use ``(limit - remaining) / limit * 100`` and
+            keep ``used=0`` as a placeholder, displayed as unknown spend.
         reset_at: when the window resets — ISO 8601 UTC (``Z`` or offset
             suffix; naive values are treated as UTC); ``None`` if N/A.  Only
             display converts it to local time; stored/JSON values stay UTC.
@@ -27,7 +30,7 @@ class UsageEntry:
         is_manual: True for manually-entered values (no live API fetch).
         plan: billing-plan / group name used to partition the platform's rows
             (multi-credential platforms: each credential is its own plan; the
-            LLM Gateway: each configured key group).  ``None`` = no
+            Sub2API: each configured key group).  ``None`` = no
             partitioning (a plain single-source platform).
             ``fetch_all`` tags expanded credentials with the slot name and
             otherwise keeps a provider-set plan.

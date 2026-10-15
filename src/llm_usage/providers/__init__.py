@@ -18,14 +18,15 @@ from typing import Any
 
 from llm_usage.config import get_platform_order
 from llm_usage.models import PlatformResult, UsageEntry
+from llm_usage.platform_keys import canonical_platform_key, normalize_platform_config
 from llm_usage.providers.base import Provider
 from llm_usage.providers.clinepass import ClinePassProvider
 from llm_usage.providers.commandcode import CommandCodeProvider
 from llm_usage.providers.kimi import KimiProvider
-from llm_usage.providers.llm_gateway import LlmGatewayProvider
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
 from llm_usage.providers.opendesign import OpenDesignProvider
+from llm_usage.providers.sub2api import Sub2ApiProvider
 from llm_usage.providers.volcengine import VolcengineProvider
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ PROVIDERS: dict[str, Provider] = {
     "clinepass": ClinePassProvider(),
     "commandcode": CommandCodeProvider(),
     "opendesign": OpenDesignProvider(),
-    "llm-gateway": LlmGatewayProvider(),
+    "sub2api": Sub2ApiProvider(),
 }
 
 # Registry order as a lookup table; the fallback for platforms not listed in
@@ -100,7 +101,7 @@ def resolve_provider_key(key: str) -> str | None:
     Returns the base key (e.g. ``"kimi#2" -> "kimi"``) when it exists in
     :data:`PROVIDERS`; ``None`` for unknown types or unknown base keys.
     """
-    base, _ = split_instance_key(key)
+    base, _ = split_instance_key(canonical_platform_key(key))
     return base if base in PROVIDERS else None
 
 
@@ -117,7 +118,12 @@ def next_instance_key(
     again); existing config keys can only raise the result further.
     Malformed (non-int) persisted values are treated as absent.
     """
-    counter = (counters or {}).get(base)
+    base = canonical_platform_key(base)
+    normalized = normalize_platform_config({
+        "platforms": platforms_cfg, "instance_counters": counters or {},
+    })
+    platforms_cfg = normalized["platforms"]
+    counter = normalized["instance_counters"].get(base)
     if not isinstance(counter, int):
         counter = 0
     max_n = max(counter, 1)
@@ -148,7 +154,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "clinepass": "ClinePass",
     "commandcode": "Command Code",
     "opendesign": "OpenDesign",
-    "llm-gateway": "LLM Gateway",
+    "sub2api": "Sub2API",
 }
 
 
@@ -161,6 +167,7 @@ def _resolve_env_value(raw: str | None) -> str | None:
 
 def _prepare_config(platform: str, pcfg: dict[str, Any]) -> dict[str, Any]:
     """Normalize a platform config section before handing to a provider."""
+    platform = canonical_platform_key(platform)
     out = dict(pcfg)
     out["_platform_key"] = platform
     # display name resolution
@@ -183,12 +190,12 @@ def _credential_specs(prepared: dict[str, Any]) -> list[tuple[dict[str, Any], st
     per credential is produced — each is an independent fetch with its own
     plan name.  A section resolving to a single credential behaves like the
     legacy top-level form (``plan_name=None``): partition headers are only
-    meaningful with ≥2 plans.  LLM Gateway keeps its own groups handling
+    meaningful with ≥2 plans.  Sub2API keeps its own groups handling
     and is never expanded here.
     """
     platform = prepared["_platform_key"]
     slots = prepared.get("credentials")
-    if platform == "llm-gateway" or not isinstance(slots, list) or not slots:
+    if resolve_provider_key(platform) == "sub2api" or not isinstance(slots, list) or not slots:
         return [(prepared, None)]
     specs: list[tuple[dict[str, Any], str | None]] = []
     for index, slot in enumerate(slots):
@@ -269,6 +276,7 @@ def fetch_all(
     ``PlatformResult.platform``; results sort by base type so each instance
     renders right after it.
     """
+    config = normalize_platform_config(config)
     platforms_cfg: dict[str, Any] = config.get("platforms", {})
     tasks: list[tuple[str, Provider, dict[str, Any], str | None]] = []
     for platform, pcfg in platforms_cfg.items():

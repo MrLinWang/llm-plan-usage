@@ -70,7 +70,7 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口 |
 | Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 |
 | OpenDesign | 自动 API | `GET /api/v1/workspaces/current` + `/api/v1/workspaces/{id}/billing/preflight`，Bearer 控制密钥；credits 配额窗口 + 美元余额 |
-| LLM Gateway（本地 Sub2API 网关） | 自动 API | `GET /v1/usage`，Bearer；读 `subscription` 出 每日/每周/每月 三行（旧版回退今日 `actual_cost`） |
+| Sub2API | 自动 API | `GET /v1/usage`，Bearer；读 `subscription` 出 每日/每周/每月 三行（旧版回退今日 `actual_cost`） |
 
 以上 9 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
 `kimi#2`），见下方「同类型供应商实例」。
@@ -136,15 +136,23 @@ base_url = "https://amr-link.open-design.ai/v1"
 确定当前工作区，再读取 `/api/v1/workspaces/{id}/billing/preflight`。
 可在平台段手工设置 `workspace_id = "工作区 ID"`，直接查询指定工作区。
 返回的 Coding Plan 窗口按原始 `credits` 单位展示已用、限额、剩余与重置时间；
-钱包余额单独以 `$` 展示，不从余额推算消费或总额度。
+钱包余额以「余额用量」行单独展示，单位为 `$`。在 Web「供应商配置」中填写「最大余额 ($)」，
+即可显示「(最大余额 - 当前余额) ÷ 最大余额」的用量进度条；余额充足时为空，余额越低进度越高。
+也可在 `[platforms.opendesign]` 中设置 `max_balance = 100`（美元）。
+每个供应商实例可独立设置，该上限分别用于其每个账号；留空或设为 `0` 关闭进度条。
+最大余额仅作为显示刻度，已用金额仍显示为 `-`；余额达到或超过上限时进度为 0%，余额为零或负数时进度为 100%，始终保留真实余额。
 
 只有 `sk-amr-` 密钥时，可通过上述网页登录授权连接对应账号。认证与额度字段参考
 [官方登录实现](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela.ts)
 与[官方用量响应解析](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela-billing.ts)。
 
-### LLM Gateway（本地 Sub2API 网关）
+### Sub2API
 
-LLM Gateway 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填。
+Sub2API 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填。
+配置键为 `sub2api`，独立实例使用 `sub2api#N`；默认显示名称为 `Sub2API`，
+也可通过 `display_name` 自定义。旧 `llm-gateway` 配置及实例读取时自动转换，
+下次保存使用新键；已有历史、用户配置和共享记录会自动迁移，原有凭证及环境变量
+引用保持有效。如果新旧键同时存在且配置不同，会提示冲突，避免覆盖任一账号。
 provider 读网关 `/v1/usage` 的 `subscription` 段：**每个组的每个 Key** 各带一份
 日/周/月配额与用量，成功 Key 逐窗口求和，卡片上每组显示「每日 / 每周 / 每月」
 三行；限额默认取面板的 `daily_limit_usd` / `weekly_limit_usd` /
@@ -153,14 +161,14 @@ provider 读网关 `/v1/usage` 的 `subscription` 段：**每个组的每个 Key
 作为「每月」行的重置倒计时，且按**到期**语义显示（过期显示「已到期」而非
 「已重置」）。旧版网关没有 `subscription` 时退回 `usage.today.actual_cost`
 （`cost` 是更旧的回退）只出一行「每日」。API keys 以**组**为单位配置，每组单独
-显示和保存历史。模板默认生成一组（`组1`，`env:LLM_GATEWAY_API_KEY`）：
+显示和保存历史。模板默认生成一组（`组1`，`env:SUB2API_API_KEY`）：
 
 ```toml
-[platforms.llm-gateway]
+[platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
 
-[[platforms.llm-gateway.groups]]
+[[platforms.sub2api.groups]]
 name = "组1"
 # daily_limit = 100        # 可选项:覆盖面板日报额度;留空则用面板值
 api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"]
@@ -172,7 +180,7 @@ Key 直接写在 config.toml 即可，也支持 `env:VARNAME` 引用环境变量
 
 ```toml
 api_keys = [
-    { name = "主 Key", value = "env:LLM_GATEWAY_TEAM_A_1" },
+    { name = "主 Key", value = "env:SUB2API_TEAM_A_1" },
     "sk-team-a-key-2",  # 无名称,显示 key#2
 ]
 ```
@@ -188,10 +196,10 @@ provider 兼容，可手工编辑 `config.toml` 使用；Web 端会把这种配�
 
 ### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass / commandcode / opendesign）
 
-除 LLM Gateway 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
+除 Sub2API 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
 **不同计费套餐**。每个凭证彼此完全独立——各自 fetch、各自展示、无共享限额、
 不合并数值；仪表盘按套餐分区展示同一平台的用量（`show`/`tui`/`web` 一致）。
-与 Gateway 的 groups（共享额度、聚合求和）不同。
+与 Sub2API 的 groups（共享额度、聚合求和）不同。
 只有一个凭证时不显示套餐分区头——单槽（含 Web 编辑器保存时写入的
 `name = "套餐1"`）与旧的顶层单 Key 形态展示完全一致；两个及以上凭证才按
 套餐分区。
@@ -284,8 +292,10 @@ ultra 三档密度试排（只压缩留白与次要列，不缩小正文），�
 每张卡片同时是独立的容器查询上下文，窄卡隐藏「限额/重置时间」次要列并把数字缩写为
 k/M/B（完整数值悬停可见）。entry 较多的平台默认精简展示：「+N」一键展开全部、再点收起；
 周期窗口平台折叠时优先保留 5小时/每周 等核心窗口；非周期窗口且同一计费单位的平台改为
-5 秒轮播切换（悬停、聚焦或切走标签页即暂停），其尾部合计行只合计已用（限额不完整时
-不虚构总进度）。多账号卡片（LLM Gateway 分组、多凭证套餐）的合计与账号同构：一个
+5 秒轮播切换（悬停、聚焦或切走标签页即暂停）；Sub2API 多账号卡片收起时也按账号
+轮播最短窗口（通常为每日），normal 显示两个账号、compact/ultra 显示一个账号，
+最短窗口合计固定展示，可点击轮播指示器手动切换。非周期条目的尾部合计行只合计已用（限额不完整时
+不虚构总进度）。多账号卡片（Sub2API 分组、多凭证套餐）的合计与账号同构：一个
 「全部合计」标题行 + 各窗口行（每日/每周/每月），只合计同一窗口、单位一致且可加总的
 条目；收起时只显示最短窗口（网关=每日）一行，compact/ultra 密度下展开也只保留每个
 账号的最短窗口，且展开/收起后立刻重跑一次密度试排（不必调整窗口大小）。
@@ -348,10 +358,10 @@ PBKDF2-SHA256（60 万次迭代、随机盐）哈希存储，不落明文；站�
 
 管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证
 （kimi/ollama/opencode-go/clinepass/commandcode 为 `api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`；
-llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode/opendesign
+sub2api 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode/opendesign
 以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
 命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
-（火山「添加 AK/SK」）追加新套餐槽。LLM Gateway 以**组**为单位编辑：
+（火山「添加 AK/SK」）追加新套餐槽。Sub2API 以**组**为单位编辑：
 默认一组「组1」，每组一个 API key 输入框 + 一个每日限额输入框（留空 = 用网关
 面板的日报额度；填了就覆盖该值，面板的周/月额度不受影响），
 组内可点「添加共享 Key」追加共享同一额度的 key，底部「添加组」新增分组；
@@ -361,13 +371,13 @@ llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollam
 （如 `已设置 (sk-k…ey)`），`env:VARNAME` 引用原样显示；凭证值留空表示保留
 已保存的值，删除整个槽才会移除该凭证。保存立即写回 `./config.toml` 并使服务端
 用量缓存失效（下次刷新生效）：槽式保存写 `credentials` 数组并清除顶层凭证
-字段；LLM Gateway 的分组保存写 `groups` 并置 `use_groups = true`。
+字段；Sub2API 的分组保存写 `groups` 并置 `use_groups = true`。
 **取消勾选「启用」不会删除该平台的凭证**：只提交 `enabled` 时仅更新开关；网页上点
 「保存」会连同凭证槽/分组一起提交，但槽内留空表示保留既有值，因此凭证值、套餐槽、
 网关分组都原样保存（旧式顶层单 Key 可能迁移为 `credentials` 数组，值不变）。
 之后重新勾选「启用」即可继续使用，无需重新填写。禁用期间该平台不出现在仪表盘上
 （拉取时会跳过），但「供应商配置」页仍能看到并编辑它。
-LLM Gateway **一键导入 config.toml**：添加栏旁的「导入 config.toml」按钮可
+Sub2API **一键导入 config.toml**：添加栏旁的「导入 config.toml」按钮可
 直接上传一个 TOML 文件（`POST /api/config/import`），**整体替换**当前配置——管理员替换
 `./config.toml`，普通用户替换自己在 `history.db` 的 `user_configs`（把本地
 配置同步到在线服务）。适合迁移新机器/新部署时免手工逐平台填写；导入前有
@@ -396,7 +406,7 @@ LLM Gateway **一键导入 config.toml**：添加栏旁的「导入 config.toml�
 
 - **普通用户与管理员同样可配置全部供应商信息**：「供应商配置」页两模式同构
   ——普通用户同样有凭证槽编辑器（kimi/ollama/opencode-go 的 `api_key`、火山×2
-  的 AK/SK，每槽一个计费套餐）与 LLM Gateway 的 `base_url` + 分组编辑器
+  的 AK/SK，每槽一个计费套餐）与 Sub2API 的 `base_url` + 分组编辑器
   （组、每日限额、共享 Key、Key 名称），字段级校验与 admin `/api/config` 完全
   一致（槽式保存写 `credentials` 数组、清除顶层凭证字段、`use_groups = true`）。
   唯一差异：普通用户保存写入自己的 `user_configs`（`/api/my/platforms`，
@@ -408,7 +418,7 @@ LLM Gateway **一键导入 config.toml**：添加栏旁的「导入 config.toml�
   - **共享给指定用户**：勾选用户名后仅这些用户可见（不能共享给自己；
     目标用户必须存在；重复勾选自动去重）。
 - **来源标注**：共享来的平台在卡片标题上追加 `(用户名)` 后缀
-  （如 `Kimi Code(alice)`），管理员公开的平台同样显示 `LLM Gateway(admin)`
+  （如 `Kimi Code(alice)`），管理员公开的平台同样显示 `Sub2API(admin)`
   （共享即标注来源，无例外）。
 - **自定义显示名称**：「供应商配置」页每张平台卡都有「显示名称」输入框
   （全平台可用，留空 = 保留当前值，最长 64 字符）；改名后自己的仪表盘立即使用
@@ -445,7 +455,7 @@ ruff check src tests && mypy src    # lint + 类型检查
 
 `重置倒计时` 列显示距下一次重置的剩余时间（如 `2天3小时`、`5小时20分`、`32分`），
 基于**当前系统时钟**在每次渲染时计算——`llm-usage tui` 中每秒刷新；重置时刻已过
-显示 `已重置`，无重置时间显示 `-`。时间戳按语义区分：套餐到期（LLM Gateway 每月行）
+显示 `已重置`，无重置时间显示 `-`。时间戳按语义区分：套餐到期（Sub2API 每月行）
 过期显示 `已到期`，网页端悬浮提示相应写作「到期时间」。该列与进度条百分比标签右对齐。
 
 Web 仪表盘同理：服务端 API 返回 UTC ISO 时间戳，浏览器端转换为本地时区显示，

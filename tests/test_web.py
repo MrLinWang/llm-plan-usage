@@ -433,6 +433,54 @@ class TestWebAuth:
 
 class TestWebConfig:
     @pytest.mark.parametrize("admin", [True, False])
+    @pytest.mark.parametrize("key", ["opendesign", "opendesign#2"])
+    def test_opendesign_max_balance_persists_and_isolates_users(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path, admin: bool, key: str,
+    ) -> None:
+        init_config(tmp_config_path)
+        section = {"control_key": "vela_ctrl_saved", "max_balance": 100, "enabled": True}
+        update_platform_config(key, section)
+        section = load_config()["platforms"][key].copy()
+        admin_before = load_config()
+        username = "admin" if admin else "alice"
+        client, _ = _auth_client(monkeypatch, tmp_db_path, username=username, admin=admin)
+        if not admin:
+            store.set_user_config(username, {"platforms": {key: section}})
+        endpoint = ("/api/config/platforms/" if admin else "/api/my/platforms/") + key.replace(
+            "#", "%23"
+        )
+        list_endpoint = "/api/config" if admin else "/api/my/platforms"
+
+        def saved():
+            cfg = load_config() if admin else store.get_user_config(username)
+            return cfg["platforms"][key]
+
+        response = client.put(endpoint, json={"max_balance": 250.5})
+        assert response.status_code == 200
+        assert response.json()["max_balance"] == 250.5
+        assert saved() == {**section, "max_balance": 250.5}
+        views = client.get(list_endpoint).json()["platforms"]
+        assert next(p for p in views if p["key"] == key)["max_balance"] == 250.5
+        assert "vela_ctrl_saved" not in response.text
+        client.put(endpoint, json={"enabled": False})
+        assert saved()["max_balance"] == 250.5  # partial edits preserve the scale
+
+        before = saved().copy()
+        for invalid in [-1, True, "100", [], {}, "NaN", "Infinity"]:
+            response = client.put(endpoint, json={"max_balance": invalid})
+            assert response.status_code == 400
+            assert saved() == before
+        for empty in [0, None]:
+            assert client.put(endpoint, json={"max_balance": empty}).status_code == 200
+            assert saved()["max_balance"] == 0
+            assert saved()["control_key"] == section["control_key"]
+        wrong = ("/api/config/platforms/" if admin else "/api/my/platforms/") + "kimi"
+        assert client.put(wrong, json={"max_balance": 100}).status_code == 400
+        if not admin:
+            assert load_config() == admin_before
+
+    @pytest.mark.parametrize("admin", [True, False])
     def test_opendesign_credential_editor(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
         tmp_config_path: Path, admin: bool,
@@ -667,7 +715,7 @@ class TestWebConfig:
     ) -> None:
         init_config(tmp_config_path)
         client, _ = _auth_client(monkeypatch, tmp_db_path)
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "enabled": True,
             "base_url": "http://gw.internal:9090",
             "groups": [{"name": "组1", "daily_limit": 50, "api_keys": ["sk-g1-12345"]}],
@@ -681,14 +729,14 @@ class TestWebConfig:
             {"name": None, "set": True, "env": None, "hint": "sk-g…45"}
         ]
         # 磁盘持久化:groups 写入且 use_groups 被置为 true
-        section = load_config()["platforms"]["llm-gateway"]
+        section = load_config()["platforms"]["sub2api"]
         assert section["base_url"] == "http://gw.internal:9090"
         assert section["groups"] == [
             {"name": "组1", "daily_limit": 50, "api_keys": ["sk-g1-12345"]}
         ]
         assert section["use_groups"] is True
         # 重复分组名 → 400
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [
                 {"name": "组1", "api_keys": ["sk-a"]},
                 {"name": "组1", "api_keys": ["sk-b"]},
@@ -696,12 +744,12 @@ class TestWebConfig:
         })
         assert resp.status_code == 400
         # 留空 key = 保留已保存的值 → 200(未改动)
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{"name": "组1", "daily_limit": None, "api_keys": [{"index": 0, "value": ""}]}],
         })
         assert resp.status_code == 200
         # 空 daily_limit = 不设限;key 留空 = 保留已保存的值
-        assert load_config()["platforms"]["llm-gateway"]["groups"] == [
+        assert load_config()["platforms"]["sub2api"]["groups"] == [
             {"name": "组1", "api_keys": ["sk-g1-12345"]}
         ]
 
@@ -712,7 +760,7 @@ class TestWebConfig:
         init_config(tmp_config_path)
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         # 保存:新 key 带名称;既有 key 留空保留 + 重命名
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{
                 "name": "组A", "daily_limit": None,
                 "api_keys": [
@@ -724,7 +772,7 @@ class TestWebConfig:
         assert resp.status_code == 400  # 尚无既有 key,index 0 无可保留
         assert "要保留" in resp.json()["detail"]
         # 先保存两个带名称的 key
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{
                 "name": "组A", "daily_limit": None,
                 "api_keys": [
@@ -734,7 +782,7 @@ class TestWebConfig:
             }],
         })
         assert resp.status_code == 200
-        section = load_config()["platforms"]["llm-gateway"]
+        section = load_config()["platforms"]["sub2api"]
         assert section["groups"] == [{
             "name": "组A",
             "api_keys": [
@@ -749,7 +797,7 @@ class TestWebConfig:
         assert group["api_keys"][0]["hint"] == "sk-n…56"
         assert group["api_keys"][1]["hint"] == "sk-n…56"
         # 留空 key = 保留值;重命名第一个
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{
                 "name": "组A", "daily_limit": None,
                 "api_keys": [
@@ -759,7 +807,7 @@ class TestWebConfig:
             }],
         })
         assert resp.status_code == 200
-        assert load_config()["platforms"]["llm-gateway"]["groups"] == [{
+        assert load_config()["platforms"]["sub2api"]["groups"] == [{
             "name": "组A",
             "api_keys": [
                 {"name": "线上主 Key", "value": "sk-new-1-123456"},
@@ -767,7 +815,7 @@ class TestWebConfig:
             ],
         }]
         # 名称超长 → 400
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{
                 "name": "组A", "daily_limit": None,
                 "api_keys": [{"value": "sk-x", "name": "长" * 101}],
@@ -783,15 +831,15 @@ class TestWebConfig:
         init_config(tmp_config_path)
         # 去掉模板默认组,模拟纯旧单 Key 配置
         cfg = load_config()
-        del cfg["platforms"]["llm-gateway"]["groups"]
+        del cfg["platforms"]["sub2api"]["groups"]
         from llm_usage.config import save_config
 
         save_config(cfg)
-        update_platform_config("llm-gateway", {"api_key": "sk-legacy-123"})
+        update_platform_config("sub2api", {"api_key": "sk-legacy-123"})
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         # 视图把旧单 Key 合成一组展示
         gateway = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}[
-            "llm-gateway"
+            "sub2api"
         ]
         assert gateway["groups"] == [{
             "index": 0,
@@ -800,14 +848,14 @@ class TestWebConfig:
             "api_keys": [{"name": None, "set": True, "env": None, "hint": "sk-l…23"}],
         }]
         # 保存时留空 key = 保留旧值 → 迁移为 groups
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{
                 "index": 0, "name": "组1", "daily_limit": None,
                 "api_keys": [{"index": 0, "value": ""}],
             }],
         })
         assert resp.status_code == 200
-        section = load_config()["platforms"]["llm-gateway"]
+        section = load_config()["platforms"]["sub2api"]
         assert section["groups"] == [{"name": "组1", "api_keys": ["sk-legacy-123"]}]
         assert section["use_groups"] is True
 
@@ -818,14 +866,14 @@ class TestWebConfig:
         init_config(tmp_config_path)
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         # 空 groups → 400(纯组式至少一组)
-        resp = client.put("/api/config/platforms/llm-gateway", json={"groups": []})
+        resp = client.put("/api/config/platforms/sub2api", json={"groups": []})
         assert resp.status_code == 400
         assert "至少需要一个分组" in resp.json()["detail"]
         # 顶层 daily_limit / use_groups 已从编辑面移除 → 未知字段 400
-        resp = client.put("/api/config/platforms/llm-gateway", json={"daily_limit": 50})
+        resp = client.put("/api/config/platforms/sub2api", json={"daily_limit": 50})
         assert resp.status_code == 400
         resp = client.put(
-            "/api/config/platforms/llm-gateway", json={"use_groups": True}
+            "/api/config/platforms/sub2api", json={"use_groups": True}
         )
         assert resp.status_code == 400
         # groups 提交到其他平台 → 400
@@ -835,16 +883,16 @@ class TestWebConfig:
         assert resp.status_code == 400
         # 无任何既有 key 时空 key 串 → 400(留空 = 保留,但无值可保留)
         cfg = load_config()
-        del cfg["platforms"]["llm-gateway"]["groups"]
-        cfg["platforms"]["llm-gateway"].pop("api_key", None)
+        del cfg["platforms"]["sub2api"]["groups"]
+        cfg["platforms"]["sub2api"].pop("api_key", None)
         from llm_usage.config import save_config
 
         save_config(cfg)
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{"name": "组1", "api_keys": [""]}],
         })
         assert resp.status_code == 400
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "groups": [{"name": "组1", "api_keys": [{"index": 0, "value": ""}]}],
         })
         assert resp.status_code == 400
@@ -976,7 +1024,7 @@ class TestWebConfig:
         assert resp.status_code == 400
         assert "缺少 secret_key" in resp.json()["detail"]
         # gateway 提交 credential_slots → 400
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "credential_slots": [{"name": "套餐A", "api_key": "sk-x"}],
         })
         assert resp.status_code == 400
@@ -1028,7 +1076,7 @@ class TestWebConfig:
         init_config(tmp_config_path)
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         platforms = {p["key"]: p for p in client.get("/api/config").json()["platforms"]}
-        assert platforms["llm-gateway"]["base_url"] == "http://127.0.0.1:18080"
+        assert platforms["sub2api"]["base_url"] == "http://127.0.0.1:18080"
         assert "base_url" not in platforms["kimi"]
 
     def test_put_gateway_base_url_keep_and_replace(
@@ -1039,19 +1087,19 @@ class TestWebConfig:
         init_config(tmp_config_path)
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         # 留空 = 不修改
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "base_url": "", "groups": [{"name": "组1", "api_keys": ["sk-a-123"]}],
         })
         assert resp.status_code == 200
-        assert load_config()["platforms"]["llm-gateway"]["base_url"] == "http://127.0.0.1:18080"
+        assert load_config()["platforms"]["sub2api"]["base_url"] == "http://127.0.0.1:18080"
         # 非空 → 写回
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "base_url": "http://gw.new:8080",
             "groups": [{"name": "组1", "api_keys": ["sk-a-123"]}],
         })
         assert resp.status_code == 200
         assert resp.json()["base_url"] == "http://gw.new:8080"
-        assert load_config()["platforms"]["llm-gateway"]["base_url"] == "http://gw.new:8080"
+        assert load_config()["platforms"]["sub2api"]["base_url"] == "http://gw.new:8080"
         # 其他平台提交 base_url → 400
         resp = client.put("/api/config/platforms/kimi", json={"base_url": "http://x"})
         assert resp.status_code == 400
@@ -1100,7 +1148,7 @@ class TestWebConfig:
         assert calls[0] == 1
         new_order = [
             "opencode-go", "ollama", "volcengine-agent", "volcengine-coding", "kimi",
-            "clinepass", "commandcode", "opendesign", "llm-gateway",
+            "clinepass", "commandcode", "opendesign", "sub2api",
         ]
         resp = client.put("/api/config/order", json={"order": new_order})
         assert resp.status_code == 200
@@ -1127,7 +1175,7 @@ class TestWebConfig:
         assert resp.status_code == 200
         assert resp.json()["order"] == [
             "ollama", "kimi", "volcengine-coding", "volcengine-agent", "opencode-go",
-            "clinepass", "commandcode", "opendesign", "llm-gateway",
+            "clinepass", "commandcode", "opendesign", "sub2api",
         ]
 
 class TestConfigImport:
@@ -1575,7 +1623,7 @@ class TestUserIsolation:
         admin_names = [p["name"] for p in client.get("/api/usage").json()["platforms"]]
         assert set(admin_names) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "opendesign", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
         }
         assert calls[0] == 2  # alice 空配置 + admin 配置,各自缓存条目
 
@@ -1587,34 +1635,34 @@ class TestUserIsolation:
         alice = self._register(client, "alice")
         bob = self._register(client, "bob")
         # 先共享给 alice
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "visibility": {"type": "shared", "targets": ["alice"]},
         })
         assert resp.status_code == 200
         assert resp.json()["visibility"] == {"type": "shared", "targets": ["alice"]}
         alice_names = [p["name"] for p in alice.get("/api/usage").json()["platforms"]]
         bob_names = [p["name"] for p in bob.get("/api/usage").json()["platforms"]]
-        assert "llm-gateway" in alice_names
-        assert alice_names == ["llm-gateway"]  # 自己的配置为空,仅共享平台
-        assert "llm-gateway" not in bob_names
+        assert "sub2api" in alice_names
+        assert alice_names == ["sub2api"]  # 自己的配置为空,仅共享平台
+        assert "sub2api" not in bob_names
         # 公开 → 所有人都可见,带 (admin) 后缀
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "visibility": {"type": "public", "targets": []},
         })
         assert resp.status_code == 200
         assert resp.json()["visibility"] == {"type": "public", "targets": []}
         for viewer in (alice, bob):
             gateway = [p for p in viewer.get("/api/usage").json()["platforms"]
-                       if p["name"] == "llm-gateway"][0]
-            assert gateway["display_name"] == "LLM Gateway(admin)"
+                       if p["name"] == "sub2api"][0]
+            assert gateway["display_name"] == "Sub2API(admin)"
         # 私有 → 无人可见
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "visibility": {"type": "private", "targets": []},
         })
         assert resp.status_code == 200
         for viewer in (alice, bob):
             names = [p["name"] for p in viewer.get("/api/usage").json()["platforms"]]
-            assert "llm-gateway" not in names
+            assert "sub2api" not in names
 
     def test_my_platform_enable_and_visibility(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
@@ -1727,7 +1775,7 @@ class TestUserIsolation:
         init_config(tmp_config_path)
         client, _ = self._config_client(monkeypatch, load_config())
         alice = self._register(client, "alice")
-        resp = alice.put("/api/my/platforms/llm-gateway", json={
+        resp = alice.put("/api/my/platforms/sub2api", json={
             "enabled": True,
             "base_url": "http://127.0.0.1:18080",
             "groups": [
@@ -1736,7 +1784,7 @@ class TestUserIsolation:
             ],
         })
         assert resp.status_code == 200
-        section = store.get_user_config("alice")["platforms"]["llm-gateway"]
+        section = store.get_user_config("alice")["platforms"]["sub2api"]
         assert section["base_url"] == "http://127.0.0.1:18080"
         assert section["use_groups"] is True
         assert section["groups"] == [
@@ -1748,7 +1796,7 @@ class TestUserIsolation:
             "name": None, "set": True, "env": None, "hint": "g-al…ey",
         }
         # 留空 base_url 不修改;groups 留空 key = 保留
-        resp = alice.put("/api/my/platforms/llm-gateway", json={
+        resp = alice.put("/api/my/platforms/sub2api", json={
             "enabled": True,
             "base_url": "",
             "groups": [
@@ -1757,7 +1805,7 @@ class TestUserIsolation:
             ],
         })
         assert resp.status_code == 200
-        section = store.get_user_config("alice")["platforms"]["llm-gateway"]
+        section = store.get_user_config("alice")["platforms"]["sub2api"]
         assert section["base_url"] == "http://127.0.0.1:18080"
         assert section["groups"] == [
             {"name": "组1", "api_keys": ["g-alice-key"]}
@@ -1783,7 +1831,7 @@ class TestUserIsolation:
             resp = alice.put("/api/my/platforms/kimi", json=body)
             assert resp.status_code == 400, body
         # gateway 不接受 credential_slots
-        resp = alice.put("/api/my/platforms/llm-gateway", json={
+        resp = alice.put("/api/my/platforms/sub2api", json={
             "credential_slots": [{"index": None, "api_key": "k"}],
         })
         assert resp.status_code == 400
@@ -1842,32 +1890,32 @@ class TestUserIsolation:
         alice = self._register(client, "alice")
         bob = self._register(client, "bob")
         # 自定义显示名称 + 启用 + 公开
-        resp = alice.put("/api/my/platforms/llm-gateway", json={
+        resp = alice.put("/api/my/platforms/sub2api", json={
             "enabled": True,
             "display_name": "我的渠道",
             "visibility": {"type": "public", "targets": []},
         })
         assert resp.status_code == 200
         assert resp.json()["display_name"] == "我的渠道"
-        assert store.get_user_config("alice")["platforms"]["llm-gateway"] == {
+        assert store.get_user_config("alice")["platforms"]["sub2api"] == {
             "enabled": True,
             "display_name": "我的渠道",
         }
         # 自己的仪表盘显示自定义名(无后缀)
         alice_gw = [p for p in alice.get("/api/usage").json()["platforms"]
-                    if p["name"] == "llm-gateway"][0]
+                    if p["name"] == "sub2api"][0]
         assert alice_gw["display_name"] == "我的渠道"
         # 共享给他人 → 自定义名 + (owner) 后缀
         bob_gw = [p for p in bob.get("/api/usage").json()["platforms"]
-                  if p["name"] == "llm-gateway"][0]
+                  if p["name"] == "sub2api"][0]
         assert bob_gw["display_name"] == "我的渠道(alice)"
         # 留空 = 不修改
-        resp = alice.put("/api/my/platforms/llm-gateway", json={
+        resp = alice.put("/api/my/platforms/sub2api", json={
             "enabled": True,
             "display_name": "",
         })
         assert resp.status_code == 200
-        assert store.get_user_config("alice")["platforms"]["llm-gateway"][
+        assert store.get_user_config("alice")["platforms"]["sub2api"][
             "display_name"] == "我的渠道"
         # 非 gateway 平台同样支持自定义名称(全平台开放)
         resp = alice.put("/api/my/platforms/kimi", json={
@@ -1913,7 +1961,7 @@ class TestUserIsolation:
         init_config(tmp_config_path)
         client, _ = self._config_client(monkeypatch, load_config())
         alice = self._register(client, "alice")
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "enabled": True,
             "display_name": "内网网关",
             "visibility": {"type": "public", "targets": []},
@@ -1921,13 +1969,13 @@ class TestUserIsolation:
         assert resp.status_code == 200
         assert resp.json()["display_name"] == "内网网关"
         admin_gw = [p for p in client.get("/api/usage").json()["platforms"]
-                    if p["name"] == "llm-gateway"][0]
+                    if p["name"] == "sub2api"][0]
         assert admin_gw["display_name"] == "内网网关"
         alice_gw = [p for p in alice.get("/api/usage").json()["platforms"]
-                    if p["name"] == "llm-gateway"][0]
+                    if p["name"] == "sub2api"][0]
         assert alice_gw["display_name"] == "内网网关(admin)"
         # 留空 = 不修改
-        resp = client.put("/api/config/platforms/llm-gateway", json={
+        resp = client.put("/api/config/platforms/sub2api", json={
             "enabled": True,
             "display_name": "",
         })
@@ -1946,11 +1994,11 @@ class TestUserIsolation:
         keys = [p["key"] for p in data["platforms"]]
         assert keys == [
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "opendesign", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
         ]
         for p in data["platforms"]:
             assert p["visibility"] == {"type": "private", "targets": []}
-            if p["key"] == "llm-gateway":
+            if p["key"] == "sub2api":
                 assert set(p) == {
                     "key", "type", "display_name", "enabled", "visibility",
                     "base_url", "groups",
@@ -1960,10 +2008,14 @@ class TestUserIsolation:
             elif p["key"] in ("kimi", "volcengine-coding", "volcengine-agent",
                               "ollama", "opencode-go", "clinepass",
                               "commandcode", "opendesign"):
-                assert set(p) == {
+                expected_fields = {
                     "key", "type", "display_name", "enabled", "visibility",
                     "credential_slots",
                 }
+                if p["type"] == "opendesign":
+                    expected_fields.add("max_balance")
+                    assert p["max_balance"] is None
+                assert set(p) == expected_fields
                 assert p["credential_slots"] == []
         # 存一条凭证后视图脱敏,不回明文
         alice.put("/api/my/platforms/kimi", json={
@@ -2639,7 +2691,7 @@ class TestProviderInstances:
         client.post("/api/config/providers", json={"type": "kimi"})
         order = ["kimi#2", "kimi", "volcengine-coding", "volcengine-agent",
                  "ollama", "opencode-go", "clinepass", "commandcode", "opendesign",
-                 "llm-gateway"]
+                 "sub2api"]
         resp = client.put("/api/config/order", json={"order": order})
         assert resp.status_code == 200
         assert resp.json()["order"] == order  # 实例键不被过滤

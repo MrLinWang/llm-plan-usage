@@ -59,7 +59,7 @@ def main() -> None:
 @click.option("--plain", is_flag=True, help="Reserved; currently same rendering as default (not implemented).")
 @click.option("--no-save", is_flag=True, help="Do not persist a snapshot to history.")
 @click.option("--keys", "show_keys", is_flag=True,
-              help="Also show per-key usage detail for multi-key groups (e.g. llm-gateway).")
+              help="Also show per-key usage detail for multi-key groups (e.g. Sub2API).")
 def show(as_json: bool, plain: bool, no_save: bool, show_keys: bool) -> None:
     """Fetch all platforms and display current usage."""
     setup_cli_logging()

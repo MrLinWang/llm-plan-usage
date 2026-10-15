@@ -25,6 +25,7 @@ from llm_usage.providers.kimi import KimiProvider
 from llm_usage.providers.llm_gateway import LlmGatewayProvider
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
+from llm_usage.providers.opendesign import OpenDesignProvider
 from llm_usage.providers.volcengine import VolcengineProvider
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ PROVIDERS: dict[str, Provider] = {
     "opencode-go": OpenCodeGoProvider(),
     "clinepass": ClinePassProvider(),
     "commandcode": CommandCodeProvider(),
+    "opendesign": OpenDesignProvider(),
     "llm-gateway": LlmGatewayProvider(),
 }
 
@@ -145,6 +147,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "opencode-go": "OpenCode Go",
     "clinepass": "ClinePass",
     "commandcode": "Command Code",
+    "opendesign": "OpenDesign",
     "llm-gateway": "LLM Gateway",
 }
 
@@ -164,8 +167,9 @@ def _prepare_config(platform: str, pcfg: dict[str, Any]) -> dict[str, Any]:
     if "display_name" not in out:
         base, _ = split_instance_key(platform)
         out["display_name"] = DISPLAY_NAMES.get(base, platform)
-    # expand env: prefixed credentials (api_key, access_key, secret_key)
+    # expand env: prefixed credentials
     out["api_key"] = _resolve_env_value(pcfg.get("api_key"))
+    out["control_key"] = _resolve_env_value(pcfg.get("control_key"))
     out["access_key"] = _resolve_env_value(pcfg.get("access_key"))
     out["secret_key"] = _resolve_env_value(pcfg.get("secret_key"))
     return out
@@ -195,6 +199,7 @@ def _credential_specs(prepared: dict[str, Any]) -> list[tuple[dict[str, Any], st
             plan_name = f"套餐{index + 1}"
         sub = dict(prepared)
         sub["api_key"] = _resolve_env_value(slot.get("api_key"))
+        sub["control_key"] = _resolve_env_value(slot.get("control_key"))
         sub["access_key"] = _resolve_env_value(slot.get("access_key"))
         sub["secret_key"] = _resolve_env_value(slot.get("secret_key"))
         sub.pop("credentials", None)

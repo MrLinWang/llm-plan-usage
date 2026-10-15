@@ -175,7 +175,13 @@ def _fmt_countdown(
 def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status: str) -> Text:
     """Build one data line (no bar) as a styled Text."""
     name = display_name if is_first else ""
-    if entry.limit is None and entry.used == 0.0 and entry.percent is not None:
+    if (
+        entry.label == "余额" and entry.limit is None and entry.used == 0.0
+        and entry.percent is None and entry.remaining is not None
+    ):
+        used = limit = "-"
+        remaining = _fmt_value(entry.remaining, entry.unit)
+    elif entry.limit is None and entry.used == 0.0 and entry.percent is not None:
         used = limit = remaining = "-"
     else:
         used = _fmt_value(entry.used, entry.unit)
@@ -384,6 +390,7 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
     table.add_column("窗口")
     table.add_column("已用", justify="right")
     table.add_column("限额", justify="right")
+    table.add_column("剩余", justify="right")
     table.add_column("百分比", justify="right")
 
     for r in reversed(rows):
@@ -391,6 +398,14 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
         limit = r.get("limit")
         limit_str = f"{limit:g}" if limit is not None else "∞"
         percent = r.get("percent")
+        used_str = str(r.get("used", ""))
+        remaining = r.get("remaining")
+        if (
+            r.get("label") == "余额" and limit is None and r.get("used") == 0
+            and percent is None and remaining is not None
+        ):
+            used_str = limit_str = "-"
+        remaining_str = _fmt_value(remaining, r.get("unit", ""))
         color = _percent_color(percent)
         percent_str = f"{percent:g}%" if percent is not None else "-"
         table.add_row(
@@ -398,8 +413,9 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
             str(r.get("platform", "")),
             str(r.get("plan") or "-"),
             str(r.get("label", "")),
-            str(r.get("used", "")),
+            used_str,
             limit_str,
+            remaining_str,
             f"[{color}]{percent_str}[/{color}]",
         )
     console.print(table)

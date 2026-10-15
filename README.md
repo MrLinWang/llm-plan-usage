@@ -69,9 +69,10 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer |
 | ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口 |
 | Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 |
+| OpenDesign | 自动 API | `GET /api/v1/workspaces/current` + `/api/v1/workspaces/{id}/billing/preflight`，Bearer 控制密钥；credits 配额窗口 + 美元余额 |
 | LLM Gateway（本地 Sub2API 网关） | 自动 API | `GET /v1/usage`，Bearer；读 `subscription` 出 每日/每周/每月 三行（旧版回退今日 `actual_cost`） |
 
-以上 8 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
+以上 9 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
 `kimi#2`），见下方「同类型供应商实例」。
 
 ## 配置
@@ -99,6 +100,47 @@ max_retries = 3
 ```
 
 `show`/`tui`/`web` 共用同一重试逻辑（Web 的 TTL 缓存内生效）。
+
+### OpenDesign
+
+OpenDesign 的模型调用密钥（`sk-amr-`）与账户控制密钥（`vela_ctrl_`）用途不同。
+在 Web「供应商配置」的 OpenDesign 凭证槽中点击「网页登录授权」，再点击
+「打开 OpenDesign 登录并授权」进入官方页面。登录对应的 OpenDesign 账号并
+确认授权，页面需要时填写配置页显示的授权码。返回配置页后，授权状态会自动
+更新；成功后查询凭证自动保存，无需查找或复制 `control_key`。
+账号密码只在 OpenDesign 官方页面输入。已有凭证槽可重新授权，也可添加新槽
+连接其他账号；独立的 OpenDesign 供应商实例同样支持此流程。
+
+管理员的查询凭证保存到 `config.toml`，普通用户的凭证只保存到自己的账户配置。
+网页登录授权保留已有的模型调用 `api_key`、其他套餐和启用状态；供应商名称、
+启用开关等其他修改仍需点击「保存」。若该供应商已停用，授权后仍需勾选
+「启用」并保存才能显示用量。授权码过期或取消后可以重新发起授权。
+
+已有控制密钥时，也可直接在凭证槽中填写，或在 `config.toml` 中配置。
+通过官方 CLI 的 `vela login` 完成登录后，生产环境的控制密钥保存在
+`~/.amr/config.json` 的 `profiles.prod.controlKey` 字段（设置了 `AMR_HOME` 时
+使用该目录）。将该值填入 `control_key`，或设置 `OPENDESIGN_CONTROL_KEY`
+环境变量并在 `config.toml` 中引用：
+
+```toml
+[platforms.opendesign]
+enabled = true
+control_key = "env:OPENDESIGN_CONTROL_KEY"  # vela_ctrl_ 开头的账户控制密钥
+base_url = "https://amr-link.open-design.ai/v1"
+```
+
+`base_url` 是模型服务地址，用量读取走 OpenDesign 官方的 `amr-api` 控制接口。
+支持多凭证套餐和独立供应商实例。保存控制密钥时会保留已有的模型调用 `api_key`。
+
+查询先读取 `GET https://amr-api.open-design.ai/api/v1/workspaces/current`
+确定当前工作区，再读取 `/api/v1/workspaces/{id}/billing/preflight`。
+可在平台段手工设置 `workspace_id = "工作区 ID"`，直接查询指定工作区。
+返回的 Coding Plan 窗口按原始 `credits` 单位展示已用、限额、剩余与重置时间；
+钱包余额单独以 `$` 展示，不从余额推算消费或总额度。
+
+只有 `sk-amr-` 密钥时，可通过上述网页登录授权连接对应账号。认证与额度字段参考
+[官方登录实现](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela.ts)
+与[官方用量响应解析](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela-billing.ts)。
 
 ### LLM Gateway（本地 Sub2API 网关）
 
@@ -144,7 +186,7 @@ api_keys = [
 provider 兼容，可手工编辑 `config.toml` 使用；Web 端会把这种配置当作一组展示，
 保存时自动迁移为 `groups` 并置 `use_groups = true`。
 
-### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass / commandcode）
+### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass / commandcode / opendesign）
 
 除 LLM Gateway 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
 **不同计费套餐**。每个凭证彼此完全独立——各自 fetch、各自展示、无共享限额、
@@ -155,7 +197,7 @@ provider 兼容，可手工编辑 `config.toml` 使用；Web 端会把这种配�
 套餐分区。
 
 Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass/commandcode 为
-`api_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
+`api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
 （火山为「添加 AK/SK」）即可增加新套餐；「套餐名」留空时服务端自动命名
 `套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后写回
 `credentials` 数组并清除顶层单凭证字段（旧单 Key 形式首次保存即自动迁移）。
@@ -305,8 +347,8 @@ PBKDF2-SHA256（60 万次迭代、随机盐）哈希存储，不落明文；站�
 ### 供应商配置
 
 管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证
-（kimi/ollama/opencode-go/clinepass/commandcode 为 `api_key`；火山两个平台为 `access_key` + `secret_key`；
-llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode
+（kimi/ollama/opencode-go/clinepass/commandcode 为 `api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`；
+llm-gateway 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode/opendesign
 以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
 命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
 （火山「添加 AK/SK」）追加新套餐槽。LLM Gateway 以**组**为单位编辑：
@@ -340,7 +382,7 @@ LLM Gateway **一键导入 config.toml**：添加栏旁的「导入 config.toml�
 卡片；新实例默认**停用**，配好凭证后再勾选启用。管理员添加写入
 `./config.toml`（`POST /api/config/providers`），普通用户写入自己的
 `user_configs`（`POST /api/my/providers`）。删除走卡片上的「删除此供应商」
-按钮（确认框），该实例的共享设置一并级联移除；内置的 8 个基础平台不可删除。
+按钮（确认框），该实例的共享设置一并级联移除；内置的 9 个基础平台不可删除。
 实例编号单调递增不复用（删除 `kimi#2` 后再添加得到 `kimi#3`），避免历史快照
 歧义。终端侧无需配置：实例随所在平台的配置自动抓取并显示。
 

@@ -432,6 +432,59 @@ class TestWebAuth:
 
 
 class TestWebConfig:
+    @pytest.mark.parametrize("admin", [True, False])
+    def test_opendesign_credential_editor(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path, admin: bool,
+    ) -> None:
+        init_config(tmp_config_path)
+        update_platform_config("opendesign", {"api_key": "sk-amr-runtime-secret"})
+        username = "admin" if admin else "alice"
+        client, _ = _auth_client(monkeypatch, tmp_db_path, username=username, admin=admin)
+        if not admin:
+            store.set_user_config(username, {"platforms": {
+                "opendesign": load_config()["platforms"]["opendesign"],
+            }})
+        endpoint = "/api/config/platforms/opendesign" if admin else "/api/my/platforms/opendesign"
+
+        def current_section():
+            cfg = load_config() if admin else store.get_user_config(username)
+            return cfg["platforms"]["opendesign"]
+
+        types = client.get("/api/provider-types").json()["types"]
+        assert {"key": "opendesign", "label": "OpenDesign"} in types
+        assert '"opendesign": ["control_key"]' in client.get("/config").text
+
+        response = client.put(endpoint, json={
+            "credential_slots": [
+                {"index": 0, "name": "设计账户", "control_key": "vela_ctrl_test_secret"},
+            ],
+        })
+        assert response.status_code == 200
+        assert "vela_ctrl_test_secret" not in response.text
+        assert "sk-amr-runtime-secret" not in response.text
+        view = response.json()
+        assert view["type"] == "opendesign"
+        assert view["display_name"] == "OpenDesign"
+        assert view["credential_slots"][0]["credentials"]["control_key"] == {
+            "set": True, "env": None, "hint": "vela…et",
+        }
+        section = current_section()
+        assert section["credentials"] == [
+            {"name": "设计账户", "control_key": "vela_ctrl_test_secret"},
+        ]
+        assert "control_key" not in section
+        assert section["api_key"] == "sk-amr-runtime-secret"
+        assert section["base_url"] == "https://amr-link.open-design.ai/v1"
+        response = client.put(endpoint, json={
+            "enabled": False,
+            "credential_slots": [{"index": 0, "control_key": ""}],
+        })
+        assert response.status_code == 200
+        saved = current_section()
+        assert saved["credentials"] == section["credentials"]
+        assert saved["api_key"] == section["api_key"]
+
     def test_get_config_credential_slots(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
         tmp_config_path: Path,
@@ -1047,7 +1100,7 @@ class TestWebConfig:
         assert calls[0] == 1
         new_order = [
             "opencode-go", "ollama", "volcengine-agent", "volcengine-coding", "kimi",
-            "clinepass", "commandcode", "llm-gateway",
+            "clinepass", "commandcode", "opendesign", "llm-gateway",
         ]
         resp = client.put("/api/config/order", json={"order": new_order})
         assert resp.status_code == 200
@@ -1074,7 +1127,7 @@ class TestWebConfig:
         assert resp.status_code == 200
         assert resp.json()["order"] == [
             "ollama", "kimi", "volcengine-coding", "volcengine-agent", "opencode-go",
-            "clinepass", "commandcode", "llm-gateway",
+            "clinepass", "commandcode", "opendesign", "llm-gateway",
         ]
 
 class TestConfigImport:
@@ -1522,7 +1575,7 @@ class TestUserIsolation:
         admin_names = [p["name"] for p in client.get("/api/usage").json()["platforms"]]
         assert set(admin_names) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "llm-gateway",
         }
         assert calls[0] == 2  # alice 空配置 + admin 配置,各自缓存条目
 
@@ -1893,7 +1946,7 @@ class TestUserIsolation:
         keys = [p["key"] for p in data["platforms"]]
         assert keys == [
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "llm-gateway",
         ]
         for p in data["platforms"]:
             assert p["visibility"] == {"type": "private", "targets": []}
@@ -1906,7 +1959,7 @@ class TestUserIsolation:
                 assert p["groups"] == []  # 无凭证/无 legacy 单 key → 空组列表
             elif p["key"] in ("kimi", "volcengine-coding", "volcengine-agent",
                               "ollama", "opencode-go", "clinepass",
-                              "commandcode"):
+                              "commandcode", "opendesign"):
                 assert set(p) == {
                     "key", "type", "display_name", "enabled", "visibility",
                     "credential_slots",
@@ -2585,7 +2638,8 @@ class TestProviderInstances:
         client = self._client(monkeypatch, tmp_config_path)
         client.post("/api/config/providers", json={"type": "kimi"})
         order = ["kimi#2", "kimi", "volcengine-coding", "volcengine-agent",
-                 "ollama", "opencode-go", "clinepass", "commandcode", "llm-gateway"]
+                 "ollama", "opencode-go", "clinepass", "commandcode", "opendesign",
+                 "llm-gateway"]
         resp = client.put("/api/config/order", json={"order": order})
         assert resp.status_code == 200
         assert resp.json()["order"] == order  # 实例键不被过滤

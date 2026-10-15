@@ -6,7 +6,7 @@
 # 平台显示顺序:可选。取消注释并调整列表即可改变 show/tui/web 的显示顺序。
 # platform_order = [
 #     "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-#     "opencode-go", "clinepass", "commandcode", "llm-gateway",
+#     "opencode-go", "clinepass", "commandcode", "opendesign", "llm-gateway",
 # ]
 
 # 自动重试:可选,默认 3(首次失败后额外重试 3 次 = 最多 4 次请求)。
@@ -88,6 +88,18 @@ api_key = "env:COMMANDCODE_API_KEY"       # Command Code API key (Studio → API
 # [[platforms.commandcode.credentials]]
 # name = "套餐A"
 # api_key = "env:COMMANDCODE_API_KEY_A"
+
+[platforms.opendesign]
+enabled = true
+control_key = "env:OPENDESIGN_CONTROL_KEY"  # vela_ctrl_ 开头的账户控制密钥,非 sk-amr- 模型密钥
+base_url = "https://amr-link.open-design.ai/v1"
+# base_url 是模型服务地址;用量通过 OpenDesign 官方 amr-api 控制接口读取。
+# workspace_id = "工作区 ID"  # 可选;默认查询当前工作区
+# 多计费套餐:同一平台可有多个独立凭证(每个 = 一个套餐);可在 Web「供应商配置」页维护。
+# 手工编辑:
+# [[platforms.opendesign.credentials]]
+# name = "套餐A"
+# control_key = "env:OPENDESIGN_CONTROL_KEY_A"
 
 [platforms.llm-gateway]
 enabled = true

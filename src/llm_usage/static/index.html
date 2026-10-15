@@ -880,10 +880,18 @@ function cleanTotal(value) {
   return Number(Number(value).toPrecision(12));
 }
 
+// 余额只报告剩余金额,不代表已用为零或额度无限;合计行保留同一语义。
+function isBalanceOnly(entry) {
+  return (entry.label === "余额" || entry.balance_only === true) &&
+    entry.limit === null && entry.used === 0 && entry.percent === null &&
+    entry.remaining !== null && entry.remaining !== undefined;
+}
+
 // 独立分组必须使用同一计费单位；限额不完整时只汇总已用，不虚构总进度。
 function totalEntry(entries) {
   var unit = entries[0].unit;
   var sameUnit = entries.every(function (entry) { return entry.unit === unit; });
+  var balanceOnly = sameUnit && entries.every(isBalanceOnly);
   var used = sameUnit ? cleanTotal(entries.reduce(function (sum, entry) {
     return sum + (Number.isFinite(Number(entry.used)) ? Number(entry.used) : 0);
   }, 0)) : 0;
@@ -894,7 +902,9 @@ function totalEntry(entries) {
   var limit = hasCompleteLimit ? cleanTotal(entries.reduce(function (sum, entry) {
     return sum + Number(entry.limit);
   }, 0)) : null;
-  var remaining = limit === null ? null : cleanTotal(Math.max(limit - used, 0));
+  var remaining = balanceOnly ? cleanTotal(entries.reduce(function (sum, entry) {
+    return sum + Number(entry.remaining);
+  }, 0)) : limit === null ? null : cleanTotal(Math.max(limit - used, 0));
   var percent = limit === null || limit === 0
     ? null : Math.round(Math.max(Math.min(used / limit * 100, 100), 0) * 10) / 10;
   // 继承一致的重置时间与语义:时间或 reset_kind 不一致时都不继承,
@@ -905,6 +915,7 @@ function totalEntry(entries) {
     kinds.every(function (value) { return value === kinds[0]; });
   return {
     label: "全部合计",
+    balance_only: balanceOnly,
     used: used,
     limit: limit,
     remaining: remaining,
@@ -963,7 +974,10 @@ function dataRow(entry) {
   var tr = el("tr");
   var used, limit, remaining;
   // 特殊行规则(同 _make_data_line)
-  if (entry.limit === null && entry.used === 0 && entry.percent !== null) {
+  if (isBalanceOnly(entry)) {
+    used = limit = "-";
+    remaining = fmtValue(entry.remaining, entry.unit);
+  } else if (entry.limit === null && entry.used === 0 && entry.percent !== null) {
     used = limit = remaining = "-";
   } else {
     used = fmtValue(entry.used, entry.unit);

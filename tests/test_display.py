@@ -49,6 +49,20 @@ class _FixedNow(datetime):
 
 
 class TestDisplay:
+    @pytest.mark.parametrize("balance", [0.0, 12.5, -0.5])
+    def test_balance_only_displays_remaining_without_inventing_usage_or_limit(
+        self, balance: float,
+    ) -> None:
+        entry = UsageEntry("opendesign", "余额", 0, None, balance, None, None, "$")
+        console, buf = _make_console()
+        render_results([PlatformResult("opendesign", "OpenDesign", entries=[entry])],
+                       console=console)
+        output = buf.getvalue()
+        row = next(line for line in output.splitlines() if "余额" in line)
+        assert row.split()[3:6] == ["-", "-", f"${balance:g}"]
+        assert "∞" not in output
+        assert "%" not in row
+
     def test_render_results_contains_platform_names(self) -> None:
         e = UsageEntry("kimi", "5小时", 80, 120, 40, 66.7, None, "%", False)
         r = PlatformResult("kimi", "Kimi Code", entries=[e])
@@ -207,6 +221,18 @@ class TestDisplaySerialization:
         console, buf = _make_console()
         render_history([], console=console)
         assert "无历史记录" in buf.getvalue()
+
+    @pytest.mark.parametrize("balance", [0.0, 12.5, -0.5])
+    def test_balance_snapshot_history_shows_remaining(self, tmp_db_path, balance) -> None:
+        entry = UsageEntry("opendesign", "余额", 0, None, balance, None, None, "$")
+        assert save_snapshot([PlatformResult("opendesign", "OpenDesign", entries=[entry])]) == 1
+        console, buf = _make_console()
+        render_history(query_history(platform="opendesign"), console=console)
+        output = buf.getvalue()
+        assert "剩余" in output and f"${balance:g}" in output
+        assert "∞" not in output
+        row = next(line for line in output.splitlines() if "余额" in line)
+        assert [cell.strip() for cell in row.split("│")[5:8]] == ["-", "-", f"${balance:g}"]
 
     def test_render_history_with_rows(self) -> None:
         rows = [{"ts": "2026-08-18T09:00:00+00:00", "platform": "kimi", "label": "5小时",

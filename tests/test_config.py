@@ -19,6 +19,7 @@ class TestConfigInit:
         assert "[platforms.kimi]" in text
         assert "[platforms.ollama]" in text
         assert "[platforms.opencode-go]" in text
+        assert "[platforms.opendesign]" in text
         assert "[platforms.llm-gateway]" in text
         # 多计费套餐注释(注释行,不进 TOML 本体)
         assert "credentials" in text
@@ -109,6 +110,10 @@ class TestEnvPrefix:
         C.init_config(p)
         cfg = C.load_config(p)
         assert cfg["platforms"]["kimi"]["api_key"] == "env:KIMI_API_KEY"
+        assert cfg["platforms"]["opendesign"]["control_key"] == "env:OPENDESIGN_CONTROL_KEY"
+        assert cfg["platforms"]["opendesign"]["base_url"] == (
+            "https://amr-link.open-design.ai/v1"
+        )
 
 
 class TestPlatformOrder:

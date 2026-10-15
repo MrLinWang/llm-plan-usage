@@ -1337,7 +1337,7 @@ class TestRegistry:
     def test_all_providers_registered(self) -> None:
         assert set(PROVIDERS.keys()) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "llm-gateway",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "llm-gateway",
         }
 
     def test_env_prefix_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1471,6 +1471,30 @@ class TestRegistry:
 
 class TestRegistryCredentialFanout:
     """credentials 数组 → 每凭证独立 fetch,合并为一个 PlatformResult 并标注 plan。"""
+
+    @pytest.mark.parametrize("use_slots", [False, True])
+    def test_opendesign_control_key_env_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, use_slots: bool,
+    ) -> None:
+        seen: list[str | None] = []
+
+        class _ControlProvider:
+            name = "opendesign"
+            display_name = "OpenDesign"
+            is_manual = False
+
+            def fetch(self, config):
+                seen.append(config.get("control_key"))
+                return PlatformResult(config["_platform_key"], "OpenDesign")
+
+        monkeypatch.setenv("OPENDESIGN_CONTROL_KEY", "vela_ctrl_test")
+        monkeypatch.setitem(PROVIDERS, "opendesign", _ControlProvider())
+        section: dict[str, Any] = {"control_key": "env:OPENDESIGN_CONTROL_KEY"}
+        if use_slots:
+            section = {"credentials": [section]}
+        result = fetch_all({"platforms": {"opendesign#2": section}})
+        assert seen == ["vela_ctrl_test"]
+        assert [r.platform for r in result] == ["opendesign#2"]
 
     def _kimi_with_handler(self, handler) -> KimiProvider:
         return KimiProvider(client=_mock_client(handler))

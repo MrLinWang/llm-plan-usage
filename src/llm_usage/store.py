@@ -16,13 +16,15 @@ import os
 import secrets
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from llm_usage.models import PlatformResult, UsageEntry
 
 DB_PATH = Path.cwd() / "history.db"
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -533,6 +535,37 @@ def delete_user_config(username: str, path: Path | None = None) -> None:
             "DELETE FROM user_configs WHERE username = ?", (username,)
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def mutate_user_config(
+    username: str, mutation: Callable[[dict[str, Any]], _T], path: Path | None = None,
+) -> tuple[dict[str, Any], _T]:
+    """Atomically merge an authorization result into the latest user config.
+
+    The callback runs inside a write transaction, so deleting an account or
+    finishing another authorization cannot replace an older config snapshot.
+    Exceptions roll back without persisting credentials.
+    """
+    conn = _connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT config FROM user_configs WHERE username = ?", (username,),
+        ).fetchone()
+        try:
+            data = json.loads(row[0]) if row else {}
+        except (ValueError, TypeError):
+            data = {}
+        config = data if isinstance(data, dict) else {}
+        result = mutation(config)
+        conn.execute(
+            "INSERT OR REPLACE INTO user_configs (username, config, updated_at) VALUES (?,?,?)",
+            (username, json.dumps(config, ensure_ascii=False), _now_iso()),
+        )
+        conn.commit()
+        return config, result
     finally:
         conn.close()
 

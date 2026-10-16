@@ -1,9 +1,11 @@
-"""TUI input tests: stdin EOF sentinel vs poll timeout."""
+"""TUI tests: stdin EOF sentinel vs poll timeout, fetch schedule."""
 
 from __future__ import annotations
 
 import os
 from typing import Any
+
+import pytest
 
 from llm_usage import tui
 
@@ -45,3 +47,44 @@ def test_read_key_timeout_none(monkeypatch: Any) -> None:
     finally:
         os.close(r)
         os.close(w)
+
+
+def _run_tui(monkeypatch: Any, keys: list[str | None], *, now: float = 30.0) -> int:
+    """按给定按键序列运行 run_tui(interval=60),返回 fetch_all 调用次数。
+
+    ``now`` 是固定的 monotonic 读数(≈ 主机开机时长),默认 30s < interval,
+    即「主机刚开机」:旧实现用 0.0 当哨兵时既不会启动拉取,按 r 也无效。
+    """
+    r, w = _pipe_stdin(monkeypatch)  # 非 TTY stdin:_cbreak 直接跳过
+    calls = [0]
+
+    def fake_fetch(_cfg: Any) -> list:
+        calls[0] += 1
+        return []
+
+    pending = iter(keys)
+    monkeypatch.setattr(tui, "fetch_all", fake_fetch)
+    monkeypatch.setattr(tui, "_monotonic", lambda: now)
+    monkeypatch.setattr(tui, "_read_key", lambda _timeout: next(pending))
+    try:
+        tui.run_tui({"platforms": {}}, interval=60)
+    finally:
+        os.close(r)
+        os.close(w)
+    return calls[0]
+
+
+@pytest.mark.parametrize("now", [30.0, 4_000_000.0])
+@pytest.mark.parametrize(
+    ("keys", "expected"),
+    [
+        ([None, "q"], 1),  # 启动即拉取
+        ([None, None, "q"], 1),  # 间隔内不重复拉取
+        ([None, "r", None, "q"], 2),  # 按 r 立即重新拉取
+    ],
+)
+def test_run_tui_fetch_schedule_regardless_of_monotonic_origin(
+    monkeypatch: Any, keys: list[str | None], expected: int, now: float
+) -> None:
+    """启动与按 r 都立即拉取,与 monotonic 零点(≈ 主机开机时长)无关。"""
+    assert _run_tui(monkeypatch, keys, now=now) == expected

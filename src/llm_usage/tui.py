@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
-import time
+from time import monotonic as _monotonic
 from typing import Any, Iterator
 
 from rich.console import Console
@@ -19,6 +19,7 @@ from rich.live import Live
 from rich.text import Text
 
 from llm_usage.display import TOTAL_WIDTH, build_overview
+from llm_usage.models import PlatformResult
 from llm_usage.providers import fetch_all
 
 DEFAULT_INTERVAL = 60  # seconds
@@ -64,11 +65,14 @@ def run_tui(cfg: dict[str, Any], interval: float = DEFAULT_INTERVAL) -> None:
     """Run the interactive dashboard until the user presses ``q``."""
     console = Console(width=TOTAL_WIDTH + 4)
     interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
-    last_fetch = 0.0
-    results = []
+    # 上次拉取时的 _monotonic() 读数;None = 立即拉取(启动 / 按 r)。
+    # monotonic 零点未定义(Linux 上约等于开机时长),不能用 0.0 代表"很久以前"。
+    # 测试替换模块级别名 llm_usage.tui._monotonic。
+    last_fetch: float | None = None
+    results: list[PlatformResult] = []
 
     def render(elapsed: float) -> Any:
-        overview = build_overview(results)  # type: ignore[arg-type]
+        overview = build_overview(results)
         # Countdown to next refresh (seconds only, no progress bar)
         remaining = max(interval - elapsed, 0.0)
         footer = Text.assemble(
@@ -87,20 +91,16 @@ def run_tui(cfg: dict[str, Any], interval: float = DEFAULT_INTERVAL) -> None:
         with Live(render(0.0), console=console, refresh_per_second=10, screen=True) as live:
             tick = 0.25
             while True:
-                now = time.monotonic()
-                elapsed = now - last_fetch
-                if elapsed >= interval:
+                now = _monotonic()
+                if last_fetch is None or now - last_fetch >= interval:
                     last_fetch = now
-                    elapsed = 0.0
                     try:
                         results = fetch_all(cfg)
                     except Exception as exc:  # noqa: BLE001
-                        from llm_usage.models import PlatformResult
-
                         results = [PlatformResult("tui", "TUI", error=str(exc))]
 
                 # Recompute elapsed right before render so countdown ticks.
-                elapsed_now = time.monotonic() - last_fetch
+                elapsed_now = _monotonic() - last_fetch
                 live.update(render(elapsed_now))
                 key = _read_key(tick)
                 if key is None:
@@ -110,7 +110,7 @@ def run_tui(cfg: dict[str, Any], interval: float = DEFAULT_INTERVAL) -> None:
                 if key.lower() == "q":
                     break
                 elif key.lower() == "r":
-                    last_fetch = 0.0
+                    last_fetch = None  # 下一轮立即拉取
                 elif key in ("+", "="):
                     interval = min(interval * 2, MAX_INTERVAL)  # + 增加间隔
                 elif key in ("-", "_"):

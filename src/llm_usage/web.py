@@ -28,6 +28,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Annotated, Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
@@ -152,30 +153,49 @@ def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 class UsageCache:
-    """TTL cache around fetch_all; explicit invalidation bypasses the interval."""
+    """TTL cache around fetch_all; explicit invalidation bypasses the interval.
+
+    ``_fetched_at`` 是上次拉取完成时的 ``_monotonic()`` 读数,``None`` 表示从未
+    拉取或已失效。monotonic 的零点未定义(Linux 上约等于主机开机时长),读数只能
+    与另一次读数相减:若用 ``0.0`` 之类的常数代表"很久以前",开机时长不足
+    interval 时失效会被静默忽略。测试替换模块级别名 ``llm_usage.web._monotonic``。
+    """
 
     def __init__(self, config: dict[str, Any], interval: float) -> None:
         self._config = config
         self._interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
         self._lock = threading.Lock()
         self._results: list[PlatformResult] | None = None
-        self._fetched_at: float = 0.0  # time.monotonic()
+        self._fetched_at: float | None = None  # _monotonic();None = 必须重新拉取
         self._fetched_at_iso: str = ""
 
     @property
     def interval(self) -> float:
         return self._interval
 
+    def _is_stale(self) -> bool:
+        """Whether the cached results are past the TTL or invalidated.
+
+        Caller must hold ``self._lock``.
+        """
+        fetched_at = self._fetched_at
+        return fetched_at is None or _monotonic() - fetched_at >= self._interval
+
     def set_config(self, config: dict[str, Any]) -> None:
         """Replace config and force the next get() to refetch."""
         with self._lock:
             self._config = config
-            self._fetched_at = 0.0
+            self._fetched_at = None
 
     def invalidate(self) -> None:
-        """Force the next get() to refetch (used by POST /api/refresh)."""
+        """Force the next get() to refetch (used by POST /api/refresh).
+
+        必须获取 get() 拉取期间持有的同一把锁:有在途拉取时先等它结束再置失效,
+        保证随后的 get() 拿到的是失效之后才开始的拉取。若改成不加锁,点击前就已
+        开始的拉取完成时会覆盖 ``None``,届时需改用代数计数(拉取开始时记录代数)。
+        """
         with self._lock:
-            self._fetched_at = 0.0
+            self._fetched_at = None
 
     def set_interval(self, interval: float) -> float:
         """Update the TTL interval (clamped to [MIN, MAX]); return the clamped value."""
@@ -191,16 +211,13 @@ class UsageCache:
         Double-check staleness after acquiring so only one thread fetches.
         """
         with self._lock:
-            stale = (
-                self._results is None
-                or time.monotonic() - self._fetched_at >= self._interval
-            )
-            if stale:
+            results = self._results
+            if results is None or self._is_stale():
                 results = fetch_all(self._config)
                 self._results = results
-                self._fetched_at = time.monotonic()
+                self._fetched_at = _monotonic()
                 self._fetched_at_iso = datetime.now(timezone.utc).isoformat()
-            return self._results, self._fetched_at_iso
+            return results, self._fetched_at_iso
 
 
 class UserCaches:
@@ -212,12 +229,19 @@ class UserCaches:
 
     Manual refresh invalidates the caller's own config and visible shared
     owners' configs, never unrelated entries in this pool.
+
+    锁顺序:持有池锁 ``self._lock`` 时绝不获取单个 UsageCache 的锁——后者在
+    拉取上游期间一直被占用,否则一个配置的慢拉取会卡住所有用户的 get()。
+    池锁内只做查找/快照,释放后再调用缓存方法。
     """
 
     MAX_CACHES = 32
 
     def __init__(self, interval: float) -> None:
         self._lock = threading.Lock()
+        # 串行化并发的 set_interval:逐个设置缓存时已释放池锁,防止两个改间隔
+        # 请求交错执行,让各缓存停在与池不一致的间隔上
+        self._interval_lock = threading.Lock()
         self._caches: OrderedDict[str, UsageCache] = OrderedDict()
         self._interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
 
@@ -245,24 +269,32 @@ class UserCaches:
     def invalidate_all(self) -> None:
         """Force every cached config to refetch on its next get()."""
         with self._lock:
-            for cache in self._caches.values():
-                cache.invalidate()
+            caches = list(self._caches.values())
+        for cache in caches:
+            cache.invalidate()
 
     def invalidate_for(self, config: dict[str, Any]) -> None:
-        """仅失效指定配置的缓存条目(下一次 get() 重新拉取)。"""
+        """仅失效指定配置的缓存条目(下一次 get() 重新拉取)。
+
+        可能要等该配置的在途拉取结束,但此时已释放池锁,不阻塞其他配置。
+        """
         key = self._key(config)
         with self._lock:
             cache = self._caches.get(key)
-            if cache is not None:
-                cache.invalidate()
+        if cache is not None:
+            cache.invalidate()
 
     def set_interval(self, interval: float) -> float:
         """Update the TTL for the pool (clamped to [MIN, MAX]); return it."""
-        with self._lock:
-            self._interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
-            for cache in self._caches.values():
-                cache.set_interval(self._interval)
-            return self._interval
+        with self._interval_lock:
+            with self._lock:
+                self._interval = max(min(interval, MAX_INTERVAL), MIN_INTERVAL)
+                value = self._interval
+                caches = list(self._caches.values())
+            # 快照之后新建的缓存已读到新间隔;被淘汰的缓存改了也无妨
+            for cache in caches:
+                cache.set_interval(value)
+            return value
 
 
 # ---- 认证辅助 ----

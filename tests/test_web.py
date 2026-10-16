@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from llm_usage import store  # noqa: E402
 from llm_usage.config import init_config, load_config, update_platform_config  # noqa: E402
 from llm_usage.models import PlatformResult, UsageEntry  # noqa: E402
-from llm_usage.web import UsageCache, create_app  # noqa: E402
+from llm_usage.web import UsageCache, UserCaches, create_app  # noqa: E402
 
 
 def _fake_results() -> list[PlatformResult]:
@@ -2463,6 +2464,221 @@ class TestRefreshIsolation:
             assert calls == {"alice": 2, "admin": 2, "extra": 2, "bob": 1}
             assert bob.get("/api/usage").json()["platforms"][0]["entries"][0]["used"] == 40
             assert calls["bob"] == 1
+
+
+# ---- 缓存时钟与锁 ----
+
+
+class _FakeClock:
+    """可控的 monotonic 替身:``now`` 即"主机开机以来"的秒数,由测试手动推进。"""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _patch_clock(monkeypatch: pytest.MonkeyPatch, now: float) -> _FakeClock:
+    """替换模块级别名 llm_usage.web._monotonic(不污染全局 time.monotonic)。"""
+    clock = _FakeClock(now)
+    monkeypatch.setattr("llm_usage.web._monotonic", clock)
+    return clock
+
+
+class _ObservedLock:
+    """可观测的互斥锁:有线程因锁已被占用而等待时置位 ``contended``。
+
+    并发测试据此确认某个调用确实卡在锁上之后再推进,而不是靠 sleep 猜时序。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self) -> _ObservedLock:
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+
+class TestCacheClockOrigin:
+    """失效与 TTL 只比较两次 monotonic 读数之差,与时钟零点(≈ 主机开机时长)无关。"""
+
+    @pytest.mark.parametrize("force", ["invalidate", "set_config"])
+    @pytest.mark.parametrize(
+        ("uptime", "interval"),
+        [(0.0, 5), (30.0, 60), (1800.0, 3600), (4_000_000.0, 60)],
+    )
+    def test_forced_refetch_regardless_of_monotonic_origin(
+        self, monkeypatch: pytest.MonkeyPatch, force: str, uptime: float, interval: float,
+    ) -> None:
+        """开机时长小于 interval 时失效同样生效(旧实现的 0.0 哨兵会被静默忽略)。"""
+        calls = _patch_fetch(monkeypatch)
+        clock = _patch_clock(monkeypatch, uptime)
+        cache = UsageCache({}, interval)
+        cache.get()
+        clock.now += 1  # 仍在 TTL 内
+        cache.get()
+        assert calls[0] == 1
+        if force == "invalidate":
+            cache.invalidate()
+        else:
+            cache.set_config({"platforms": {}})
+        cache.get()
+        assert calls[0] == 2
+
+    def test_ttl_boundary_right_after_boot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """开机 30s、interval 60s:59.9s 内命中缓存,满 60s 重新拉取。"""
+        calls = _patch_fetch(monkeypatch)
+        clock = _patch_clock(monkeypatch, 30.0)
+        cache = UsageCache({}, 60)
+        cache.get()
+        clock.now = 30.0 + 59.9
+        cache.get()
+        assert calls[0] == 1
+        clock.now = 30.0 + 60
+        cache.get()
+        assert calls[0] == 2
+
+    def test_refresh_endpoint_refetches_right_after_boot(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """开机 30s(小于默认 interval 60s)时「马上刷新」仍重新拉取,fetched_at 随之更新。"""
+        clock = _patch_clock(monkeypatch, 30.0)
+        client, calls = _auth_client(monkeypatch, tmp_db_path)
+        before = client.get("/api/usage").json()
+        assert calls[0] == 1
+        clock.now += 2
+        resp = client.post("/api/refresh")
+        assert resp.status_code == 200
+        assert calls[0] == 2
+        assert resp.json()["fetched_at"] != before["fetched_at"]
+
+    def test_invalidate_waits_for_inflight_fetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """拉取进行中失效:先等在途拉取结束,随后的 get() 拿到失效之后才开始的拉取。"""
+        started = threading.Event()
+        release = threading.Event()
+        calls = [0]
+
+        def fake(_cfg):
+            calls[0] += 1
+            n = calls[0]
+            if n == 1:
+                started.set()
+                assert release.wait(5)
+            return [PlatformResult(f"fetch{n}", f"fetch{n}")]
+
+        monkeypatch.setattr("llm_usage.web.fetch_all", fake)
+        cache = UsageCache({}, 60)
+        lock = _ObservedLock()
+        cache._lock = lock
+        first: list = []
+        refreshed: list = []
+
+        def refresh() -> None:
+            cache.invalidate()
+            refreshed.append(cache.get())
+
+        inflight = threading.Thread(target=lambda: first.append(cache.get()), daemon=True)
+        refresher = threading.Thread(target=refresh, daemon=True)
+        try:
+            inflight.start()
+            assert started.wait(5)  # 第一次拉取进行中,持有缓存锁
+            refresher.start()
+            assert lock.contended.wait(5)  # invalidate() 确实在等这把锁
+        finally:
+            release.set()
+            for thread in (inflight, refresher):
+                if thread.is_alive():
+                    thread.join(5)
+        assert not inflight.is_alive() and not refresher.is_alive()
+        assert first[0][0][0].platform == "fetch1"
+        assert refreshed[0][0][0].platform == "fetch2"
+        assert calls[0] == 2
+
+
+class _InflightSlowFetch:
+    """场景:``slow`` 配置的拉取卡在上游(持有它的缓存锁),``fast`` 配置已缓存。"""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.release = threading.Event()
+        started = threading.Event()
+        block = threading.Event()  # 置位后 slow 的拉取才会卡住
+
+        def fake(cfg):
+            if cfg.get("slow") and block.is_set():
+                started.set()
+                assert self.release.wait(5)
+            return []
+
+        monkeypatch.setattr("llm_usage.web.fetch_all", fake)
+        self.pool = UserCaches(60)
+        self.slow: dict = {"slow": True}
+        self.fast: dict = {"slow": False}
+        self.pool.get(self.slow)
+        self.pool.get(self.fast)
+        self.lock = _ObservedLock()
+        self.pool._caches[self.pool._key(self.slow)]._lock = self.lock
+        block.set()
+        self.pool.invalidate_for(self.slow)  # 下一次 get(slow) 真正去拉取
+        self.inflight = threading.Thread(target=self.pool.get, args=(self.slow,), daemon=True)
+        self.inflight.start()
+        assert started.wait(5)
+
+    def assert_other_config_not_blocked(self, blocking_call) -> None:
+        """blocking_call 卡在 slow 的缓存锁上时,fast 的 get() 必须照常返回。"""
+        waiter = threading.Thread(target=blocking_call, daemon=True)
+        reader = threading.Thread(target=self.pool.get, args=(self.fast,), daemon=True)
+        try:
+            waiter.start()
+            assert self.lock.contended.wait(5)  # blocking_call 正在等 slow 的缓存锁
+            reader.start()
+            reader.join(1)
+            assert not reader.is_alive(), "其他配置的 get() 被池锁阻塞"
+        finally:
+            self.release.set()
+            for thread in (self.inflight, waiter, reader):
+                if thread.is_alive():
+                    thread.join(5)
+        assert not waiter.is_alive()
+
+
+class TestUserCachesLocking:
+    """池锁内只做查找/快照:某个配置的慢拉取不会经由刷新或改间隔阻塞其他配置。"""
+
+    @pytest.mark.parametrize("operation", ["invalidate_for", "invalidate_all", "set_interval"])
+    def test_slow_fetch_does_not_block_other_configs(
+        self, monkeypatch: pytest.MonkeyPatch, operation: str
+    ) -> None:
+        scenario = _InflightSlowFetch(monkeypatch)
+        pool = scenario.pool
+        blocking_calls = {
+            "invalidate_for": lambda: pool.invalidate_for(scenario.slow),
+            "invalidate_all": pool.invalidate_all,
+            "set_interval": lambda: pool.set_interval(120),
+        }
+        scenario.assert_other_config_not_blocked(blocking_calls[operation])
+
+    def test_set_interval_applies_to_existing_and_new_caches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """改间隔后已有缓存与之后新建的缓存都使用新值(含上下限钳制)。"""
+        _patch_fetch(monkeypatch)
+        pool = UserCaches(60)
+        pool.get({"platforms": {"a": {}}})
+        assert pool.set_interval(120) == 120.0
+        pool.get({"platforms": {"b": {}}})
+        assert {cache.interval for cache in pool._caches.values()} == {120.0}
+        assert pool.set_interval(1) == 5.0
+        assert pool.interval == 5.0
+        assert {cache.interval for cache in pool._caches.values()} == {5.0}
 
 
 class TestProviderInstances:

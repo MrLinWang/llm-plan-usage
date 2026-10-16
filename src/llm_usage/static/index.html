@@ -170,6 +170,13 @@
     outline: 2px solid var(--cyan);
     outline-offset: 2px;
   }
+  /* 切换按钮(自动轮播与手动翻页共用)在位置文字后追加「›」;无障碍名称取 aria-label */
+  .rotation-indicator::after {
+    content: "\203A";
+    margin-left: 4px;
+    font-size: 13px;
+    line-height: 1;
+  }
   .rotation-indicator[hidden] { display: none; }
   .platform.is-expanded {
     grid-column: 1 / -1;
@@ -794,7 +801,8 @@ function pctColor(percent) {
 
 // ---- DOM 构建 ----
 // 每个平台一张卡片:卡片头 = 平台名 + 状态徽章(OK/提示/错误),条数超限时附带
-// 轮播指示器 / 「+N」展开按钮;卡片体 = entry 表格(每个 entry 占一个数据行 +
+// 切换按钮(自动轮播指示器或手动翻页,见「收起视图的手动切换」)/「+N」展开按钮;
+// 卡片体 = entry 表格(每个 entry 占一个数据行 +
 // 一个通栏进度条行)。周期窗口平台按密度档折叠(compact 档保留 5小时/每周);
 // 同计费单位平台改为轮播展示,尾部追加「全部合计」汇总行。
 // error 平台卡片体显示错误信息;空 entries 平台显示 "无数据"。
@@ -1191,12 +1199,17 @@ function windowTotals(entries) {
   return totals;
 }
 
-// 合计数据行(+进度条):轮播路径单独使用;周期窗口合计走 appendTotalBlock
-function appendSummaryRows(body, total) {
+// 合计数据行(+进度条):轮播路径单独使用;周期窗口合计走 appendTotalBlock。
+// rowClass 供手动切换回「合计」页时复用入场动画。
+function appendSummaryRows(body, total, rowClass) {
   var totalData = dataRow(total);
   var totalBar = barRow(total.percent, isBalanceOnly(total));
   totalData.classList.add("summary-row");
   totalBar.classList.add("summary-bar");
+  if (rowClass) {
+    totalData.classList.add(rowClass);
+    totalBar.classList.add(rowClass);
+  }
   body.appendChild(totalData);
   body.appendChild(totalBar);
 }
@@ -1210,8 +1223,8 @@ function appendTotalBlock(body, totals) {
 }
 
 // 轮播路径的合计:单行,行标签本身就是「全部合计」
-function appendTotalRows(body, entries) {
-  appendSummaryRows(body, totalEntry(entries));
+function appendTotalRows(body, entries, rowClass) {
+  appendSummaryRows(body, totalEntry(entries), rowClass);
 }
 
 function buildExpandedGrid(entries, totals, requestedColumns, summaryHead) {
@@ -1258,6 +1271,46 @@ function outerGridColumnCount() {
   return columns.split(/\s+/).length;
 }
 
+// ---- 收起视图的手动切换 ----
+// 收起后仍有条目未显示、又没有自动轮播的卡片,卡头给一个切换按钮:按默认视图的
+// 行数分组,点一下换下一组,末组之后回到默认组。切到的位置只存在卡片闭包里,
+// 卡片重建(数据刷新、调整窗口、任一卡片展开/收起)即回到默认视图。
+
+// 卡头切换按钮:自动轮播指示器与手动翻页共用,CSS 在位置文字后追加「›」。
+function switchButton() {
+  var button = el("button", "rotation-indicator");
+  button.type = "button";
+  button.setAttribute("aria-label", "切换下一组用量");
+  return button;
+}
+
+// 分页:第一页就是默认视图显示的条目(空数组 = 只显示合计行),其余条目保持
+// 原顺序,每页 firstPage.length 条(至少 1 条),最后一页可能更短。
+function collapsedPages(entries, firstPage) {
+  var size = Math.max(firstPage.length, 1);
+  var rest = entries.filter(function (entry) { return firstPage.indexOf(entry) < 0; });
+  var pages = [firstPage];
+  for (var i = 0; i < rest.length; i += size) pages.push(rest.slice(i, i + size));
+  return pages;
+}
+
+// 按钮文字与悬停提示:「a–b/n」(单条为「a/n」);空页(只显示合计)为「合计」。
+function pageLabel(pages, index) {
+  var start = 0;
+  var total = 0;
+  pages.forEach(function (page, i) {
+    if (i < index) start += page.length;
+    total += page.length;
+  });
+  var size = pages[index].length;
+  if (size === 0) return { text: "合计", title: "正在显示全部合计；点击查看第 1 条" };
+  var range = size === 1 ? String(start + 1) : (start + 1) + "–" + (start + size);
+  return {
+    text: range + "/" + total,
+    title: "正在显示第 " + range + " 条，共 " + total + " 条；点击切换"
+  };
+}
+
 function platformCard(p, displayMode, stateKey) {
   var card = el("div", "card platform");
   var head = el("div", "platform-head");
@@ -1296,11 +1349,42 @@ function platformCard(p, displayMode, stateKey) {
   var entryToggle = null;
   var rotationIndicator = null;
   if (rotatingCollapses && rotationSlotCount > 0 && rotationEntries.length > rotationSlotCount) {
-    rotationIndicator = el("button", "rotation-indicator");
-    rotationIndicator.type = "button";
-    rotationIndicator.setAttribute("aria-label", "切换下一组用量");
+    rotationIndicator = switchButton();
     head.appendChild(rotationIndicator);
   }
+  // 没有自动轮播的收起视图按默认视图的行数手动翻页(见 collapsedPages);
+  // manualPages[0] 就是默认视图,pageIndex 只由切换按钮改变。
+  var manualPages = null;
+  if (periodicCollapses) {
+    manualPages = collapsedPages(entries, collapsedEntries);
+  } else if (rotatingCollapses && !rotationIndicator) {
+    // 无轮播按钮的轮播类卡片:ultra 只显示合计的同单位卡片(合计 → 第 1 条 → …,
+    // 每页一行),以及 normal 下恰好两个账号的 Sub2API(第一页 = 各账号最短窗口)
+    manualPages = collapsedPages(entries, rotationSlotCount > 0 ? rotationEntries : []);
+  }
+  var pageIndex = 0;
+  var pager = null;
+  var syncPager = function () {
+    var label = pageLabel(manualPages, pageIndex);
+    pager.textContent = label.text;
+    pager.title = label.title;
+  };
+  if (manualPages && manualPages.length > 1) {
+    pager = switchButton();
+    syncPager();
+    head.appendChild(pager);
+  }
+  // 切换只重画本卡片的 tbody;绝不调用 refitLayout():它会重建全部卡片,
+  // 刚切到的位置随之复位。
+  var bindPager = function (isExpanded, renderPage) {
+    pager.addEventListener("click", function (event) {
+      event.stopPropagation();
+      if (isExpanded()) return;
+      pageIndex = (pageIndex + 1) % manualPages.length;
+      renderPage(true);
+      syncPager();
+    });
+  };
   if (periodicCollapses || rotatingCollapses) {
     var hiddenEntryCount = accountRotation ? expandedEntries.length - rotationSlotCount
       : entries.length - (independentCompacts ? rotationSlotCount : collapsedEntries.length);
@@ -1370,18 +1454,36 @@ function platformCard(p, displayMode, stateKey) {
       rotationOffset = (rotationOffset + Math.max(rotationSlotCount, 1)) % rotationEntries.length;
       renderRotation();
     };
+    // 手动翻页(manualPages 非空):第 0 页沿用原默认视图,其余页画分到的条目
+    var renderManualPage = function (animate) {
+      var page = manualPages[pageIndex];
+      var rowClass = animate ? "rotating-slot" : undefined;
+      closeKeyPopovers();
+      body.textContent = "";
+      if (pageIndex === 0 && rotationSlotCount > 0) {
+        renderRotation();
+      } else if (page.length === 0) {
+        appendTotalRows(body, entries, rowClass);
+      } else if (accountRotation) {
+        // 账号分页保留套餐标题与固定的最短窗口合计,与轮播视图同构
+        appendEntries(body, page, rowClass);
+        if (cardTotals.length > 0) appendTotalBlock(body, cardTotals.slice(0, 1));
+      } else {
+        page.forEach(function (entry) { appendEntryRows(body, entry, rowClass); });
+      }
+    };
     var renderIndependentRows = function () {
       closeKeyPopovers();
       card.classList.toggle("is-expanded", independentExpanded);
       if (rotationIndicator) rotationIndicator.hidden = independentExpanded;
+      if (pager) pager.hidden = independentExpanded;
       setExpandedContent(independentExpanded);
       if (independentExpanded) {
         // 完整内容由多列展开网格承载，原表保留但隐藏以便快速收起。
-      } else if (rotationSlotCount > 0) {
-        renderRotation();
+      } else if (manualPages) {
+        renderManualPage(false);
       } else {
-        body.textContent = "";
-        appendTotalRows(body, entries);
+        renderRotation();
       }
       entryToggle.textContent = independentExpanded
         ? "收起" : "+" + (accountRotation ? expandedEntries.length - rotationSlotCount
@@ -1399,6 +1501,7 @@ function platformCard(p, displayMode, stateKey) {
         advanceRotation();
       });
     }
+    if (pager) bindPager(function () { return independentExpanded; }, renderManualPage);
     entryToggle.addEventListener("click", function (event) {
       event.stopPropagation();
       independentExpanded = !independentExpanded;
@@ -1419,13 +1522,15 @@ function platformCard(p, displayMode, stateKey) {
     }
   } else if (periodicCollapses) {
     var expanded = expandedPlatformKeys.has(stateKey);
-    var renderPeriodicRows = function () {
+    // animate:切换按钮触发的重画给新行加入场动画,默认/展开收起的渲染不加
+    var renderPeriodicRows = function (animate) {
       closeKeyPopovers();
       card.classList.toggle("is-expanded", expanded);
+      if (pager) pager.hidden = expanded;
       setExpandedContent(expanded);
       if (!expanded) {
         body.textContent = "";
-        appendEntries(body, collapsedEntries);
+        appendEntries(body, manualPages[pageIndex], animate ? "rotating-slot" : undefined);
         // 收起时只给最短窗口(网关=每日)的合计块;其余窗口合计在展开视图里看
         if (cardTotals.length > 0) appendTotalBlock(body, cardTotals.slice(0, 1));
       }
@@ -1445,6 +1550,7 @@ function platformCard(p, displayMode, stateKey) {
       renderPeriodicRows();
       refitLayout();
     });
+    if (pager) bindPager(function () { return expanded; }, renderPeriodicRows);
     renderPeriodicRows();
   } else {
     appendEntries(body, entries);

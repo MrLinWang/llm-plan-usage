@@ -83,18 +83,49 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 （仓库内另附只读参考 `config.toml.example`，内容与模板一致，可直接
 `cp config.toml.example config.toml`）。
 
-所有供应商统一使用「平台设置 + `accounts` 账号列表」，单账号也写成一个列表项：
+所有供应商统一使用「一个供应商一个表」：平台设置和 `accounts` 账号列表都写在
+**同一个** `[platforms.供应商]` 表里，不再拆出 `[[platforms.供应商.accounts]]` 子表。
+九种供应商（含 Sub2API 的多个共享 Key 组、`kimi#2` 这类实例）版式完全一致：
+
+```toml
+[platforms.kimi]
+enabled = true
+base_url = "https://api.kimi.com/coding/v1"
+accounts = [
+    { name = "套餐A", api_key = "env:KIMI_API_KEY_A" },
+    { name = "套餐B", api_key = "sk-kimi-xxx" },
+]
+
+[platforms.volcengine-coding]
+enabled = true
+plan_type = "coding"
+tier = "pro"
+accounts = [
+    { access_key = "env:VOLCENGINE_ACCESS_KEY", secret_key = "env:VOLCENGINE_SECRET_KEY" },
+]
+
+[platforms.sub2api]
+enabled = true
+base_url = "http://127.0.0.1:18080"
+accounts = [
+    { name = "组1", api_keys = ["env:SUB2API_API_KEY"] },
+]
+```
 
 - `[platforms.供应商]`：`enabled`、`display_name`、`base_url`、`tier`、`limits`、
-  `max_balance` 等平台设置。
-- `[[platforms.供应商.accounts]]`：可选的 `name` 和账号凭证。普通平台使用
-  `api_key`，OpenDesign 使用 `control_key`，火山使用 `access_key` + `secret_key`。
-  Sub2API 的一个账号对应一个共享 Key 组，使用 `name`、可选 `daily_limit` 和 `api_keys`。
+  `max_balance` 等平台设置，以及 `accounts` 数组。
+- `accounts` 数组：每项一个账号，**一项一行**。`name` 可选，凭证按供应商取
+  `api_key`（kimi / ollama / opencode-go / clinepass / commandcode）、`control_key`
+  （OpenDesign）或 `access_key` + `secret_key`（火山）。Sub2API 的一个账号对应
+  一个共享 Key 组，使用 `name`、可选 `daily_limit` 和 `api_keys`；`api_keys` 每项
+  可以是密钥字符串，也可以是带名字的 `{ name = "主 Key", value = "sk-…" }`。
+- 旧配置中未启用的备用凭证或分组保存在同一平台表内的 `legacy` 表中
+  （`legacy = { api_key = "sk-amr-…" }`），避免迁移时丢失，不会混入当前账号列表。
 
-旧的顶层凭证、`credentials`、Sub2API `groups` / `use_groups` 格式仍可读取，
-保存时统一写为 `accounts`；API 密钥和 `env:` 引用原样保留，不展开环境变量。
-旧配置中未启用的备用凭证或分组保存在对应平台的 `legacy` 表中，避免迁移时丢失，
-不会混入当前账号列表。无需同时维护新旧两套字段。
+旧的顶层凭证、`credentials`、Sub2API `groups` / `use_groups` 格式，以及
+`[[platforms.供应商.accounts]]` 子表格式仍可读取，保存时统一写为上面这种表内
+`accounts` 数组；API 密钥和 `env:` 引用原样保留，不展开环境变量。
+无需同时维护新旧两套字段。
 
 将现有文件立即整理为统一格式：
 
@@ -103,9 +134,9 @@ llm-usage config --format
 ```
 
 命令会原子重写当前配置文件，不输出密钥；转换或写入失败时保留原文件。
-账号固定使用 `[[platforms.供应商.accounts]]` 数组表，命名 Key 使用
-`[[platforms.sub2api.accounts.api_keys]]` 数组表，避免因密钥长度变化而在
-内联对象和多行表之间切换。后续网页保存也使用同一格式。
+版式是确定的：每个供应商只有一个表头，`accounts` 写成跨行数组、每个账号一行；
+嵌套的 `api_keys` 只会在该账号行超出 100 列时改为每项一行，因此不会因为密钥
+长短在「内联对象」和「多行表」之间摇摆。后续网页保存也使用同一格式。
 
 ### 自动重试
 
@@ -151,9 +182,9 @@ OpenDesign 的模型调用密钥（`sk-amr-`）与账户控制密钥（`vela_ctr
 [platforms.opendesign]
 enabled = true
 base_url = "https://amr-link.open-design.ai/v1"
-
-[[platforms.opendesign.accounts]]
-control_key = "env:OPENDESIGN_CONTROL_KEY"  # vela_ctrl_ 开头的账户控制密钥
+accounts = [
+    { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_ 开头的账户控制密钥
+]
 ```
 
 `base_url` 是模型服务地址，用量读取走 OpenDesign 官方的 `amr-api` 控制接口。
@@ -194,11 +225,10 @@ provider 读网关 `/v1/usage` 的 `subscription` 段：**每个组的每个 Key
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
-
-[[platforms.sub2api.accounts]]
-name = "组1"
-# daily_limit = 100        # 可选项:覆盖面板日报额度;留空则用面板值
-api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"]
+accounts = [
+    # 账号内可加 daily_limit = 100(覆盖面板日报额度,不影响周/月)
+    { name = "组1", api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"] },
+]
 ```
 
 Key 直接写在 config.toml 即可，也支持 `env:VARNAME` 引用环境变量。每个 Key 可
@@ -209,16 +239,12 @@ Key 直接写在 config.toml 即可，也支持 `env:VARNAME` 引用环境变量
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
-
-[[platforms.sub2api.accounts]]
-name = "组1"
-
-[[platforms.sub2api.accounts.api_keys]]
-name = "主 Key"
-value = "env:SUB2API_TEAM_A_1"
-
-[[platforms.sub2api.accounts.api_keys]]
-value = "sk-team-a-key-2"  # 无名称,显示 key#2
+accounts = [
+    { name = "组1", api_keys = [
+        { name = "主 Key", value = "env:SUB2API_TEAM_A_1" },
+        { value = "sk-team-a-key-2" },  # 无名称,显示 key#2
+    ] },
+]
 ```
 
 组内部分 Key 请求失败时，成功 Key 仍会
@@ -243,7 +269,7 @@ value = "sk-team-a-key-2"  # 无名称,显示 key#2
 Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass/commandcode 为
 `api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
 （火山为「添加 AK/SK」）即可增加新套餐；「套餐名」留空时服务端自动命名
-`套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后统一写回
+`套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后统一写回平台表内的
 `accounts` 数组（旧单 Key 和 `credentials` 格式保存时自动迁移）。
 手工配置同样支持：
 
@@ -251,14 +277,10 @@ Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/openc
 [platforms.kimi]
 enabled = true
 # base_url = "https://api.kimi.com/coding/v1"
-
-[[platforms.kimi.accounts]]
-name = "套餐A"
-api_key = "env:KIMI_API_KEY_A"
-
-[[platforms.kimi.accounts]]
-name = "套餐B"
-api_key = "sk-kimi-xxx"
+accounts = [
+    { name = "套餐A", api_key = "env:KIMI_API_KEY_A" },
+    { name = "套餐B", api_key = "sk-kimi-xxx" },
+]
 ```
 
 每个凭证 = 一个独立计费套餐：`show`/`tui`/`web` 的同一平台卡片内按套餐分块
@@ -411,8 +433,8 @@ sub2api 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/op
 同组 Key 的今日用量会合并计算。凭证永远不回显明文：已保存的值显示为掩码
 （如 `已设置 (sk-k…ey)`），`env:VARNAME` 引用原样显示；凭证值留空表示保留
 已保存的值，删除整个槽才会移除该凭证。保存立即写回 `./config.toml` 并使服务端
-用量缓存失效（下次刷新生效）：所有供应商统一写 `accounts` 数组，
-Sub2API 的每个分组保存为一个账号；旧凭证格式同时迁移。
+用量缓存失效（下次刷新生效）：所有供应商统一写成各自 `[platforms.<供应商>]`
+表内的 `accounts` 数组，Sub2API 的每个分组保存为一个账号；旧凭证格式同时迁移。
 **取消勾选「启用」不会删除该平台的凭证**：只提交 `enabled` 时仅更新开关；网页上点
 「保存」会连同凭证槽/分组一起提交，但槽内留空表示保留既有值，因此凭证值、套餐槽、
 Sub2API 分组都保留（旧格式可能迁移为 `accounts` 数组，凭证值不变）。

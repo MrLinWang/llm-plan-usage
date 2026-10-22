@@ -72,7 +72,14 @@ def _read_for(admin: bool) -> dict[str, Any]:
 
 
 def _raw_accounts(path: Path) -> dict[str, Any]:
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    # 落盘版式:每个供应商一个 [platforms.<key>] 表,accounts 在表内,无子表头
+    headers = [line for line in text.splitlines() if line.lstrip().startswith("[")]
+    assert headers, text
+    for line in headers:
+        assert not line.startswith("[[platforms."), line
+        assert line.removeprefix("[platforms.").removesuffix("]").count(".") == 0, line
+    raw = tomllib.loads(text)
     for section in raw.get("platforms", {}).values():
         assert "accounts" in section
         assert not {"credentials", "groups", "api_key", "control_key",

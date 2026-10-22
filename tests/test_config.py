@@ -11,6 +11,13 @@ import pytest
 from llm_usage import config as C
 
 
+def _table_headers(text: str) -> str:
+    """配置文本中的所有表头行(忽略注释里的示例)。"""
+    return "\n".join(
+        line for line in text.splitlines() if line.lstrip().startswith("[")
+    )
+
+
 class TestConfigInit:
     def test_init_creates_file(self, tmp_path: Path) -> None:
         p = tmp_path / "config.toml"
@@ -22,8 +29,9 @@ class TestConfigInit:
         assert "[platforms.opencode-go]" in text
         assert "[platforms.opendesign]" in text
         assert "[platforms.sub2api]" in text
-        assert "[[platforms.kimi.accounts]]" in text
-        assert "[[platforms.sub2api.accounts]]" in text
+        # 每个供应商只有一个表,accounts 写在表内,不使用子表
+        assert "accounts = [" in text
+        assert "[[platforms." not in _table_headers(text)
 
     def test_init_refuses_overwrite_without_flag(self, tmp_path: Path) -> None:
         p = tmp_path / "config.toml"
@@ -50,7 +58,7 @@ class TestConfigInit:
 
 class TestConfigLoadSave:
     @pytest.mark.parametrize("api_key", ["x", "env:KIMI_API_KEY", "sk-" + "a" * 120])
-    def test_account_table_format_is_stable_for_short_and_long_keys(
+    def test_account_format_is_stable_for_short_and_long_keys(
         self, tmp_path: Path, api_key: str,
     ) -> None:
         path = tmp_path / "config.toml"
@@ -62,12 +70,15 @@ class TestConfigLoadSave:
         }}
         C.save_config(original, path)
         text = path.read_text()
-        assert "[[platforms.kimi.accounts]]" in text
-        assert "[[platforms.sub2api.accounts]]" in text
-        assert "[[platforms.sub2api.accounts.api_keys]]" in text
-        assert "accounts = [" not in text
+        assert "[platforms.kimi]" in text
+        assert "[platforms.sub2api]" in text
+        assert "accounts = [" in text
+        assert "[[platforms." not in _table_headers(text)
         raw = tomllib.loads(text)
         assert raw["platforms"]["kimi"] == {"enabled": False, "accounts": [{"api_key": api_key}]}
+        assert raw["platforms"]["sub2api"]["accounts"] == [
+            {"name": "共享账号", "api_keys": [{"name": "主 Key", "value": "env:KEY"}]},
+        ]
         assert C.load_config(path) == original
         C.save_config(C.load_config(path), path)
         assert path.read_text() == text
@@ -78,11 +89,118 @@ class TestConfigLoadSave:
             "附加设置": {"quoted = key": {"a.b": [1, 2]}},
         }}}
         text = C.format_config(original)
-        assert '[[platforms."kimi#2".accounts]]' in text
+        assert '[platforms."kimi#2"]' in text
+        assert "[[platforms." not in _table_headers(text)
         assert C.to_runtime_config(tomllib.loads(text)) == original
 
-    def test_load_missing_returns_empty(self, tmp_path: Path) -> None:
-        assert C.load_config(tmp_path / "nonexistent.toml") == {}
+    def test_every_provider_keeps_accounts_in_its_own_platform_table(self) -> None:
+        """9 个供应商(含实例)都只占一个表:无子表头,accounts 在表内。"""
+        original = {"platforms": {
+            "kimi": {"enabled": True, "api_key": "env:KIMI"},
+            "kimi#2": {"enabled": False, "credentials": [
+                {"name": "套餐A", "api_key": "env:KIMI_A"},
+                {"name": "套餐B", "api_key": "env:KIMI_B"},
+            ]},
+            "volcengine-coding": {"enabled": True, "tier": "pro", "access_key": "AK",
+                                  "secret_key": "SK"},
+            "volcengine-agent": {"enabled": True, "credentials": [
+                {"access_key": "AK", "secret_key": "SK"},
+                {"access_key": "AK2", "secret_key": "SK2"},
+            ]},
+            "ollama": {"api_key": "env:OLLAMA"},
+            "opencode-go": {"api_key": "env:OPENCODE"},
+            "clinepass": {"api_key": "env:CLINE"},
+            "commandcode": {"api_key": "env:COMMAND"},
+            "opendesign": {"enabled": True, "max_balance": 300,
+                           "credentials": [{"name": "套餐1", "control_key": "vela_ctrl_x"}]},
+            "sub2api": {"enabled": True, "base_url": "https://g.test", "groups": [
+                {"name": "组A", "api_keys": ["k1", "k2"]},
+                {"name": "组B", "daily_limit": 20, "api_keys": [
+                    {"name": "主 Key", "value": "k3"}]},
+            ]},
+        }}
+        text = C.format_config(original)
+        assert "[[platforms." not in _table_headers(text)
+        # 每个平台表头正好出现一次,且没有任何 [platforms.<key>.<child>] 子表
+        for key in original["platforms"]:
+            header = f"[platforms.{C._toml_key(key)}]"
+            assert text.count(header) == 1, key
+        for line in _table_headers(text).splitlines():
+            assert line.startswith("[platforms.") and line.endswith("]")
+            assert line.removeprefix("[platforms.").removesuffix("]").count(".") == 0, line
+        parsed = tomllib.loads(text)
+        assert parsed == C.to_accounts_config(original)
+        assert C.to_runtime_config(parsed) == C.to_runtime_config(original)
+        assert len(parsed["platforms"]["kimi#2"]["accounts"]) == 2
+        assert len(parsed["platforms"]["sub2api"]["accounts"]) == 2
+        assert C.format_config(parsed) == text
+
+    def test_long_named_key_group_wraps_inside_its_account_line(self) -> None:
+        """超长命名 Key:key 数组在 account 行内换行,仍不产生子表。"""
+        original = {"platforms": {"sub2api": {"enabled": True, "groups": [
+            {"name": "组1", "daily_limit": 200, "api_keys": [
+                {"name": "主 Key", "value": "sk-" + "1" * 80},
+                {"name": "备用 Key", "value": "sk-" + "2" * 80},
+            ]},
+        ]}}}
+        text = C.format_config(original)
+        assert "[[platforms." not in _table_headers(text)
+        assert _table_headers(text).count("[platforms.") == 1
+        assert "api_keys = [\n" in text
+        assert C.to_runtime_config(tomllib.loads(text)) == C.to_runtime_config(original)
+        assert C.format_config(tomllib.loads(text)) == text
+
+    def test_empty_and_unknown_account_values_stay_in_the_platform_table(self) -> None:
+        """空账号数组、未知供应商的非表值都原样留在平台表内。"""
+        cases = {
+            "empty_accounts": {"kimi": {"enabled": False, "accounts": []}},
+            "unknown_provider": {"future-provider": {
+                "accounts": "unknown", "api_key": 123, "legacy": ["anything"]}},
+            "empty_section": {"ollama": {}},
+            "dormant_legacy": {"opendesign": {
+                "legacy": {"api_key": "sk-amr-model"},
+                "accounts": [{"name": "套餐1", "control_key": "vela"}],
+            }},
+        }
+        for name, platforms in cases.items():
+            text = C.format_config({"platforms": platforms})
+            assert "[[platforms." not in _table_headers(text), name
+            parsed = tomllib.loads(text)
+            assert parsed == C.to_accounts_config({"platforms": platforms}), name
+            assert C.format_config(parsed) == text, name
+
+    @pytest.mark.parametrize(("config", "expected"), [
+        ({"platforms": {"kimi": "oops"}}, '[platforms]\nkimi = "oops"\n'),
+        ({"platforms": [{"kimi": 1}]}, "[[platforms]]\nkimi = 1\n"),
+        ({"platforms": {}}, "[platforms]\n"),
+        ({}, ""),
+    ])
+    def test_malformed_or_missing_platforms_never_serialize_to_an_empty_file(
+        self, config: dict[str, Any], expected: str,
+    ) -> None:
+        """畸形但可解析的 platforms 必须原样回写,不得静默清空整份配置。
+
+        ``[platforms] kimi = "oops"`` 与非表数组曾是合法输入;写入器若丢弃
+        它们就会把 config.toml 变成 0 字节(数据丢失)。
+        """
+        text = C.format_config(config)
+        assert text == expected
+        assert tomllib.loads(text) == config
+        assert C.format_config(tomllib.loads(text)) == text
+
+    def test_malformed_platforms_are_never_truncated_on_save(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.toml"
+        path.write_text('[platforms]\nkimi = "oops"\n\n[platforms.ollama]\nenabled = true\n')
+        original = C.load_config(path)
+        C.save_config(original, path)
+        text = path.read_text()
+        assert text, "保存后配置文件不得为空"
+        raw = tomllib.loads(text)
+        assert raw["platforms"]["kimi"] == "oops"
+        # 已知供应商会被补成标准 accounts 形态;关键是其设置没有丢。
+        assert raw["platforms"]["ollama"]["enabled"] is True
+        assert raw == C.to_accounts_config(original)
+        assert C.load_config(path) == original
 
     def test_roundtrip(self, tmp_path: Path) -> None:
         p = tmp_path / "config.toml"

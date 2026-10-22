@@ -30,6 +30,16 @@ CONFIG_PATH = Path.cwd() / "config.toml"
 # 保证所有 config.toml 读-改-写在同一临界区内串行(避免丢失更新)。
 _CONFIG_LOCK = threading.Lock()
 
+# 版式:内联数组(含账号行内的 api_keys)超过该宽度时改为每项一行。
+# 内联表本身不允许换行,所以超长账号行仍是单行,只是它的数组字段会展开。
+LINE_LIMIT = 100
+# 平台表内的字段优先级:常用设置在前,legacy / accounts 固定在末尾。
+_PLATFORM_HEAD = ("enabled", "display_name", "base_url")
+_PLATFORM_TAIL = ("legacy", "accounts")
+
+# 区分「配置里没有 platforms 键」与「platforms 为空表」:前者不渲染任何表头。
+_ABSENT: Any = object()
+
 _T = TypeVar("_T")
 
 
@@ -73,62 +83,177 @@ def _write_config_unlocked(config: dict[str, Any], path: Path) -> None:
     _atomic_write_bytes(path, format_config(config).encode("utf-8"))
 
 
+def _is_table_array(value: Any) -> bool:
+    """Whether ``value`` is a non-empty list of tables (a TOML array of tables)."""
+    return isinstance(value, list) and bool(value) and all(
+        isinstance(item, dict) for item in value
+    )
+
+
+def _toml_key(key: str) -> str:
+    """Render a key as a TOML key (quoted only when the bare form is illegal)."""
+    return tomli_w.dumps({key: 0}).removesuffix(" = 0\n")
+
+
+def _toml_scalar(value: Any) -> str:
+    """Render one scalar through ``tomli_w`` so quoting and escapes stay correct."""
+    return tomli_w.dumps({"_": value}).removesuffix("\n").removeprefix("_ = ")
+
+
+def _field_order(table: dict[str, Any]) -> list[str]:
+    """Stable field order: ``name`` first, then plain values, then nested ones."""
+    rest = [key for key in table if key != "name"]
+    plain = sorted(key for key in rest if not isinstance(table[key], (dict, list)))
+    nested = sorted(key for key in rest if isinstance(table[key], (dict, list)))
+    return (["name"] if "name" in table else []) + plain + nested
+
+
+def _inline_value(value: Any, indent: int) -> str:
+    """Render a value as TOML text that fits on one line when it can.
+
+    A table must stay on one line (TOML inline tables cannot span lines), while
+    an array may break into one item per line once it outgrows the line budget.
+    """
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        pairs = [f"{_toml_key(key)} = {_inline_value(value[key], indent)}"
+                 for key in _field_order(value)]
+        return "{ " + ", ".join(pairs) + " }"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        items = [_inline_value(item, indent + 4) for item in value]
+        single = "[" + ", ".join(items) + "]"
+        if all("\n" not in item for item in items) and indent + len(single) <= LINE_LIMIT:
+            return single
+        pad, close = " " * (indent + 4), " " * indent
+        return "[\n" + "".join(f"{pad}{item},\n" for item in items) + close + "]"
+    return _toml_scalar(value)
+
+
+def _accounts_field(accounts: Any) -> str:
+    """Render ``accounts`` as one line per account, never as child table headers."""
+    if not isinstance(accounts, list) or not accounts:
+        return f"accounts = {_inline_value(accounts, 0)}"
+    lines = "".join(f"    {_inline_value(account, 4)},\n" for account in accounts)
+    return "accounts = [\n" + lines + "]"
+
+
+def _platform_block(key: str, section: dict[str, Any]) -> str:
+    """Render one provider as a single ``[platforms.<key>]`` table."""
+    header = ".".join(_toml_key(part) for part in ("platforms", key))
+    lines = [f"[{header}]"]
+    rest = sorted(
+        field for field in section if field not in (*_PLATFORM_HEAD, *_PLATFORM_TAIL)
+    )
+    fields = [field for field in _PLATFORM_HEAD if field in section]
+    fields += rest
+    fields += [field for field in _PLATFORM_TAIL if field in section]
+    for field in fields:
+        value = section[field]
+        if field == "accounts":
+            lines.append(_accounts_field(value))
+        else:
+            lines.append(f"{_toml_key(field)} = {_inline_value(value, 0)}")
+    return "\n".join(lines)
+
+
+def _table_block(key: str, table: dict[str, Any]) -> str:
+    """Render a top-level table (``[instance_counters]``) after the platforms."""
+    header = f"[{_toml_key(key)}]"
+    fields = [f"{_toml_key(field)} = {_inline_value(table[field], 0)}" for field in table]
+    return "\n".join([header, *fields])
+
+
+def _platforms_block(platforms: Any) -> list[str]:
+    """Render the ``platforms`` value as its single parent table plus sections.
+
+    Malformed-but-loadable shapes are preserved rather than dropped, so a
+    rewrite can never silently empty a file: an array of tables becomes
+    ``[[platforms]]`` rows and non-table entries stay as literal keys of
+    ``[platforms]``.  Only an empty mapping keeps the bare ``[platforms]``.
+    """
+    if _is_table_array(platforms):
+        return [
+            "[[platforms]]\n" + "\n".join(
+                f"{_toml_key(field)} = {_inline_value(item[field], 0)}"
+                for field in _field_order(item)
+            )
+            for item in platforms
+        ]
+    if not isinstance(platforms, dict):
+        return []
+    if not platforms:
+        return ["[platforms]"]
+    literals: dict[str, Any] = {}
+    blocks: list[str] = []
+    for key, section in platforms.items():
+        if isinstance(section, dict):
+            blocks.append(_platform_block(key, section))
+        else:
+            literals[key] = section
+    if literals:
+        # Parent literals must precede the child tables they belong to.
+        body = "\n".join(
+            f"{_toml_key(key)} = {_inline_value(literals[key], 0)}"
+            for key in literals
+        )
+        blocks.insert(0, f"[platforms]\n{body}")
+    return blocks
+
+
 def format_config(config: dict[str, Any]) -> str:
-    """Render accounts as tables consistently, independent of credential length."""
+    """Render the canonical config with one single table per provider.
+
+    Every provider keeps *all* of its settings — platform options, ``legacy``
+    and ``accounts`` (plus Sub2API's nested ``api_keys``) — inside one
+    ``[platforms.<key>]`` table, so no provider ever needs a child table
+    header.  ``accounts`` is a multiline array holding one inline table per
+    account (one account per line); an inline table cannot span lines, so a
+    nested ``api_keys`` array breaks into one item per line once that account
+    line outgrows :data:`LINE_LIMIT`.
+
+    The layout is decided by field order and structure, never by which
+    credentials happen to be set, so repeated rewrites stay byte-stable.  An
+    unparseable shape raises :class:`ConfigFormatError` upstream; anything that
+    loads is rendered back, so saving can never truncate a config.
+    """
     canonical = to_accounts_config(config)
     blocks: list[str] = []
+    platforms: Any = _ABSENT
+    trailing: list[tuple[str, Any]] = []
+    for key, value in canonical.items():
+        if key == "platforms":
+            platforms = value
+        elif isinstance(value, dict) or _is_table_array(value):
+            trailing.append((key, value))
+        else:
+            # Top-level literals (platform_order, max_retries, …) must precede
+            # the first table header.
+            blocks.append(tomli_w.dumps({key: value}).rstrip("\n"))
 
-    def key_part(key: str) -> str:
-        return tomli_w.dumps({key: 0}).removesuffix(" = 0\n")
+    if platforms is not _ABSENT:
+        blocks.extend(_platforms_block(platforms))
 
-    def emit(table: dict[str, Any], path: list[str], array: bool = False) -> None:
-        literals: dict[str, Any] = {}
-        children: list[tuple[str, Any]] = []
-        fields = list(table)
-        if len(path) == 2 and path[0] == "platforms":
-            priority = ["enabled", "display_name", "base_url"]
-            fields = [key for key in priority if key in table]
-            fields += sorted(key for key in table if key not in priority and key != "accounts")
-            if "accounts" in table:
-                fields.append("accounts")
-        elif array:
-            fields = (["name"] if "name" in table else []) + sorted(
-                key for key in table if key != "name"
-            )
-        for key in fields:
-            value = table[key]
-            if isinstance(value, dict) or (
-                isinstance(value, list) and value
-                and all(isinstance(item, dict) for item in value)
-            ):
-                children.append((key, value))
-            else:
-                literals[key] = value
-        block = ""
-        if path and (literals or not children or array):
-            name = ".".join(key_part(part) for part in path)
-            block = f"[[{name}]]\n" if array else f"[{name}]\n"
-        block += tomli_w.dumps(literals)
-        if block:
-            blocks.append(block.rstrip("\n"))
-        for key, value in children:
-            child_path = [*path, key]
-            if isinstance(value, dict):
-                emit(value, child_path)
-            else:
-                for item in value:
-                    emit(item, child_path, array=True)
-
-    emit(canonical, [])
+    for key, value in trailing:
+        if isinstance(value, dict):
+            blocks.append(_table_block(key, value))
+        else:
+            for item in value:
+                blocks.append(f"[[{_toml_key(key)}]]\n" + "\n".join(
+                    f"{_toml_key(field)} = {_inline_value(item[field], 0)}"
+                    for field in _field_order(item)
+                ))
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 # The default template generated by ``llm-usage config --init``.
 EXAMPLE_CONFIG = """\
 # llm-usage configuration
-# 统一格式:平台设置放在 [platforms.<type>]，每个账号放在 [[platforms.<type>.accounts]]。
-# 单账号和多账号使用同一结构;追加一个 accounts 表即可增加独立账号。
+# 每个供应商只写一个 [platforms.<type>] 表:平台设置与 accounts 账号列表都在表内,
+# 不再使用 [[platforms.<type>.accounts]] 子表。accounts 写成数组,一个账号一行。
 # 账号 name 可选;凭证使用 env:VARNAME 引用环境变量,也可直接填写密钥。
-# 旧顶层凭证、credentials 和 groups 仍可读取,保存时统一为 accounts。
+# 旧顶层凭证、credentials、groups 与子表格式仍可读取,保存时统一为本格式。
 
 # 平台显示顺序(可选):
 # platform_order = [
@@ -142,54 +267,52 @@ EXAMPLE_CONFIG = """\
 [platforms.kimi]
 enabled = true
 base_url = "https://api.kimi.com/coding/v1"
-
-[[platforms.kimi.accounts]]
-api_key = "env:KIMI_API_KEY"
+accounts = [
+    { api_key = "env:KIMI_API_KEY" },
+]
 
 [platforms.volcengine-coding]
 enabled = true
 plan_type = "coding"
 tier = "pro"  # lite | pro
-# limits = { "session" = 6000, "weekly" = 45000, "monthly" = 90000 }
-
-[[platforms.volcengine-coding.accounts]]
-# 火山使用 AccessKey/SecretKey + V4 签名,不是 Bearer API key。
-access_key = "env:VOLCENGINE_ACCESS_KEY"
-secret_key = "env:VOLCENGINE_SECRET_KEY"
+# limits = { session = 6000, weekly = 45000, monthly = 90000 }
+accounts = [
+    # 火山使用 AccessKey/SecretKey + V4 签名,不是 Bearer API key。
+    { access_key = "env:VOLCENGINE_ACCESS_KEY", secret_key = "env:VOLCENGINE_SECRET_KEY" },
+]
 
 [platforms.volcengine-agent]
 enabled = true
 plan_type = "agent"
 tier = "medium"  # small | medium | large | max
-# limits = { "5h" = 6000, "weekly" = 45000, "monthly" = 90000 }
-
-[[platforms.volcengine-agent.accounts]]
-access_key = "env:VOLCENGINE_ACCESS_KEY"
-secret_key = "env:VOLCENGINE_SECRET_KEY"
+# limits = { "5h" = 6000, weekly = 45000, monthly = 90000 }
+accounts = [
+    { access_key = "env:VOLCENGINE_ACCESS_KEY", secret_key = "env:VOLCENGINE_SECRET_KEY" },
+]
 
 [platforms.ollama]
 enabled = true
-
-[[platforms.ollama.accounts]]
-api_key = "env:OLLAMA_API_KEY"
+accounts = [
+    { api_key = "env:OLLAMA_API_KEY" },
+]
 
 [platforms.opencode-go]
 enabled = true
-
-[[platforms.opencode-go.accounts]]
-api_key = "env:OPENCODE_GO_API_KEY"
+accounts = [
+    { api_key = "env:OPENCODE_GO_API_KEY" },
+]
 
 [platforms.clinepass]
 enabled = true
-
-[[platforms.clinepass.accounts]]
-api_key = "env:CLINEPASS_API_KEY"
+accounts = [
+    { api_key = "env:CLINEPASS_API_KEY" },
+]
 
 [platforms.commandcode]
 enabled = true
-
-[[platforms.commandcode.accounts]]
-api_key = "env:COMMANDCODE_API_KEY"
+accounts = [
+    { api_key = "env:COMMANDCODE_API_KEY" },
+]
 
 [platforms.opendesign]
 enabled = true
@@ -197,21 +320,20 @@ base_url = "https://amr-link.open-design.ai/v1"
 # 模型服务地址会自动映射到 OpenDesign 官方用量接口。
 # workspace_id = "工作区 ID"  # 可选;默认当前工作区
 # max_balance = 100  # 可选;美元余额用量的显示上限,0/未设置时不显示进度条
-
-[[platforms.opendesign.accounts]]
-# 也可通过 Web「供应商配置」中的网页登录授权自动保存。
-control_key = "env:OPENDESIGN_CONTROL_KEY"  # vela_ctrl_,非 sk-amr- 模型密钥
+accounts = [
+    # 也可通过 Web「供应商配置」中的网页登录授权自动保存。
+    { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_,非 sk-amr- 模型密钥
+]
 
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
-
-[[platforms.sub2api.accounts]]
-# 一个账号对应一组共享额度的 Key;增加 Key 不增加账号。
-name = "组1"
-# daily_limit = 100  # 可选;覆盖面板日报额度,不影响周/月额度
-api_keys = ["env:SUB2API_API_KEY"]
-# Key 也可命名:api_keys = [{ name = "主Key", value = "env:SUB2API_API_KEY" }]
+accounts = [
+    # 一个账号对应一组共享额度的 Key;增加 Key 不增加账号。
+    # 账号内可加 daily_limit = 100,覆盖面板日报额度(不影响周/月额度)。
+    # api_keys 每项可写名字:{ name = "主 Key", value = "env:SUB2API_API_KEY" }。
+    { name = "组1", api_keys = ["env:SUB2API_API_KEY"] },
+]
 """
 
 

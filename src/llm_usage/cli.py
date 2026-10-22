@@ -137,7 +137,10 @@ def web(host: str, port: int, interval: float) -> None:
 @main.command()
 @click.option("--init", "do_init", is_flag=True, help="Generate example config template.")
 @click.option("--force", is_flag=True, help="Overwrite an existing config with --init.")
-@click.option("--format", "do_format", is_flag=True, help="Rewrite config using unified account tables.")
+@click.option(
+    "--format", "do_format", is_flag=True,
+    help="Rewrite config with one table per provider and inline accounts.",
+)
 def config(do_init: bool, force: bool, do_format: bool) -> None:
     """Print config path and contents, or generate a template."""
     setup_cli_logging()

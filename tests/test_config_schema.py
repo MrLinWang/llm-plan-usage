@@ -1,4 +1,4 @@
-"""Compatibility and lossless credential migration for uniform account tables."""
+"""Compatibility and lossless credential migration to one accounts list per provider."""
 
 from __future__ import annotations
 

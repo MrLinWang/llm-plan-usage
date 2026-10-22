@@ -1,11 +1,12 @@
-"""Lossless adapters between account tables and the existing provider configuration.
+"""Lossless adapters between the persisted account list and provider configuration.
 
-The persisted format uses ``accounts`` for every known provider.  The runtime
-projection deliberately keeps the older credential/group shapes, so providers
-and credential editors do not need to understand two storage formats.  Dormant
-credentials are kept in a ``legacy`` table rather than silently activated or
-discarded during conversion.  Secret values, including ``env:`` references,
-are never resolved here.
+The persisted format keeps an ``accounts`` list inside every known provider's
+single ``[platforms.<key>]`` table.  The runtime projection deliberately keeps
+the older credential/group shapes, so providers and credential editors do not
+need to understand two storage formats.  Dormant credentials are kept in a
+``legacy`` table rather than silently activated or discarded during
+conversion.  Secret values, including ``env:`` references, are never resolved
+here.
 """
 
 from __future__ import annotations
@@ -153,7 +154,7 @@ def _runtime_section(section: dict[str, Any], provider: str) -> dict[str, Any]:
 
 
 def to_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Decode account tables without editing the input or expanding secrets.
+    """Decode a provider's ``accounts`` list without editing the input.
 
     Legacy sections remain accepted.  Unknown provider sections are copied
     verbatim, so importing configuration for a future provider is safe.
@@ -235,7 +236,7 @@ def _accounts_section(section: dict[str, Any], provider: str) -> dict[str, Any]:
 
 
 def to_accounts_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Encode runtime credentials as uniform account tables, preserving backups."""
+    """Encode runtime credentials as one uniform ``accounts`` list per provider."""
     result = to_runtime_config(config)
     platforms = result.get("platforms")
     if not isinstance(platforms, dict):

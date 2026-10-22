@@ -1,8 +1,8 @@
 # llm-usage configuration
-# 统一格式:平台设置放在 [platforms.<type>]，每个账号放在 [[platforms.<type>.accounts]]。
-# 单账号和多账号使用同一结构;追加一个 accounts 表即可增加独立账号。
+# 每个供应商只写一个 [platforms.<type>] 表:平台设置与 accounts 账号列表都在表内,
+# 不再使用 [[platforms.<type>.accounts]] 子表。accounts 写成数组,一个账号一行。
 # 账号 name 可选;凭证使用 env:VARNAME 引用环境变量,也可直接填写密钥。
-# 旧顶层凭证、credentials 和 groups 仍可读取,保存时统一为 accounts。
+# 旧顶层凭证、credentials、groups 与子表格式仍可读取,保存时统一为本格式。
 
 # 平台显示顺序(可选):
 # platform_order = [
@@ -16,54 +16,52 @@
 [platforms.kimi]
 enabled = true
 base_url = "https://api.kimi.com/coding/v1"
-
-[[platforms.kimi.accounts]]
-api_key = "env:KIMI_API_KEY"
+accounts = [
+    { api_key = "env:KIMI_API_KEY" },
+]
 
 [platforms.volcengine-coding]
 enabled = true
 plan_type = "coding"
 tier = "pro"  # lite | pro
-# limits = { "session" = 6000, "weekly" = 45000, "monthly" = 90000 }
-
-[[platforms.volcengine-coding.accounts]]
-# 火山使用 AccessKey/SecretKey + V4 签名,不是 Bearer API key。
-access_key = "env:VOLCENGINE_ACCESS_KEY"
-secret_key = "env:VOLCENGINE_SECRET_KEY"
+# limits = { session = 6000, weekly = 45000, monthly = 90000 }
+accounts = [
+    # 火山使用 AccessKey/SecretKey + V4 签名,不是 Bearer API key。
+    { access_key = "env:VOLCENGINE_ACCESS_KEY", secret_key = "env:VOLCENGINE_SECRET_KEY" },
+]
 
 [platforms.volcengine-agent]
 enabled = true
 plan_type = "agent"
 tier = "medium"  # small | medium | large | max
-# limits = { "5h" = 6000, "weekly" = 45000, "monthly" = 90000 }
-
-[[platforms.volcengine-agent.accounts]]
-access_key = "env:VOLCENGINE_ACCESS_KEY"
-secret_key = "env:VOLCENGINE_SECRET_KEY"
+# limits = { "5h" = 6000, weekly = 45000, monthly = 90000 }
+accounts = [
+    { access_key = "env:VOLCENGINE_ACCESS_KEY", secret_key = "env:VOLCENGINE_SECRET_KEY" },
+]
 
 [platforms.ollama]
 enabled = true
-
-[[platforms.ollama.accounts]]
-api_key = "env:OLLAMA_API_KEY"
+accounts = [
+    { api_key = "env:OLLAMA_API_KEY" },
+]
 
 [platforms.opencode-go]
 enabled = true
-
-[[platforms.opencode-go.accounts]]
-api_key = "env:OPENCODE_GO_API_KEY"
+accounts = [
+    { api_key = "env:OPENCODE_GO_API_KEY" },
+]
 
 [platforms.clinepass]
 enabled = true
-
-[[platforms.clinepass.accounts]]
-api_key = "env:CLINEPASS_API_KEY"
+accounts = [
+    { api_key = "env:CLINEPASS_API_KEY" },
+]
 
 [platforms.commandcode]
 enabled = true
-
-[[platforms.commandcode.accounts]]
-api_key = "env:COMMANDCODE_API_KEY"
+accounts = [
+    { api_key = "env:COMMANDCODE_API_KEY" },
+]
 
 [platforms.opendesign]
 enabled = true
@@ -71,18 +69,17 @@ base_url = "https://amr-link.open-design.ai/v1"
 # 模型服务地址会自动映射到 OpenDesign 官方用量接口。
 # workspace_id = "工作区 ID"  # 可选;默认当前工作区
 # max_balance = 100  # 可选;美元余额用量的显示上限,0/未设置时不显示进度条
-
-[[platforms.opendesign.accounts]]
-# 也可通过 Web「供应商配置」中的网页登录授权自动保存。
-control_key = "env:OPENDESIGN_CONTROL_KEY"  # vela_ctrl_,非 sk-amr- 模型密钥
+accounts = [
+    # 也可通过 Web「供应商配置」中的网页登录授权自动保存。
+    { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_,非 sk-amr- 模型密钥
+]
 
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
-
-[[platforms.sub2api.accounts]]
-# 一个账号对应一组共享额度的 Key;增加 Key 不增加账号。
-name = "组1"
-# daily_limit = 100  # 可选;覆盖面板日报额度,不影响周/月额度
-api_keys = ["env:SUB2API_API_KEY"]
-# Key 也可命名:api_keys = [{ name = "主Key", value = "env:SUB2API_API_KEY" }]
+accounts = [
+    # 一个账号对应一组共享额度的 Key;增加 Key 不增加账号。
+    # 账号内可加 daily_limit = 100,覆盖面板日报额度(不影响周/月额度)。
+    # api_keys 每项可写名字:{ name = "主 Key", value = "env:SUB2API_API_KEY" }。
+    { name = "组1", api_keys = ["env:SUB2API_API_KEY"] },
+]

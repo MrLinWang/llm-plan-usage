@@ -410,6 +410,21 @@ Web 端所有页面和 API 都需要登录。首次启动（尚无用户）访�
   注册成功即自动登录。开关默认关闭，状态持久化在 `history.db` 的
   `settings` 表（重启不丢失）；关闭后注册入口消失，注册 API 返回 403。
 - **用户名规则**：注册 / 创建账号的用户名限 1–64 位字母、数字、下划线、点或连字符（`[A-Za-z0-9_.-]`）。
+- **关于**：仪表盘 ⋯ 菜单里的「关于」会弹出面板，显示当前版本号和**功能更新日志**
+  （按版本倒序，最新版本带「当前版本」徽标；日志过长时面板内可滚动）。
+  版本由 `src/llm_usage/version.py` 统一解析：优先 `llm_usage.__version__`
+  （与 `pyproject.toml` 的 `version` 同步），该属性缺失或为空时才回退安装包
+  元数据，两者皆无则显示 `未知`——任何情况下都不会抛异常，
+  因此 `llm-usage --version` 与面板始终一致、前端不硬编码。
+  日志数据在 `src/llm_usage/changelog.py`，随包分发，
+  因此 Docker 镜像内同样可用。面板可用「关闭」按钮、Esc 或点击遮罩关闭。
+  接口不可用时版本显示「未知」、日志区提示「更新日志加载失败」，面板不会打不开。
+
+  发布新版本时改三处：`pyproject.toml` 的 `version`、`src/llm_usage/__init__.py`
+  的 `__version__`（两处须一致），以及在 `changelog.py` 的 `CHANGELOG` **顶部**
+  追加一条记录（`version` / `date` / `entries`，每条 `kind` 为
+  `feature` / `fix` / `breaking`）；`version.py` 只解析、无需修改。
+  测试会校验日志首条版本与包版本一致，漏改会直接失败。
 - 修改或重置密码后，该用户的其他登录会话立即失效。
 
 用户与会话存储在 `./history.db`（`users`/`sessions` 表）中，密码以

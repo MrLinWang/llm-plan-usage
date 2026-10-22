@@ -35,6 +35,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from llm_usage import store
+from llm_usage.changelog import changelog
 from llm_usage.config import (
     get_platform_config,
     get_platform_order,
@@ -68,6 +69,7 @@ from llm_usage.providers import (
     split_instance_key,
 )
 from llm_usage.providers.opendesign import parse_max_balance
+from llm_usage.version import app_version
 
 logger = logging.getLogger(__name__)
 
@@ -1216,6 +1218,13 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         ):
             raise HTTPException(status_code=400, detail="间隔需为 5-3600 秒内的数字")
         return {"interval": cache.set_interval(float(value))}
+
+    @app.get("/api/version")
+    def app_version_endpoint(
+        user: dict[str, Any] = Depends(api_user),
+    ) -> dict[str, Any]:
+        """版本号与更新日志(仪表盘「关于」面板)。需要登录,与其它 /api/* 一样不缓存。"""
+        return {"version": app_version(), "changelog": changelog()}
 
     # ---- 用户管理 API ----
     # GET 放开到任意登录用户(普通用户配置页需要共享目标列表);写操作保持管理员。

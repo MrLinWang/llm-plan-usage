@@ -37,6 +37,10 @@ def _patch_fetch(monkeypatch: pytest.MonkeyPatch, results=None) -> list[int]:
     return calls
 
 
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
 def _auth_client(
     monkeypatch: pytest.MonkeyPatch,
     tmp_db_path: Path,
@@ -153,6 +157,21 @@ class TestWeb:
         assert 'id="nav-users"' in html    # 用户管理入口(JS 仅对管理员取消隐藏)
         assert 'id="nav-config"' in html   # 供应商配置入口(管理员恒显,普通用户随开关)
 
+    def test_index_has_about_hooks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        """「关于」菜单项与浮层的静态挂载点:缺失时面板无法打开或无法显示版本。"""
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        html = client.get("/").text
+        assert 'id="nav-about"' in html       # ⋯ 菜单里的「关于」按钮
+        assert "关于" in html
+        assert 'id="about-overlay"' in html   # 浮层遮罩
+        assert 'id="about-version"' in html   # 版本号文本节点
+        assert 'id="about-log"' in html       # 功能更新日志容器
+        assert "功能更新" in html
+        assert 'id="about-close"' in html     # 关闭按钮
+        assert "/api/version" in html         # 版本数据来源
+
     def test_refresh_forces_refetch(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
     ) -> None:
@@ -202,6 +221,163 @@ class TestWeb:
         assert 'rel="icon"' in html
         assert "data:image/svg+xml" in html
 
+
+
+class TestVersionEndpoint:
+    """「关于」面板:版本号取包内 __version__,更新日志取自包内 changelog 模块。"""
+
+    def test_version_endpoint_returns_package_version_and_changelog(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        import llm_usage
+
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        resp = client.get("/api/version")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["version"] == llm_usage.__version__
+        assert isinstance(data["changelog"], list) and data["changelog"]
+        # 面板显示 vX.Y.Z 时日志最高必须也是 X.Y.Z,否则会出现「版本更高但无记录」
+        assert data["changelog"][0]["version"] == data["version"]
+        assert resp.headers["Cache-Control"] == "no-store"
+
+    def test_version_endpoint_requires_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
+    ) -> None:
+        _patch_fetch(monkeypatch)
+        client = TestClient(create_app({"platforms": {}}))
+        assert client.get("/api/version").status_code == 401
+
+    def test_app_version_prefers_package_version_over_stale_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """editable 安装的元数据可能滞后于代码:以 __version__ 为准,避免显示旧版本。"""
+        import llm_usage
+        from llm_usage import version as version_mod
+
+        monkeypatch.setattr(version_mod, "distribution_version", lambda _name: "0.0.0-stale")
+        assert version_mod.app_version() == llm_usage.__version__
+
+    def test_app_version_falls_back_to_metadata_without_package_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """__version__ 缺失(异常打包)时回退分发包元数据,而非直接报错。"""
+        import llm_usage
+        from llm_usage import version as version_mod
+
+        monkeypatch.setattr(version_mod, "distribution_version", lambda _name: "9.9.9")
+        monkeypatch.setattr(llm_usage, "__version__", "")
+        assert version_mod.app_version() == "9.9.9"
+
+    def test_app_version_survives_a_missing_package_attribute(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """__version__ 真正不存在(而非空串)时也必须回退,不能抛 ImportError。
+
+        cli.py 在**导入期**求值 app_version(),一旦抛异常整个 CLI 都起不来。
+        """
+        import llm_usage
+        from llm_usage import version as version_mod
+
+        monkeypatch.setattr(version_mod, "distribution_version", lambda _name: "9.9.9")
+        monkeypatch.delattr(llm_usage, "__version__")
+        assert version_mod.app_version() == "9.9.9"
+
+    def test_app_version_returns_placeholder_when_nothing_is_known(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """既无 __version__ 也无元数据时给占位符,面板仍可渲染。"""
+        from importlib.metadata import PackageNotFoundError
+
+        import llm_usage
+        from llm_usage import version as version_mod
+
+        def missing(_name: str) -> str:
+            raise PackageNotFoundError(_name)
+
+        monkeypatch.setattr(version_mod, "distribution_version", missing)
+        monkeypatch.delattr(llm_usage, "__version__")
+        assert version_mod.app_version() == "未知"
+
+    def test_cli_and_web_report_the_same_version(self) -> None:
+        """`--version` 与「关于」面板必须同源,否则两处显示不同版本号。"""
+        from click.testing import CliRunner
+
+        from llm_usage.cli import main
+        from llm_usage.version import app_version
+
+        result = CliRunner().invoke(main, ["--version"])
+        assert result.exit_code == 0, result.output
+        assert app_version() in result.output
+
+
+class TestChangelog:
+    """更新日志随包分发,结构稳定且与版本号同步。"""
+    def test_releases_are_well_formed_and_newest_first(self) -> None:
+        import re
+
+        from llm_usage.changelog import RELEASE_KINDS, changelog
+
+        releases = changelog()
+        assert releases, "至少有一条更新记录"
+        versions: list[str] = []
+        for release in releases:
+            assert set(release) == {"version", "date", "entries"}
+            assert re.fullmatch(r"\d+\.\d+\.\d+", release["version"]), release["version"]
+            assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", release["date"]), release["date"]
+            assert release["entries"], f"{release['version']} 无变更条目"
+            for entry in release["entries"]:
+                assert set(entry) == {"kind", "text"}
+                assert entry["kind"] in RELEASE_KINDS, entry["kind"]
+                assert entry["text"].strip(), entry["text"]
+            versions.append(release["version"])
+
+        assert len(versions) == len(set(versions)), "版本号不得重复"
+        assert versions == sorted(versions, key=_version_key, reverse=True), versions
+
+    def test_newest_release_matches_package_version(self) -> None:
+        """改版本号时必须同步更新日志首条,否则此处失败(仪表盘会显示空日志)。"""
+        from llm_usage import __version__
+        from llm_usage.changelog import changelog
+
+        assert changelog()[0]["version"] == __version__
+
+    def test_pyproject_and_package_versions_agree(self) -> None:
+        """pyproject.toml 与 __init__.py 的版本号必须一致,否则安装包与「关于」不符。"""
+        import tomllib
+        from pathlib import Path
+
+        from llm_usage import __version__
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+        assert declared == __version__
+
+    def test_frontend_kind_labels_cover_every_release_kind(self) -> None:
+        """前端标签表必须覆盖 RELEASE_KINDS,否则新 kind 会渲染成原始英文。"""
+        import re
+        from pathlib import Path
+
+        from llm_usage.changelog import RELEASE_KINDS
+
+        html = (Path(__file__).resolve().parents[1]
+                / "src" / "llm_usage" / "static" / "index.html").read_text(encoding="utf-8")
+        match = re.search(r"ABOUT_KIND_LABELS\s*=\s*\{([^}]*)\}", html)
+        assert match, "index.html 缺少 ABOUT_KIND_LABELS"
+        labels = set(re.findall(r"(\w+)\s*:", match.group(1)))
+        assert labels == set(RELEASE_KINDS), (
+            f"前端标签 {sorted(labels)} 与 RELEASE_KINDS {sorted(RELEASE_KINDS)} 不一致"
+        )
+
+    def test_changelog_returns_a_copy(self) -> None:
+        from llm_usage.changelog import changelog
+
+        first = changelog()
+        original = first[0]["entries"][0]["text"]
+        first[0]["entries"][0]["text"] = "tampered"
+        first[0]["entries"].append({"kind": "fix", "text": "tampered"})
+        assert changelog()[0]["entries"][0]["text"] == original
+        assert len(changelog()[0]["entries"]) == len(first[0]["entries"]) - 1
 
 
 class TestPwa:

@@ -292,6 +292,78 @@
     outline-offset: -2px;
   }
   #more-dropdown [hidden] { display: none; }
+  /* 「关于」浮层:遮罩 + 居中面板,复用下拉/悬浮明细的配色变量。 */
+  .about-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, 0.45);
+  }
+  .about-overlay[hidden] { display: none; }
+  .about-panel {
+    min-width: 260px;
+    max-width: min(92vw, 380px);
+    background: var(--surface);
+    border: 1px solid var(--sep);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 16px 18px;
+  }
+  .about-title { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+  .about-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 4px 0;
+    font-size: 13px;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .about-row #about-version { color: var(--fg); }
+  /* 功能更新日志:限高滚动,避免版本多时把面板撑出屏幕。 */
+  .about-log-title {
+    margin: 12px 0 6px;
+    padding-top: 10px;
+    border-top: 1px solid var(--sep);
+    font-size: 12px;
+    color: var(--dim);
+  }
+  .about-log { max-height: min(46vh, 320px); overflow-y: auto; }
+  .about-log-empty { font-size: 12px; color: var(--dim); }
+  .about-release { padding: 6px 0; }
+  .about-release + .about-release { border-top: 1px dashed var(--sep); }
+  .about-release-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 4px;
+    font-size: 13px;
+    color: var(--fg);
+  }
+  .about-release-head .current {
+    border: 1px solid var(--cyan);
+    border-radius: 999px;
+    padding: 0 6px;
+    font-size: 11px;
+    color: var(--cyan);
+  }
+  .about-release-head .date { margin-left: auto; font-size: 11px; color: var(--dim); }
+  .about-release ul { margin: 0; padding-left: 18px; }
+  .about-release li { font-size: 12px; line-height: 1.6; color: var(--dim); }
+  .about-release li .tag {
+    margin-right: 5px;
+    padding: 0 4px;
+    border-radius: 4px;
+    font-size: 10px;
+  }
+  .about-release li .tag.feature { border: 1px solid var(--green); color: var(--green); }
+  .about-release li .tag.fix { border: 1px solid var(--yellow); color: var(--yellow); }
+  .about-release li .tag.breaking { border: 1px solid var(--red); color: var(--red); }
+  .about-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
   #theme-toggle:disabled, .pill-btn:disabled, #interval-select:disabled {
     opacity: 0.5;
     cursor: default;
@@ -577,6 +649,7 @@
             <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
             <a id="nav-users" class="dropdown-item" href="/users" hidden>用户管理</a>
             <a id="nav-config" class="dropdown-item" href="/config" hidden>供应商配置</a>
+            <button id="nav-about" class="dropdown-item" type="button">关于</button>
             <div class="menu-separator" aria-hidden="true"></div>
             <button id="logout" class="danger-item" type="button">退出登录</button>
           </div>
@@ -585,6 +658,19 @@
     </div>
   </div>
   <div id="platforms"></div>
+</div>
+<!-- 「关于」浮层:显示版本号(取自服务端安装包元数据),Esc / 点击遮罩 / 关闭按钮收起。 -->
+<div id="about-overlay" class="about-overlay" hidden>
+  <div id="about-panel" class="about-panel" role="dialog" aria-modal="true"
+       aria-labelledby="about-title">
+    <div id="about-title" class="about-title">关于 llm-usage</div>
+    <div class="about-row"><span>版本</span><span id="about-version">…</span></div>
+    <div class="about-log-title">功能更新</div>
+    <div id="about-log" class="about-log"></div>
+    <div class="about-actions">
+      <button id="about-close" class="pill-btn" type="button">关闭</button>
+    </div>
+  </div>
 </div>
 <!-- 平台卡片内的 entry 表格骨架;每个平台卡片克隆一份。 -->
 <template id="entry-table">
@@ -679,6 +765,124 @@ document.addEventListener("click", function (e) {
 });
 document.addEventListener("keydown", function (e) {
   if (e.key === "Escape" && !moreDropdown.hidden) setMoreOpen(false);
+});
+
+// ---- 关于 ----
+// ⋯ 菜单 →「关于」弹出浮层显示版本号;版本取自 /api/version(服务端安装包元数据),
+// 只在首次打开时请求一次。Esc / 点击遮罩 / 关闭按钮收起,并还原焦点。
+var aboutBtn = document.getElementById("nav-about");
+var aboutOverlay = document.getElementById("about-overlay");
+var aboutClose = document.getElementById("about-close");
+var aboutVersionEl = document.getElementById("about-version");
+var aboutLogEl = document.getElementById("about-log");
+var aboutVersionLoaded = false;
+var aboutReturnFocus = null;
+
+var ABOUT_KIND_LABELS = {feature: "新功能", fix: "修复", breaking: "不兼容"};
+
+// 功能更新日志:版本倒序,当前版本带徽标。全程 textContent / createElement,
+// 日志文本不经 HTML 解析。releases 为 null 表示加载失败,[] 表示确实没有记录。
+function renderAboutLog(releases, currentVersion) {
+  aboutLogEl.textContent = "";
+  if (!releases) {
+    var failed = document.createElement("div");
+    failed.className = "about-log-empty";
+    failed.textContent = "更新日志加载失败";
+    aboutLogEl.appendChild(failed);
+    return;
+  }
+  if (!releases.length) {
+    var empty = document.createElement("div");
+    empty.className = "about-log-empty";
+    empty.textContent = "暂无更新记录";
+    aboutLogEl.appendChild(empty);
+    return;
+  }
+  releases.forEach(function (release) {
+    var block = document.createElement("div");
+    block.className = "about-release";
+
+    var head = document.createElement("div");
+    head.className = "about-release-head";
+    var versionEl = document.createElement("span");
+    versionEl.textContent = release.version ? "v" + release.version : "未标注版本";
+    head.appendChild(versionEl);
+    if (release.version === currentVersion) {
+      var badge = document.createElement("span");
+      badge.className = "current";
+      badge.textContent = "当前版本";
+      head.appendChild(badge);
+    }
+    if (release.date) {
+      var dateEl = document.createElement("span");
+      dateEl.className = "date";
+      dateEl.textContent = release.date;
+      head.appendChild(dateEl);
+    }
+    block.appendChild(head);
+
+    var list = document.createElement("ul");
+    (release.entries || []).forEach(function (entry) {
+      var li = document.createElement("li");
+      var kind = entry.kind || "feature";
+      var tag = document.createElement("span");
+      tag.className = "tag " + kind;
+      tag.textContent = ABOUT_KIND_LABELS[kind] || kind;
+      li.appendChild(tag);
+      li.appendChild(document.createTextNode(entry.text || ""));
+      list.appendChild(li);
+    });
+    block.appendChild(list);
+    aboutLogEl.appendChild(block);
+  });
+}
+
+function setAboutOpen(open) {
+  if (open) {
+    aboutReturnFocus = document.activeElement;
+    aboutOverlay.hidden = false;
+    aboutClose.focus();
+    if (!aboutVersionLoaded) {
+      aboutVersionLoaded = true;
+      fetch("/api/version").then(function (r) {
+        if (r.status === 401) { location.href = "/login"; throw new Error("未登录"); }  // 会话失效
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }).then(function (data) {
+        aboutVersionEl.textContent = "v" + data.version;
+        renderAboutLog(data.changelog, data.version);
+      }).catch(function () {
+        aboutVersionEl.textContent = "未知";  // 取不到版本不阻断面板
+        renderAboutLog(null, null);
+        aboutVersionLoaded = false;           // 下次打开重试
+      });
+    }
+  } else {
+    aboutOverlay.hidden = true;
+    if (aboutReturnFocus && aboutReturnFocus.focus) aboutReturnFocus.focus();
+    aboutReturnFocus = null;
+  }
+}
+
+aboutBtn.addEventListener("click", function () {
+  setMoreOpen(false);  // 先收起下拉,再显示浮层
+  setAboutOpen(true);
+});
+aboutClose.addEventListener("click", function () { setAboutOpen(false); });
+aboutOverlay.addEventListener("click", function (e) {
+  if (e.target === aboutOverlay) setAboutOpen(false);  // 点面板内部不关闭
+});
+document.addEventListener("keydown", function (e) {
+  if (aboutOverlay.hidden) return;
+  // 两个 keydown 监听都挂在 document 上,stopPropagation 拦不住同层监听(那需要
+  // stopImmediatePropagation);这里只按自身可见性处理,互不干扰即可。
+  if (e.key === "Escape") { setAboutOpen(false); return; }
+  // 焦点陷阱:aria-modal="true" 承诺背景不可达,面板内只有「关闭」可聚焦,
+  // 用 Tab / Shift+Tab 把焦点留在面板内,避免跳到背后的卡片控件。
+  if (e.key === "Tab") {
+    e.preventDefault();
+    aboutClose.focus();
+  }
 });
 
 // ---- 会话状态 ----

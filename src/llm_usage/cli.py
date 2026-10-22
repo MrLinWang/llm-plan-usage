@@ -16,6 +16,7 @@ from llm_usage.logging_setup import setup_cli_logging, setup_web_logging
 from llm_usage.providers import fetch_all
 from llm_usage.store import query_history, save_snapshot
 from llm_usage.tui import run_tui
+from llm_usage.version import app_version
 
 console = Console()
 
@@ -47,7 +48,7 @@ def _load() -> dict[str, Any]:
 
 
 @click.group()
-@click.version_option(package_name="llm-usage")
+@click.version_option(version=app_version())
 def main() -> None:
     """llm-usage: unified LLM coding plan usage monitor."""
 
@@ -56,7 +57,8 @@ def main() -> None:
 
 @main.command()
 @click.option("--json", "as_json", is_flag=True, help="Output JSON for scripting.")
-@click.option("--plain", is_flag=True, help="Reserved; currently same rendering as default (not implemented).")
+@click.option("--plain", is_flag=True,
+              help="Reserved; currently same rendering as default (not implemented).")
 @click.option("--no-save", is_flag=True, help="Do not persist a snapshot to history.")
 @click.option("--keys", "show_keys", is_flag=True,
               help="Also show per-key usage detail for multi-key groups (e.g. Sub2API).")

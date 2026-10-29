@@ -15,18 +15,30 @@ Credits response shape (no envelope):
                    "resetAt": 1789716175624},
       "weekly":   {"used": 0.05, "cap": 35, "exceeded": false,
                    "resetAt": 1790302975624}
-    }
+    },
+    "sandboxAccess": true,
+    "sandboxMinutes": {"usedMinutes": 0, "limitMinutes": 0,
+                       "overageUsd": 0, "resetAt": 1793491200000}
   }
 
 (Values above are illustrative; ``resetAt`` is epoch milliseconds.)
 
-``credits.monthlyCredits`` is the *monthly remainder* in dollars (verified:
-plan total − remaining == fiveHour.used).  The monthly row therefore needs the
+``credits.monthlyCredits`` is the *monthly remainder* in credit units (1
+credit is about $1 of usage on full-allowance models; boosted models stretch
+it further, and the same unit applies to ``windowLimits``).  Verified: plan
+total − remaining == fiveHour.used.  The monthly row therefore needs the
 plan's total, which comes from ``subscriptions``: ``planId`` is matched
 longest-prefix against the CLI's built-in table (:data:`PLAN_MONTHLY_CREDITS`)
 and only an ``active`` subscription yields the row — an unknown or inactive
 plan is silently skipped rather than guessed.  A subscription lookup failure
 degrades to the two window rows plus a ``warning``.
+
+Cloud (sandbox) minutes are an optional monthly allowance added to the credits
+payload after the original provider was written.  When ``sandboxAccess`` is
+true and the account either has an included minute quota or has already used
+some minutes, a final ``云端分钟`` row is emitted: used/limit when
+``limitMinutes > 0``, otherwise a used-only row for per-minute billing.  A
+``0/0`` payload (no Cloud usage) adds no row.
 """
 
 from __future__ import annotations
@@ -101,6 +113,48 @@ def _plan_monthly_credits(plan_id: Any) -> float | None:
     return None
 
 
+def _sandbox_entry(
+    payload: dict[str, Any], platform: str
+) -> UsageEntry | None:
+    """Cloud minutes row from the optional ``sandboxMinutes`` payload.
+
+    Mirrors the CLI's ``/usage`` overlay: only shown when ``sandboxAccess`` is
+    true and the account has a quota (``limitMinutes > 0``) or usage.  Without
+    an included quota the row is used-only (billed per minute), so no cap,
+    percentage or reset countdown is attached.
+    """
+    if payload.get("sandboxAccess") is not True:
+        return None
+    sandbox = payload.get("sandboxMinutes")
+    if not isinstance(sandbox, dict):
+        return None
+    used = _as_float(sandbox.get("usedMinutes")) or 0.0
+    limit = _as_float(sandbox.get("limitMinutes")) or 0.0
+    if limit <= 0 and used <= 0:
+        return None
+    if limit > 0:
+        return UsageEntry(
+            platform=platform,
+            label="云端分钟",
+            used=used,
+            limit=limit,
+            remaining=compute_remaining(used, limit),
+            percent=compute_percent(used, limit),
+            reset_at=_parse_reset_time(sandbox.get("resetAt")),
+            unit="分钟",
+        )
+    return UsageEntry(
+        platform=platform,
+        label="云端分钟",
+        used=used,
+        limit=None,
+        remaining=None,
+        percent=None,
+        reset_at=None,
+        unit="分钟",
+    )
+
+
 def _parse_usage_payload(
     payload: dict[str, Any],
     subscription: dict[str, Any] | None,
@@ -108,10 +162,11 @@ def _parse_usage_payload(
 ) -> list[UsageEntry]:
     """Turn the credits payload (+ subscription) into UsageEntry list.
 
-    Rows come in the fixed 5小时 → 每周 → 每月 order.  A window is emitted only
-    when both ``used`` and a positive ``cap`` are present — this covers
-    ``limited: false`` and missing fields.  The monthly row additionally
+    Rows come in the fixed 5小时 → 每周 → 每月 → 云端分钟 order.  A window is
+    emitted only when both ``used`` and a positive ``cap`` are present — this
+    covers ``limited: false`` and missing fields.  The monthly row additionally
     requires an ``active`` subscription whose ``planId`` is in the tier table.
+    The cloud-minutes row is optional (see :func:`_sandbox_entry`).
     """
     entries: list[UsageEntry] = []
 
@@ -169,6 +224,10 @@ def _parse_usage_payload(
                     unit="$",
                 )
             )
+
+    sandbox = _sandbox_entry(payload, platform)
+    if sandbox is not None:
+        entries.append(sandbox)
 
     return entries
 

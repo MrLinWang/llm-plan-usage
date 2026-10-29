@@ -15,6 +15,17 @@ Response shape (verified against the live API, 2026-08):
   }
 Legacy flat ``limits[]`` items (``{"name", "limit", "remaining", ...}``)
 are also accepted. Numbers may be JSON strings. ``used = limit - remaining``.
+
+Newer responses also carry a ``usages`` object with ratio-only windows::
+
+  "usages": {
+    "limit_5h": {"used_ratio": 0.0002, "reset_time": "2026-10-29T06:48:26Z"},
+    "limit_7d": {"used_ratio": 0.0001, "reset_time": "2026-11-04T16:48:26Z"}
+  }
+
+The legacy ``limits``/``usage`` fields still carry the absolute numbers, so
+they win.  ``usages`` is a fallback for missing windows (percent-only rows),
+which keeps the provider working if the legacy block is eventually removed.
 """
 
 from __future__ import annotations
@@ -52,9 +63,9 @@ def _parse_reset_time(value: Any) -> str | None:
         return None
     if isinstance(value, (int, float)):
         # epoch milliseconds → ISO 8601
-        from datetime import datetime, timezone
+        from datetime import UTC, datetime
 
-        return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(value / 1000.0, tz=UTC).isoformat()
     if isinstance(value, str):
         return value
     return None
@@ -83,6 +94,46 @@ def _window_label(window: Any) -> str | None:
     return f"{int(minutes)}分钟"
 
 
+def _ratio_percent(value: Any) -> float | None:
+    """Convert a 0–1 ``used_ratio`` to a clamped 0–100 percent."""
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(max(min(ratio * 100.0, 100.0), 0.0), 1)
+
+
+def _append_ratio_windows(
+    payload: dict[str, Any], platform: str, entries: list[UsageEntry]
+) -> None:
+    """Fill windows missing from ``limits``/``usage`` via ``usages``."""
+    usages = payload.get("usages")
+    if not isinstance(usages, dict):
+        return
+    present = {entry.label for entry in entries}
+    for key, label in (("limit_5h", "5小时"), ("limit_7d", "每周")):
+        if label in present:
+            continue
+        item = usages.get(key)
+        if not isinstance(item, dict):
+            continue
+        percent = _ratio_percent(item.get("used_ratio"))
+        if percent is None:
+            continue
+        entries.append(
+            UsageEntry(
+                platform=platform,
+                label=label,
+                used=0.0,
+                limit=None,
+                remaining=None,
+                percent=percent,
+                reset_at=_parse_reset_time(item.get("reset_time")),
+                unit="%",
+            )
+        )
+
+
 def _parse_usage_payload(
     payload: dict[str, Any], platform: str
 ) -> list[UsageEntry]:
@@ -90,6 +141,7 @@ def _parse_usage_payload(
 
     - ``limits[]`` → per-window entries (typically the 5h window).
     - ``usage`` → the weekly window entry.
+    - ``usages`` → ratio-only fallback for windows missing above.
     """
     entries: list[UsageEntry] = []
 
@@ -142,6 +194,7 @@ def _parse_usage_payload(
                 )
             )
 
+    _append_ratio_windows(payload, platform, entries)
     return entries
 
 

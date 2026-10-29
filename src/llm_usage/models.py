@@ -26,7 +26,8 @@ class UsageEntry:
             subscription expiry (e.g. the gateway's 每月 row) rather than a
             quota refresh; ``None`` = window reset.  Display reads it to say
             「已到期」 instead of 「已重置」 once the timestamp has passed.
-        unit: display unit: ``"%"``, ``"次"``, ``"$"``, ``"tokens"``.
+        unit: free-form display unit, e.g. ``"%"``, ``"$"``, ``"次"``,
+            ``"tokens"``, ``"分钟"``, ``"credits"``, ``"AFP"``.
         is_manual: True for manually-entered values (no live API fetch).
         plan: billing-plan / group name used to partition the platform's rows
             (multi-credential platforms: each credential is its own plan; the

@@ -34,7 +34,7 @@ from typing import Annotated, Any
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
-from llm_usage import store
+from llm_usage import i18n, store
 from llm_usage.changelog import changelog
 from llm_usage.config import (
     get_platform_config,
@@ -926,11 +926,58 @@ _STATIC_DIR = Path(str(files("llm_usage") / "static"))
 _ICON_FILES = {"icon-192.png", "icon-512.png", "apple-touch-icon.png"}
 
 
+def inject_i18n_page(page: str, locale: str) -> str:
+    """Add the selected locale, catalog and shared i18n runtime to a page."""
+    catalog = json.dumps(i18n.catalog(locale), ensure_ascii=False).replace("</", "<\\/")
+    bootstrap = (
+        '<link rel="stylesheet" href="/i18n.css">'
+        '<script>window.__LLM_USAGE_LOCALE__='
+        + json.dumps(locale)
+        + ';window.__LLM_USAGE_I18N__='
+        + catalog
+        + ';</script><script src="/i18n.js" defer></script>'
+        + '<script>setTimeout(function(){document.documentElement.removeAttribute("data-i18n-pending")},1500)</script>'
+    )
+    page = re.sub(r'<html lang="[^"]*"', f'<html lang="{locale}" data-i18n-pending', page, count=1)
+    return page.replace("</head>", bootstrap + "</head>", 1)
+
+
 def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     cache = UserCaches(interval)
     limiter = _LoginLimiter()
     app = FastAPI(title="llm-usage")
+
+    @app.exception_handler(HTTPException)
+    async def _localized_http_error(request: Request, exc: HTTPException) -> JSONResponse:
+        detail = exc.detail
+        if isinstance(detail, str):
+            detail = i18n.translate_message(detail)
+        return JSONResponse(
+            {"detail": detail}, status_code=exc.status_code, headers=exc.headers or {}
+        )
     app.state.opendesign_auth = DeviceAuthorizationManager()
+
+    @app.middleware("http")
+    async def _locale(request: Request, call_next: Any) -> Response:
+        query = request.query_params.get("lang")
+        locale = i18n.resolve_locale(
+            query,
+            cookie=request.cookies.get("llm_usage_lang"),
+            accept_language=request.headers.get("accept-language"),
+        )
+        token = i18n.set_locale(locale)
+        try:
+            response = await call_next(request)
+        finally:
+            i18n.reset_locale(token)
+        response.headers.setdefault("Vary", "Accept-Language, Cookie")
+        normalized = i18n.normalize_locale(query)
+        if normalized:
+            response.set_cookie(
+                "llm_usage_lang", normalized, max_age=31536000, path="/",
+                samesite="lax", secure=_secure_cookie_enabled(),
+            )
+        return response
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next: Any) -> Response:
@@ -946,6 +993,9 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         name: (files("llm_usage") / "static" / name).read_text(encoding="utf-8")
         for name in ("index.html", "login.html", "users.html", "config.html")
     }
+
+    def _render_page(name: str) -> HTMLResponse:
+        return HTMLResponse(inject_i18n_page(pages[f"{name}.html"], i18n.current_locale()))
 
     # ---- 配置来源与按用户合并 ----
 
@@ -1008,7 +1058,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         return JSONResponse({
             "fetched_at": fetched_at,
             "interval": cache.interval,
-            "platforms": results_to_dict(platforms)["platforms"],
+            "platforms": results_to_dict(platforms, localize_errors=True)["platforms"],
         })
 
     # ---- 页面 ----
@@ -1018,11 +1068,23 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         """浏览器默认请求 /favicon.ico;页面已声明内联 data URI 图标,这里兜底返回 204 避免 404 日志。"""
         return Response(status_code=204)
 
+    @app.get("/i18n.js")
+    def i18n_js() -> Response:
+        return FileResponse(_STATIC_DIR / "i18n.js", media_type="text/javascript")
+
+    @app.get("/i18n.css")
+    def i18n_css() -> Response:
+        return FileResponse(_STATIC_DIR / "i18n.css", media_type="text/css")
+
     @app.get("/manifest.webmanifest")
     def webmanifest() -> Response:
         """PWA 清单:application/manifest+json 是浏览器识别安装条件的媒体类型。"""
-        return FileResponse(_STATIC_DIR / "manifest.webmanifest",
-                            media_type="application/manifest+json")
+        data = json.loads((_STATIC_DIR / "manifest.webmanifest").read_text(encoding="utf-8"))
+        data["name"] = i18n.t("app.title")
+        data["short_name"] = i18n.t("pwa.short_name")
+        data["description"] = i18n.t("app.description")
+        data["lang"] = i18n.current_locale()
+        return JSONResponse(data, media_type="application/manifest+json")
 
     @app.get("/sw.js")
     def service_worker() -> Response:
@@ -1039,11 +1101,11 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     def index(request: Request) -> Response:
         if _current_user(request) is None:
             return RedirectResponse("/login", status_code=302)
-        return HTMLResponse(pages["index.html"])
+        return _render_page("index")
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page() -> HTMLResponse:
-        return HTMLResponse(pages["login.html"])
+        return _render_page("login")
 
     @app.get("/users", response_class=HTMLResponse)
     def users_page(request: Request) -> Response:
@@ -1052,7 +1114,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
             return RedirectResponse("/login", status_code=302)
         if not user["is_admin"]:
             return RedirectResponse("/", status_code=302)
-        return HTMLResponse(pages["users.html"])
+        return _render_page("users")
 
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request) -> Response:
@@ -1060,7 +1122,7 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         user = _current_user(request)
         if user is None:
             return RedirectResponse("/login", status_code=302)
-        return HTMLResponse(pages["config.html"])
+        return _render_page("config")
 
     # ---- 认证 API ----
 

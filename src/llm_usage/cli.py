@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.syntax import Syntax
 
 from llm_usage import config as config_mod
+from llm_usage import i18n
 from llm_usage.display import render_history, render_key_breakdown, render_results, results_to_json
 from llm_usage.logging_setup import setup_cli_logging, setup_web_logging
 from llm_usage.providers import fetch_all
@@ -49,8 +50,11 @@ def _load() -> dict[str, Any]:
 
 @click.group()
 @click.version_option(version=app_version())
-def main() -> None:
+@click.option("--lang", type=click.Choice(["en", "zh-CN"]), default=None,
+              help="UI language: en or zh-CN.")
+def main(lang: str | None) -> None:
     """llm-usage: unified LLM coding plan usage monitor."""
+    i18n.set_locale(i18n.resolve_locale(lang))
 
 
 # --- show -------------------------------------------------------------------
@@ -67,7 +71,7 @@ def show(as_json: bool, plain: bool, no_save: bool, show_keys: bool) -> None:
     setup_cli_logging()
     cfg = _load()
     if not cfg.get("platforms"):
-        console.print("[yellow]未配置任何平台。运行 `llm-usage config --init` 生成模板。[/yellow]")
+        console.print(f"[yellow]{i18n.t('cli.not_configured')}[/yellow]")
         sys.exit(0)
     results = fetch_all(cfg)
     if as_json:
@@ -95,7 +99,7 @@ def tui(interval: float) -> None:
     setup_cli_logging()
     cfg = _load()
     if not cfg.get("platforms"):
-        console.print("[yellow]未配置任何平台。运行 `llm-usage config --init` 生成模板。[/yellow]")
+        console.print(f"[yellow]{i18n.t('cli.not_configured')}[/yellow]")
         sys.exit(0)
     try:
         run_tui(cfg, interval=interval)
@@ -114,12 +118,12 @@ def web(host: str, port: int, interval: float) -> None:
     """Serve the web dashboard at http://<host>:<port>/ ."""
     cfg = _load()
     if not cfg.get("platforms"):
-        console.print("[yellow]未配置任何平台。运行 `llm-usage config --init` 生成模板。[/yellow]")
+        console.print(f"[yellow]{i18n.t('cli.not_configured')}[/yellow]")
         sys.exit(0)
     try:
         import uvicorn
     except ImportError:
-        console.print("[red]缺少依赖,请先安装:pip install llm-usage\\[web][/red]")
+        console.print(f"[red]{i18n.t('cli.web_missing')}[/red]")
         sys.exit(2)
     from llm_usage.web import create_app
 

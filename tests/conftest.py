@@ -53,3 +53,13 @@ def _no_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     slept: list[float] = []
     monkeypatch.setattr("llm_usage.providers._sleep", slept.append)
     return slept
+
+
+@pytest.fixture(autouse=True)
+def _force_zh_locale(monkeypatch):
+    """Pin the legacy Chinese expectations unless a test explicitly changes locale."""
+    monkeypatch.setenv("LLM_USAGE_LANG", "zh-CN")
+    from llm_usage import i18n
+    i18n.set_locale("zh-CN")
+    yield
+    i18n.set_locale("en")

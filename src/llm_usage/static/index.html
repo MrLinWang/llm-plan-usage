@@ -647,6 +647,13 @@
           <button id="more-menu-btn" class="pill-btn more-btn" type="button" title="更多选项" aria-label="更多选项" aria-controls="more-dropdown" aria-expanded="false">⋯</button>
           <div id="more-dropdown" class="dropdown" role="menu" hidden>
             <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+            <div class="menu-separator"></div>
+            <button id="language-toggle" type="button" data-i18n="nav.language"
+                    aria-haspopup="menu" aria-expanded="false" aria-controls="language-submenu">语言</button>
+            <div id="language-submenu" class="submenu" role="menu" hidden>
+              <button type="button" data-lang="en" data-lang-label="English">English</button>
+              <button type="button" data-lang="zh-CN" data-lang-label="简体中文">简体中文</button>
+            </div>
             <a id="nav-users" class="dropdown-item" href="/users" hidden>用户管理</a>
             <a id="nav-config" class="dropdown-item" href="/config" hidden>供应商配置</a>
             <button id="nav-about" class="dropdown-item" type="button">关于</button>
@@ -688,6 +695,7 @@
 </template>
 <script>
 "use strict";
+window.__LLM_USAGE_MENU_MANAGED__ = true;
 
 var platformsEl = document.getElementById("platforms");
 var entryTableTpl = document.getElementById("entry-table");
@@ -758,7 +766,11 @@ function setMoreOpen(open) {
 }
 
 moreBtn.addEventListener("click", function () { setMoreOpen(moreDropdown.hidden); });
-moreDropdown.addEventListener("click", function () { setMoreOpen(false); });  // 点任一菜单项后收起
+moreDropdown.addEventListener("click", function (e) {
+  // 语言项和它的二级菜单不应关闭主菜单
+  if (e.target.closest("#language-toggle") || e.target.closest("#language-submenu")) return;
+  setMoreOpen(false);
+});
 document.addEventListener("click", function (e) {
   if (moreDropdown.hidden) return;
   if (e.target !== moreBtn && !moreDropdown.contains(e.target)) setMoreOpen(false);
@@ -922,6 +934,7 @@ function fmtG(v) {
 function fmtValue(v, unit) {
   if (v === null || v === undefined) return "-";
   var num = fmtG(v);
+  if (typeof window !== "undefined" && window.tUnit) unit = window.tUnit(unit);
   if (unit === "$") return "$" + num;
   if (unit === "%") return num + "%";
   if (unit === "tokens") return num + " tokens";
@@ -946,6 +959,7 @@ function fmtCompactNumber(v) {
 function fmtCompactValue(v, unit) {
   if (v === null || v === undefined) return "-";
   var num = fmtCompactNumber(v);
+  if (typeof window !== "undefined" && window.tUnit) unit = window.tUnit(unit);
   if (unit === "$") return "$" + num;
   if (unit === "%") return num + "%";
   // tokens 等长单位在紧凑表头中省略，避免数字被挤压；完整单位可悬停查看。
@@ -1205,6 +1219,7 @@ function dataRow(entry) {
   var compactRemaining = remaining === "-"
     ? "-" : fmtCompactValue(entry.remaining, entry.unit);
   var label = entry.label === "余额" ? "余额用量" : entry.label;
+  if (typeof window !== "undefined" && window.tLabel) label = window.tLabel(label);
   var labelCell = td(label, "entry-label");
   labelCell.title = label;
   // 多 Key 组(与 CLI render_key_breakdown 约定一致):行可点击弹出各 Key 明细

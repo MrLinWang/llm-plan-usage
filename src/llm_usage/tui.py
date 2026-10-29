@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import contextlib
 import sys
+from collections.abc import Iterator
 from time import monotonic as _monotonic
-from typing import Any, Iterator
+from typing import Any
 
 from rich.console import Console
 from rich.live import Live
 from rich.text import Text
 
+from llm_usage import i18n
 from llm_usage.display import TOTAL_WIDTH, build_overview
 from llm_usage.models import PlatformResult
 from llm_usage.providers import fetch_all
@@ -76,12 +78,12 @@ def run_tui(cfg: dict[str, Any], interval: float = DEFAULT_INTERVAL) -> None:
         # Countdown to next refresh (seconds only, no progress bar)
         remaining = max(interval - elapsed, 0.0)
         footer = Text.assemble(
-            ("间隔 ", "dim"),
+            (i18n.t("tui.interval"), "dim"),
             (f"{interval:.0f}s", "cyan"),
-            (" · 下次刷新 ", "dim"),
+            (i18n.t("tui.next_refresh"), "dim"),
             (f"{remaining:4.0f}s", "cyan"),
             ("   ", ""),
-            ("q 退出 · r 刷新 · +/- 调间隔", "dim"),
+            (i18n.t("tui.keys"), "dim"),
         )
         from rich.console import Group
 

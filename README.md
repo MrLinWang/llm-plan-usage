@@ -1,44 +1,52 @@
 # llm-usage
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![docker](https://github.com/MrLinWang/llm-plan-usage/actions/workflows/docker.yml/badge.svg)](https://github.com/MrLinWang/llm-plan-usage/actions/workflows/docker.yml)
 
-统一监控多个 LLM 编程额度 / Token 计划的命令行工具。
+A unified CLI for monitoring usage across multiple LLM coding plans and token plans.
 
-## 安装
+## Installation
 
 ```bash
 pip install -e .
 ```
 
-若需使用 Web 仪表盘，安装 web extra：
+For the Web dashboard, install the `web` extra:
 
 ```bash
 pip install -e ".[web]"
 ```
 
-或使用一键安装脚本（需要 [uv](https://docs.astral.sh/uv/)）：
+Or use the one-shot setup script (requires [uv](https://docs.astral.sh/uv/)):
 
 ```bash
-./setup.sh                    # 创建 .venv 并安装依赖（含 test/web extra）
-source .venv/bin/activate     # 激活虚拟环境
+./setup.sh                    # create .venv and install dependencies (including test/web extras)
+source .venv/bin/activate     # activate the virtual environment
 ```
 
-## 快速开始
+## Quick start
 
 ```bash
-llm-usage config --init     # 生成示例配置 ./config.toml
-llm-usage config --format   # 将现有配置统一为 accounts 格式
-llm-usage show              # 拉取所有平台用量，渲染 rich 表格
-llm-usage show --keys        # 总览 + 多 Key 分组的各 Key 用量明细
-llm-usage show --json        # JSON 输出，便于脚本处理
-llm-usage tui                # 交互式终端仪表盘（q 退出，r 刷新，+/- 调间隔）
-llm-usage web                # 浏览器仪表盘（默认 http://127.0.0.1:8765）
-llm-usage history --days 7   # 查看历史快照
+llm-usage config --init     # generate an example ./config.toml
+llm-usage config --format   # normalize an existing config to the accounts format
+llm-usage show              # fetch every platform and render a rich table
+llm-usage show --keys       # overview + per-key usage for multi-key groups
+llm-usage show --json       # JSON output for scripting
+llm-usage tui               # interactive terminal dashboard (q quit, r refresh, +/- interval)
+llm-usage web               # browser dashboard (default http://127.0.0.1:8765)
+llm-usage history --days 7  # view historical snapshots
 ```
+
+## Language
+
+- The Web UI follows the browser language (`zh*` → 简体中文, otherwise English). Use `⋯` → Language on any page, then choose **English** or **简体中文** in the submenu; the choice is stored in a cookie and `localStorage`.
+- CLI: `--lang en|zh-CN`, or `LLM_USAGE_LANG` / `LANG`. `show --json` keeps canonical labels/errors for scripting; human output is localized.
+- Provider errors and usage labels are kept canonical internally and translated at display time.
 
 ## Docker
 
-镜像由 GitHub Actions 自动构建并发布到 GHCR（`main` 分支 → `latest`，tag `v*` → 对应版本号，多架构 amd64/arm64）：
+Images are built and published to GHCR by GitHub Actions (`main` → `latest`, `v*` tag → version tag, multi-arch amd64/arm64):
 
 ```bash
 docker run -d --name llm-usage \
@@ -47,7 +55,7 @@ docker run -d --name llm-usage \
   ghcr.io/mrlinwang/llm-plan-usage:latest
 ```
 
-打开 http://127.0.0.1:8765/ ，首次访问创建管理员账号；之后在「供应商配置」页填写各平台凭证（写回 `/data/config.toml`），或直接注入环境变量：
+Open http://127.0.0.1:8765/ and create the admin account on first visit. Then fill in each platform's credentials on the "Provider configuration" page (written back to `/data/config.toml`), or inject environment variables directly:
 
 ```bash
 docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
@@ -55,45 +63,39 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
   ghcr.io/mrlinwang/llm-plan-usage:latest
 ```
 
-- `/data` 卷持久化配置与历史数据库（含用户/会话）；推荐命名卷。bind mount 宿主目录时需对 uid 1000 可写。
-- 改端口用 `-e PORT=9000 -p 9000:9000`（healthcheck 跟随 `$PORT`）。
-- 本地构建：`docker build -t llm-usage:dev .`
+- The `/data` volume persists configuration and the history database (including users/sessions); a named volume is recommended. When using a bind mount, the host directory must be writable by uid 1000.
+- To change the port, use `-e PORT=9000 -p 9000:9000` (the healthcheck follows `$PORT`).
+- Local build: `docker build -t llm-usage:dev .`
 
-## 支持的平台
+## Supported platforms
 
-| 平台 | 方式 | 说明 |
-|------|------|------|
-| Kimi Code (Moonshot Coding Plan) | 自动 API | `GET /coding/v1/usages`，Bearer；`limits/usage` 绝对值 + 新版 `usages` 比例兜底 |
-| 火山方舟 Coding Plan | 自动 API | Volcengine OpenAPI `GetCodingPlanUsage`，AK/SK + V4 签名 |
-| 火山方舟 Agent Plan | 自动 API | Volcengine OpenAPI `GetAFPUsage`，AK/SK + V4 签名 |
-| Ollama Cloud | 自动 API | `GET /api/balance`，Bearer；legacy 计划 5小时/每周 百分比窗口，credits 计划每月 `$` 额度池 |
-| OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer Console key；5小时/每周/每月 百分比窗口（Go/Plus/Teams 额度按模型不同） |
-| ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口；无订阅返回明确提示 |
-| Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 + 可选云端分钟 |
-| OpenDesign | 自动 API | `GET /api/v1/workspaces/current` + `/api/v1/workspaces/{id}/billing/preflight`，Bearer 控制密钥；credits 配额窗口 + 美元余额 |
-| Sub2API | 自动 API | `GET /v1/usage`，Bearer；读 `subscription` 出 每日/每周/每月 三行（旧版回退今日 `actual_cost`） |
+| Platform | Mode | Notes |
+|----------|------|-------|
+| Kimi Code (Moonshot Coding Plan) | Automatic API | `GET /coding/v1/usages`, Bearer; absolute `limits/usage` plus the newer `usages` ratio fallback |
+| Volcengine Ark Coding Plan | Automatic API | Volcengine OpenAPI `GetCodingPlanUsage`, AK/SK + V4 signing |
+| Volcengine Ark Agent Plan | Automatic API | Volcengine OpenAPI `GetAFPUsage`, AK/SK + V4 signing |
+| Ollama Cloud | Automatic API | `GET /api/balance`, Bearer; legacy plans use 5-hour/weekly percent windows, credits plans use a monthly `$` allowance pool |
+| OpenCode Go | Automatic API | `GET /zen/go/v1/usage`, Bearer Console key; 5-hour/weekly/monthly percent windows (Go/Plus/Teams allowances are model-dependent) |
+| ClinePass | Automatic API | `GET /api/v1/users/me/plan/usage-limits`, Bearer; 5-hour/weekly/monthly percent windows; a missing subscription returns a clear message |
+| Command Code | Automatic API | `GET /alpha/billing/credits` + `/subscriptions`, Bearer; 5-hour/weekly `$` windows + monthly allowance + optional Cloud minutes |
+| OpenDesign | Automatic API | `GET /api/v1/workspaces/current` + `/api/v1/workspaces/{id}/billing/preflight`, Bearer control key; credit quota windows + USD balance |
+| Sub2API | Automatic API | `GET /v1/usage`, Bearer; reads `subscription` into daily/weekly/monthly rows (older payloads fall back to today's `actual_cost`) |
 
-以上 9 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
-`kimi#2`），见下方「同类型供应商实例」。
+The nine built-in platform keys above are all available. Each type can also have multiple **independent instances** (extra account cards, with keys such as `kimi#2`); see "Same-type provider instances" below.
 
-## 配置
+## Configuration
 
-配置文件位于 `./config.toml`（当前目录）。API 密钥支持 `env:VARNAME` 前缀，
-从环境变量读取，避免明文存储在磁盘上。运行 `llm-usage config --init` 生成模板
-（仓库内另附只读参考 `config.toml.example`，内容与模板一致，可直接
-`cp config.toml.example config.toml`）。
+The configuration file lives at `./config.toml` (current directory). API keys support an `env:VARNAME` prefix so secrets can be read from environment variables instead of being stored in plaintext. Run `llm-usage config --init` to generate the template (the repository also ships a read-only reference `config.toml.example` with identical content; you can run `cp config.toml.example config.toml`).
 
-所有供应商统一使用「一个供应商一个表」：平台设置和 `accounts` 账号列表都写在
-**同一个** `[platforms.供应商]` 表里，不再拆出 `[[platforms.供应商.accounts]]` 子表。
-九种供应商（含 Sub2API 的多个共享 Key 组、`kimi#2` 这类实例）版式完全一致：
+Every provider uses "one table per provider": platform settings and the `accounts` list live in the **same** `[platforms.<provider>]` table, with no separate `[[platforms.<provider>.accounts]]` child table. All nine provider types (including Sub2API's shared-key groups and instances such as `kimi#2`) share the same layout:
 
 ```toml
 [platforms.kimi]
 enabled = true
 base_url = "https://api.kimi.com/coding/v1"
 accounts = [
-    { name = "套餐A", api_key = "env:KIMI_API_KEY_A" },
-    { name = "套餐B", api_key = "sk-kimi-xxx" },
+    { name = "Plan A", api_key = "env:KIMI_API_KEY_A" },
+    { name = "Plan B", api_key = "sk-kimi-xxx" },
 ]
 
 [platforms.volcengine-coding]
@@ -108,433 +110,215 @@ accounts = [
 enabled = true
 base_url = "http://127.0.0.1:18080"
 accounts = [
-    { name = "组1", api_keys = ["env:SUB2API_API_KEY"] },
+    { name = "Group 1", api_keys = ["env:SUB2API_API_KEY"] },
 ]
 ```
 
-- `[platforms.供应商]`：`enabled`、`display_name`、`base_url`、`tier`、`limits`、
-  `max_balance` 等平台设置，以及 `accounts` 数组。
-- `accounts` 数组：每项一个账号，**一项一行**。`name` 可选，凭证按供应商取
-  `api_key`（kimi / ollama / opencode-go / clinepass / commandcode）、`control_key`
-  （OpenDesign）或 `access_key` + `secret_key`（火山）。Sub2API 的一个账号对应
-  一个共享 Key 组，使用 `name`、可选 `daily_limit` 和 `api_keys`；`api_keys` 每项
-  可以是密钥字符串，也可以是带名字的 `{ name = "主 Key", value = "sk-…" }`。
-- 旧配置中未启用的备用凭证或分组保存在同一平台表内的 `legacy` 表中
-  （`legacy = { api_key = "sk-amr-…" }`），避免迁移时丢失，不会混入当前账号列表。
+- `[platforms.<provider>]` holds platform settings such as `enabled`, `display_name`, `base_url`, `tier`, `limits`, `max_balance`, plus the `accounts` array.
+- Each `accounts` entry is one account, **one per line**. `name` is optional. Credentials use `api_key` (kimi / ollama / opencode-go / clinepass / commandcode), `control_key` (OpenDesign), or `access_key` + `secret_key` (Volcengine). For Sub2API, one account is one shared-key group using `name`, an optional `daily_limit`, and `api_keys`; each `api_keys` entry may be a key string or a named `{ name = "Primary", value = "sk-..." }` object.
+- Unused legacy credentials or groups are retained in the platform's `legacy` table (for example `legacy = { api_key = "sk-amr-..." }`) so migrations never silently drop them; they are not mixed into the active account list.
 
-旧的顶层凭证、`credentials`、Sub2API `groups` / `use_groups` 格式，以及
-`[[platforms.供应商.accounts]]` 子表格式仍可读取，保存时统一写为上面这种表内
-`accounts` 数组；API 密钥和 `env:` 引用原样保留，不展开环境变量。
-无需同时维护新旧两套字段。
+Legacy top-level credentials, `credentials`, Sub2API `groups` / `use_groups`, and the `[[platforms.<provider>.accounts]]` child-table format are still readable; saves are normalized to the in-table `accounts` array shown above. API keys and `env:` references are preserved verbatim, and environment variables are never expanded during formatting. You do not need to maintain both formats.
 
-将现有文件立即整理为统一格式：
+Normalize an existing file immediately:
 
 ```bash
 llm-usage config --format
 ```
 
-命令会原子重写当前配置文件，不输出密钥；转换或写入失败时保留原文件。
-版式是确定的：每个供应商只有一个表头，`accounts` 写成跨行数组、每个账号一行；
-嵌套的 `api_keys` 只会在该账号行超出 100 列时改为每项一行，因此不会因为密钥
-长短在「内联对象」和「多行表」之间摇摆。后续网页保存也使用同一格式。
+The command atomically rewrites the current config file and never prints secrets; conversion or write failures preserve the original file. The layout is deterministic: every provider has exactly one table header, and `accounts` is a multi-line array with one account per line. Nested `api_keys` only break to one item per line when that account line exceeds 100 columns, so the layout never flips between inline objects and multi-line tables based on secret length. Web saves use the same formatter.
 
-### 自动重试
+### Automatic retries
 
-单个供应商拉取失败时会自动重试**瞬时故障**：网络错误/超时、HTTP 408/429/5xx、
-响应解析失败、provider 内部异常。重试按平台（多凭证时按每个凭证独立）进行，
-采用指数退避 0.5s → 1s → 2s（单次上限 5s），不影响其他平台的并发拉取。
-认证失败(401)、未配置、404、配置错误、无订阅等**永久错误不重试**（重试结果
-必然相同，只会浪费请求）。
+A failed platform fetch automatically retries **transient failures**: network errors/timeouts, HTTP 408/429/5xx, response parse failures, and provider-internal exceptions. Retries are per platform (and per credential for multi-account platforms), with exponential backoff 0.5s → 1s → 2s (capped at 5s per sleep), without blocking other platforms' concurrent fetches. **Permanent errors are not retried** because the result would be identical: authentication failure (401), not configured, 404, configuration error, no subscription, and similar.
 
-次数由顶层键 `max_retries` 配置，默认 3 = 首次失败后**额外**重试 3 次（最多 4 次
-请求、3 次退避等待）；`0` 关闭重试。非法的负值/非整数回落默认值，超过 10 截断为 10。
-带提示（warning）的部分成功结果不重试：网关某分组部分 Key 失败时已有成功用量，
-重试只会重复请求。
+The retry budget is the top-level `max_retries` key. The default `3` means **three extra attempts** after the first failure (up to 4 requests and 3 backoff sleeps); `0` disables retries. Negative or non-integer values fall back to the default; values above 10 are capped at 10. Partial successes with a warning are not retried: when some keys in a gateway group succeed, retrying would only duplicate requests.
 
 ```toml
 max_retries = 3
 ```
 
-`show`/`tui`/`web` 共用同一重试逻辑（Web 的 TTL 缓存内生效）。
+`show` / `tui` / `web` share the same retry logic (inside the Web TTL cache).
 
 ### OpenDesign
 
-OpenDesign 的模型调用密钥（`sk-amr-`）与账户控制密钥（`vela_ctrl_`）用途不同。
-在 Web「供应商配置」的 OpenDesign 凭证槽中点击「网页登录授权」，再点击
-「打开 OpenDesign 登录并授权」进入官方页面。登录对应的 OpenDesign 账号并
-确认授权，页面需要时填写配置页显示的授权码。返回配置页后，授权状态会自动
-更新；成功后查询凭证自动保存，无需查找或复制 `control_key`。
-账号密码只在 OpenDesign 官方页面输入。已有凭证槽可重新授权，也可添加新槽
-连接其他账号；独立的 OpenDesign 供应商实例同样支持此流程。
+OpenDesign model-inference keys (`sk-amr-`) and account control keys (`vela_ctrl_`) serve different purposes. In the Web "Provider configuration" page, click "Web login authorization" in the OpenDesign credential slot, then "Open OpenDesign login and authorize" to visit the official page. Sign in to the OpenDesign account and confirm; enter the authorization code shown on the configuration page if requested. When you return, the authorization status updates automatically; a successful query credential is saved without requiring you to find or copy a `control_key`. Passwords are only entered on OpenDesign's official page. Existing credential slots can be re-authorized, and new slots can connect other accounts; standalone OpenDesign provider instances support the same flow.
 
-管理员的查询凭证保存到 `config.toml`，普通用户的凭证只保存到自己的账户配置。
-网页登录授权保留已有的模型调用 `api_key`、其他套餐和启用状态；供应商名称、
-启用开关等其他修改仍需点击「保存」。若该供应商已停用，授权后仍需勾选
-「启用」并保存才能显示用量。授权码过期或取消后可以重新发起授权。
+Admin credentials are saved to `config.toml`; regular users' credentials are saved only to their own account configuration. Web login authorization preserves the existing model `api_key`, other plans, and the enabled flag; other edits such as display name and the enabled switch still require clicking "Save". If the provider is disabled, you must still enable it and save before usage appears. Expired or cancelled authorizations can be restarted.
 
-已有控制密钥时，也可直接在凭证槽中填写，或在 `config.toml` 中配置。
-通过官方 CLI 的 `vela login` 完成登录后，生产环境的控制密钥保存在
-`~/.amr/config.json` 的 `profiles.prod.controlKey` 字段（设置了 `AMR_HOME` 时
-使用该目录）。将该值填入 `control_key`，或设置 `OPENDESIGN_CONTROL_KEY`
-环境变量并在 `config.toml` 中引用：
+If you already have a control key, you can enter it directly in the credential slot or configure it in `config.toml`. After logging in with the official CLI via `vela login`, the production control key is stored in `~/.amr/config.json` under `profiles.prod.controlKey` (or under `AMR_HOME` if set). Put that value into `control_key`, or set the `OPENDESIGN_CONTROL_KEY` environment variable and reference it from `config.toml`:
 
 ```toml
 [platforms.opendesign]
 enabled = true
 base_url = "https://amr-link.open-design.ai/v1"
 accounts = [
-    { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_ 开头的账户控制密钥
+    { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_ account control key
 ]
 ```
 
-`base_url` 是模型服务地址，用量读取走 OpenDesign 官方的 `amr-api` 控制接口。
-支持多凭证套餐和独立供应商实例。保存控制密钥时会保留已有的模型调用 `api_key`。
+`base_url` is the model service address; usage is read through OpenDesign's official `amr-api` control endpoint. Multiple credential plans and standalone provider instances are supported. Saving a control key preserves the existing model-inference `api_key`.
 
-查询先读取 `GET https://amr-api.open-design.ai/api/v1/workspaces/current`
-确定当前工作区，再读取 `/api/v1/workspaces/{id}/billing/preflight`。
-可在平台段手工设置 `workspace_id = "工作区 ID"`，直接查询指定工作区。
-返回的 Coding Plan 窗口按原始 `credits` 单位展示已用、限额、剩余与重置时间；
-钱包余额以「余额用量」行单独展示，单位为 `$`。在 Web「供应商配置」中填写「最大余额 ($)」，
-即可显示「(最大余额 - 当前余额) ÷ 最大余额」的用量进度条；余额充足时为空，余额越低进度越高。
-也可在 `[platforms.opendesign]` 中设置 `max_balance = 100`（美元）。
-每个供应商实例可独立设置，该上限分别用于其每个账号；留空或设为 `0` 关闭进度条。
-最大余额仅作为显示刻度，已用金额仍显示为 `-`；余额达到或超过上限时进度为 0%，余额为零或负数时进度为 100%，始终保留真实余额。
+The query first reads `GET https://amr-api.open-design.ai/api/v1/workspaces/current` to determine the active workspace, then `/api/v1/workspaces/{id}/billing/preflight`. You can set `workspace_id = "workspace ID"` manually in the platform section to query a specific workspace directly. Returned Coding Plan windows show used, limit, remaining, and reset time in their native `credits` unit; the wallet balance is shown separately as a "Balance usage" row in `$`. Set "Maximum balance ($)" in the Web provider editor to show a usage bar computed as `(max balance - current balance) / max balance`; a full balance shows an empty bar, and lower balances show more progress. You can also set `max_balance = 100` (USD) in `[platforms.opendesign]`. The limit is per provider instance and applies to each of its accounts; leave it empty or set it to `0` to disable the bar. The maximum balance is only a display scale: spend still shows as `-`; progress is 0% at or above the limit and 100% at zero or negative balance, while the real balance is always preserved.
 
-只有 `sk-amr-` 密钥时，可通过上述网页登录授权连接对应账号。认证与额度字段参考
-[官方登录实现](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela.ts)
-与[官方用量响应解析](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela-billing.ts)。
+With only an `sk-amr-` key, use the Web login authorization flow above to connect the account. Authentication and quota fields follow the [official login implementation](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela.ts) and [official billing preflight parser](https://github.com/nexu-io/open-design/blob/main/apps/daemon/src/integrations/vela-billing.ts).
 
 ### Sub2API
 
-Sub2API 与其他平台一样完全在 `config.toml` 中配置：`base_url` 必填。
-配置键为 `sub2api`，独立实例使用 `sub2api#N`；默认显示名称为 `Sub2API`，
-也可通过 `display_name` 自定义。旧 `llm-gateway` 配置及实例读取时自动转换，
-下次保存使用新键；已有历史、用户配置和共享记录会自动迁移，原有凭证及环境变量
-引用保持有效。如果新旧键同时存在且配置不同，会提示冲突，避免覆盖任一账号。
-provider 读网关 `/v1/usage` 的 `subscription` 段：**每个组的每个 Key** 各带一份
-日/周/月配额与用量，成功 Key 逐窗口求和，卡片上每组显示「每日 / 每周 / 每月」
-三行；限额默认取面板的 `daily_limit_usd` / `weekly_limit_usd` /
-`monthly_limit_usd`，组里填了 `daily_limit` 则**覆盖**每日额度（多 Key 组的限额
-为成功 Key 之和，只要有 Key 未上报就留空不画进度）。`subscription.expires_at`
-作为「每月」行的重置倒计时，且按**到期**语义显示（过期显示「已到期」而非
-「已重置」）。旧版网关没有 `subscription` 时退回 `usage.today.actual_cost`
-（`cost` 是更旧的回退）只出一行「每日」。API keys 以**组**为单位配置，每组单独
-显示和保存历史。模板默认生成一组（`组1`，`env:SUB2API_API_KEY`）：
+Sub2API is configured entirely in `config.toml` like every other platform; `base_url` is required. The config key is `sub2api`, with independent instances named `sub2api#N`; the default display name is `Sub2API`, customizable via `display_name`. Existing `llm-gateway` sections and instances are converted automatically on read and saved under the new key; history, user configs, and shares are migrated automatically, while existing credentials and environment references remain valid. If old and new keys both exist with different contents, an explicit conflict is reported instead of overwriting either account. The provider reads the gateway's `/v1/usage` `subscription` block: **each key in each group** reports daily/weekly/monthly quotas and usage. Successful keys are summed per window, and each group shows three rows: Daily / Weekly / Monthly. Limits default to the panel's `daily_limit_usd` / `weekly_limit_usd` / `monthly_limit_usd`; a group-level `daily_limit` **overrides** the daily quota (a multi-key group's limit is the sum of successful keys; if any key reports no quota, the limit stays empty and no progress bar is drawn). `subscription.expires_at` drives the Monthly row's countdown with **expiry** semantics: an expired plan shows "Expired" rather than "Reset". Older gateways without `subscription` fall back to `usage.today.actual_cost` (`cost` is an even older fallback) and produce a single Daily row. API keys are configured per **group**; each group gets its own display and history. The template generates one group (`Group 1`, `env:SUB2API_API_KEY`):
 
 ```toml
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
 accounts = [
-    # 账号内可加 daily_limit = 100(覆盖面板日报额度,不影响周/月)
-    { name = "组1", api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"] },
+    # Optional daily_limit = 100 inside the account (overrides the panel daily quota; weekly/monthly are unaffected)
+    { name = "Group 1", api_keys = ["sk-team-a-key-1", "sk-team-a-key-2"] },
 ]
 ```
 
-Key 直接写在 config.toml 即可，也支持 `env:VARNAME` 引用环境变量。每个 Key 可
-配置**显示名称**（`show --keys` 的 Key 明细与 Web 仪表盘悬浮明细中展示，失败
-提示也会带上名称）：
+Keys can be written directly in `config.toml` or referenced via `env:VARNAME`. Each key can have a **display name**, shown in `show --keys` and the Web dashboard popover, and included in per-key error messages:
 
 ```toml
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
 accounts = [
-    { name = "组1", api_keys = [
-        { name = "主 Key", value = "env:SUB2API_TEAM_A_1" },
-        { value = "sk-team-a-key-2" },  # 无名称,显示 key#2
+    { name = "Group 1", api_keys = [
+        { name = "Primary", value = "env:SUB2API_TEAM_A_1" },
+        { value = "sk-team-a-key-2" },  # unnamed → displayed as key#2
     ] },
 ]
 ```
 
-组内部分 Key 请求失败时，成功 Key 仍会
-聚合，但结果会带提示；带提示的部分聚合不会写入历史快照，以免把不完整数据当成完整用量。
-同一个 Key 不应配置到多个分组。可用
-`LLM_USAGE_CONFIG` 环境变量覆盖路径（历史数据库用 `LLM_USAGE_DB`）。
+If some keys in a group fail, successful keys are still aggregated but the result carries a warning; partial aggregates are not written to history snapshots, so incomplete data is never mistaken for a complete usage record. The same key must not be assigned to multiple groups. Use the `LLM_USAGE_CONFIG` environment variable to override the config path (and `LLM_USAGE_DB` for the history database).
 
-旧的顶层单 Key 形式（`api_key` + 可选 `daily_limit` + `use_groups`）及
-`groups` 列表仍可读取；Web 端会把当前生效的配置当作账号分组展示，
-保存时统一迁移为 `accounts`。新配置不需要设置 `use_groups`。
+Legacy top-level single-key forms (`api_key` + optional `daily_limit` + `use_groups`) and the `groups` list remain readable; the Web UI presents the effective configuration as account groups and migrates it to `accounts` on save. New configs do not need `use_groups`.
 
-### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass / commandcode / opendesign）
+### Multiple billing plans (kimi / volcengine ×2 / ollama / opencode-go / clinepass / commandcode / opendesign)
 
-除 Sub2API 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
-**不同计费套餐**。每个凭证彼此完全独立——各自 fetch、各自展示、无共享限额、
-不合并数值；仪表盘按套餐分区展示同一平台的用量（`show`/`tui`/`web` 一致）。
-与 Sub2API 账号内的共享 Key（共享额度、聚合求和）不同。
-只有一个凭证时不显示套餐分区头——单槽（含 Web 编辑器保存时写入的
-`name = "套餐1"`）与旧的顶层单 Key 形态展示完全一致；两个及以上凭证才按
-套餐分区。
+Except for Sub2API, every platform supports **multiple credentials**: different credentials under the same platform are **different billing plans** for that provider. Each credential is fully independent — separate fetch, separate display, no shared quota, no value aggregation; the dashboard partitions usage rows by plan for the same platform (`show` / `tui` / `web` all behave the same). This differs from Sub2API's shared keys inside one account (shared quota, aggregated sums). A single credential shows no plan header — a single slot (including `name = "套餐1"` written by the Web editor) is indistinguishable from the legacy single-key form; only two or more credentials produce plan sections.
 
-Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass/commandcode 为
-`api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
-（火山为「添加 AK/SK」）即可增加新套餐；「套餐名」留空时服务端自动命名
-`套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后统一写回平台表内的
-`accounts` 数组（旧单 Key 和 `credentials` 格式保存时自动迁移）。
-手工配置同样支持：
+The Web "Provider configuration" page starts with one credential slot per platform (`api_key` for kimi/ollama/opencode-go/clinepass/commandcode; `control_key` for OpenDesign; `access_key` + `secret_key` for the two Volcengine platforms). Click "Add credential" (or "Add AK/SK" for Volcengine) to add a plan; leave the plan name empty and the server names it `套餐1`, `套餐2`, ... A blank credential value means "keep the saved value"; saves write to the platform's `accounts` array (legacy single-key and `credentials` formats migrate automatically). Manual configuration works too:
 
 ```toml
 [platforms.kimi]
 enabled = true
 # base_url = "https://api.kimi.com/coding/v1"
 accounts = [
-    { name = "套餐A", api_key = "env:KIMI_API_KEY_A" },
-    { name = "套餐B", api_key = "sk-kimi-xxx" },
+    { name = "Plan A", api_key = "env:KIMI_API_KEY_A" },
+    { name = "Plan B", api_key = "sk-kimi-xxx" },
 ]
 ```
 
-每个凭证 = 一个独立计费套餐：`show`/`tui`/`web` 的同一平台卡片内按套餐分块
-显示各自的数据行（套餐名标头）；历史快照记录套餐列；JSON 输出的每个 entry
-带 `plan` 字段。同一平台的部分凭证失败时该平台整体仍显示成功部分并附提示
-（不写历史快照）；全部失败才显示错误。旧的 `credentials` 数组和顶层单凭证
-配置仍保持原有查询行为，保存时转换为统一的 `accounts` 格式。
+Each credential is an independent billing plan: `show`/`tui`/`web` display each plan's rows inside the same platform card, with a plan-name header; history snapshots record the plan; JSON output includes a `plan` field on each entry. If some credentials fail, the platform still shows the successful ones with a warning (and does not write a snapshot); only when all fail does it show an error. Legacy `credentials` arrays and top-level single credentials keep their original fetch behavior and are converted to the unified `accounts` format on save.
 
-## 运行日志
+## Logging
 
-所有命令（`show` / `tui` / `web` / `config` / `history`）都会把运行日志统一写入
-配置文件同目录下的 `log/` 文件夹（即 `./log/llm-usage.log`，仓库内已
-`.gitignore`；轮转：单文件 1MB，保留 3 个备份 `llm-usage.log.1`~`.3`），
-同时仍输出到 stderr——`show --json` 的 stdout 不受影响。日志含供应商拉取失败
-与自动重试、Web 启动/访问/错误、登录限流锁定等服务端细节（面向用户的错误文案
-仍是脱敏的通用文案，详见「安全说明」）；httpx 每次成功请求的 INFO 行已静音
-（压到 WARNING），避免刷屏与快速写满文件。可用环境变量 `LLM_USAGE_LOG`
-覆盖日志路径：
+Every command (`show` / `tui` / `web` / `config` / `history`) writes runtime logs to a `log/` directory next to the config file (i.e. `./log/llm-usage.log`, already `.gitignore`d; rotation: 1 MB per file, 3 backups `llm-usage.log.1`–`.3`) while still writing to stderr, so `show --json` stdout stays clean. Logs include provider failures and retries, Web startup/access/errors, login throttling, and other server details (user-facing errors remain sanitized as described in "Security"). Per-request INFO lines from httpx are suppressed to WARNING to avoid noise and filling the file quickly. Override the log path with `LLM_USAGE_LOG`:
 
 ```bash
 LLM_USAGE_LOG=/var/log/llm-usage.log llm-usage web
 ```
 
-Docker 镜像中配置文件在 `/data/config.toml`，日志因此默认写到
-`/data/log/llm-usage.log`（随 `/data` 卷持久化，容器重建不丢），无需额外环境变量。
+In the Docker image the config file is `/data/config.toml`, so logs default to `/data/log/llm-usage.log` (persisted with the `/data` volume and surviving container recreation) with no extra environment variable.
 
-## 安全说明
+## Security
 
-- **文件权限**：`config.toml` 与 `history.db` 以 `0600` 创建（含明文 API 密钥、
-  密码哈希与会话令牌）。勿放宽权限，勿提交到 git。
-- **登录限流**：登录 / 注册 / 初始化接口按来源 IP 限流——60 秒内失败 5 次
-  即锁定 5 分钟（HTTP 429）。计数在进程内存中，重启清零。
-- **错误信息脱敏**：网络/内部异常只返回通用文案（如「网络错误」「内部错误」、`HTTP {状态码}`），异常细节仅写入服务端日志，不回显给浏览器。
-- **会话令牌**：`history.db` 中会话令牌为明文存储——数据库泄露即等于会话可被
-  劫持，请自行保管好该文件。
-- **HTTPS 反代**：若经反向代理以 HTTPS 对外提供服务，设置环境变量
-  `LLM_USAGE_SECURE_COOKIE=1` 为会话 Cookie 追加 `Secure` 标志。
-- **单进程部署**：用量缓存与登录限流均在进程内生效，请勿使用多 worker 部署
-  （默认单 worker 的 `llm-usage web` 无需任何配置）。
-- **WAL 备份**：SQLite 启用 WAL 模式；备份时需一并包含 `history.db-wal` /
-  `history.db-shm`，或先执行 checkpoint。
+- **File permissions**: `config.toml` and `history.db` are created with `0600` (they contain plaintext API keys, password hashes, and session tokens). Do not loosen permissions and do not commit them to git.
+- **Login throttling**: login / registration / setup endpoints are throttled per source IP — 5 failures in 60 seconds lock the source for 5 minutes (HTTP 429). Counters are in-process and reset on restart.
+- **Sanitized errors**: network/internal failures return generic messages (e.g. "Network error", "Internal error", `HTTP {status}`); details go only to server logs and are never echoed to the browser.
+- **Session tokens**: session tokens are stored in plaintext in `history.db` — a database leak means sessions can be hijacked, so protect the file.
+- **HTTPS reverse proxy**: if serving over HTTPS through a reverse proxy, set `LLM_USAGE_SECURE_COOKIE=1` to add the `Secure` flag to the session cookie.
+- **Single-process deployment**: usage caches and login throttling are in-process; do not run multiple workers (the default single-worker `llm-usage web` needs no configuration).
+- **WAL backups**: SQLite uses WAL mode; back up `history.db-wal` / `history.db-shm` too, or checkpoint first.
 
-## Web 仪表盘
+## Web dashboard
 
-`llm-usage web` 启动一个 FastAPI + Uvicorn 服务，默认监听 `127.0.0.1:8765`，
-浏览器打开 `http://127.0.0.1:8765/` 即可查看用量总览。Web 仪表盘与 `llm-usage show`
-输出等价，按平台分卡片展示：每张卡片标出平台名与状态，内含该平台的
-窗口/已用/限额/剩余/重置时间/重置倒计时列和进度条。
+`llm-usage web` starts a FastAPI + Uvicorn server on `127.0.0.1:8765` by default; open `http://127.0.0.1:8765/` to view the usage overview. The dashboard is equivalent to `llm-usage show`, with one card per platform: each card shows the platform name and status, plus window / used / limit / remaining / reset time / reset countdown columns and a progress bar.
 
-后端以 `interval` 秒（默认 60，最小 5，最大 3600）为 TTL 缓存 provider 结果，
-自动轮询在缓存过期前复用结果，不重复调用外部 API；前端按服务端返回的 `interval` 轮询。
-数据为实时仪表盘，不写入历史快照。
+The backend caches provider results for `interval` seconds (default 60, min 5, max 3600); automatic polling reuses cached results until expiry and does not call external APIs repeatedly. The frontend polls at the `interval` returned by the server. This is a live dashboard; it does not write historical snapshots.
 
-右上角「刷新」会立即发起请求，绕过自己的配置和可见共享来源的配置缓存，
-不清空其他配置的缓存。等待时保留旧卡片并持续显示「刷新中…」，成功后更新
-卡片并重新计时；迟到的旧轮询响应不会改写新请求的结果或等待状态。用量请求
-失败时保留旧数据、显示错误并在 10 秒后重试，也可再次手动刷新。获取新数据
-仍需等待供应商接口响应及必要的重试，但不必等待下一次自动刷新。
+The "Refresh" button in the top-right immediately issues a request, bypassing the cache for your own config and the configs of visible shared sources, without clearing other configs' caches. While waiting, old cards remain and "Refreshing..." is shown; on success the cards update and the timer restarts. Late responses from older polls cannot overwrite a newer request's result or waiting state. On failure, existing data stays visible, an error is shown, and the page retries after 10 seconds; manual refresh remains available. New data still requires waiting for provider responses and any retries, but does not require waiting for the next automatic refresh.
 
-更新服务代码后，需重启 Web 服务并重新加载页面，才能使用新版刷新逻辑。
+After updating the server code, restart the Web service and reload the page to use the new refresh logic.
 
-页面右上角可切换浅色/深色主题；选择持久化在浏览器 `localStorage`，
-未手动选择时跟随系统 `prefers-color-scheme`（默认深色）。
+Use the top-right control to switch light/dark themes; the choice persists in browser `localStorage`. Without a manual choice it follows the system `prefers-color-scheme` (dark by default).
 
-仪表盘是自适应布局：视口高度放不下全部平台卡片时，前端自动按 normal → compact →
-ultra 三档密度试排（只压缩留白与次要列，不缩小正文），窗口尺寸变化后自动重新试排；
-每张卡片同时是独立的容器查询上下文，窄卡隐藏「限额/重置时间」次要列并把数字缩写为
-k/M/B（完整数值悬停可见）。entry 较多的平台默认精简展示：「+N」一键展开全部、再点收起；
-周期窗口平台折叠时优先保留 5小时/每周 等核心窗口；非周期窗口且同一计费单位的平台改为
-5 秒轮播切换（悬停、聚焦或切走标签页即暂停）；Sub2API 多账号卡片收起时也按账号
-轮播最短窗口（通常为每日），normal 显示两个账号、compact/ultra 显示一个账号，
-最短窗口合计固定展示。收起后仍有条目没显示的卡片，卡头都有切换按钮（如「1–2/3 ›」）：
-点一下换下一组，每组行数与默认显示相同，最后一组之后回到第一组，不必展开整张卡片。
-周期窗口卡片（如 compact 下的 5小时/每周 → 每月）只手动切换、不自动轮播；ultra 下
-只显示「全部合计」的卡片在合计和各条目之间逐条切换；normal 下恰好两个账号的 Sub2API
-卡片可翻看各账号的每周/每月；已有轮播的卡片点击轮播指示器即可手动切换。切到的位置
-不保存，数据刷新、调整窗口或任一卡片展开/收起后回到默认视图。非周期条目的尾部合计行只合计已用（限额不完整时
-不虚构总进度）。多账号卡片（Sub2API 分组、多凭证套餐）的合计与账号同构：一个
-「全部合计」标题行 + 各窗口行（每日/每周/每月），只合计同一窗口、单位一致且可加总的
-条目；收起时只显示最短窗口（网关=每日）一行，compact/ultra 密度下展开也只保留每个
-账号的最短窗口，且展开/收起后立刻重跑一次密度试排（不必调整窗口大小）。
-展开的卡片内容按外层卡片网格列数重排为多列；每个平台的展开状态保存在
-`sessionStorage`（仅当前标签页会话，跨数据刷新与页面刷新保留，退出登录时清除）。
+The dashboard uses a responsive layout: when the viewport cannot fit every platform card, the frontend tries three densities — normal → compact → ultra — compressing whitespace and secondary columns only, never the body text, and re-tries on resize. Each card is also its own container-query context; narrow cards hide the secondary "limit/reset time" columns and abbreviate numbers as k/M/B (full values on hover). Platforms with many entries collapse by default: "+N" expands all, and clicking again collapses. Periodic-window platforms keep core windows such as 5-hour/weekly when collapsed; non-periodic platforms with the same unit rotate every 5 seconds (paused on hover, focus, or hidden tab). Collapsed Sub2API multi-account cards also rotate the shortest window per account (usually daily): normal shows two accounts, compact/ultra shows one, and the shortest-window total stays fixed. Collapsed cards that still hide rows get a switch button in the card header (e.g. "1–2/3 ›"): click to show the next group, with the same number of rows per group, wrapping to the first group after the last, without expanding the whole card. Periodic-window cards (e.g. 5-hour/weekly → monthly in compact mode) page manually and never rotate automatically; in ultra mode, cards showing only "Total" switch between the total and each entry; at normal density, Sub2API cards with exactly two accounts can page through each account's weekly/monthly rows; cards with rotation can be switched manually by clicking the rotation indicator. The position is not persisted: data refreshes, window resizes, or any expand/collapse return to the default view. Non-periodic total rows sum only used amounts (no invented total progress when limits are incomplete). Totals on multi-account cards (Sub2API groups, multi-credential plans) mirror the account structure: a "Total" header plus one row per window (daily/weekly/monthly), summing only entries with the same window, unit, and addable values; when collapsed only the shortest window (daily for gateways) is shown, and compact/ultra expansion keeps only each account's shortest window, re-running the density pass immediately after expand/collapse (no resize needed). Expanded cards reflow their content into multiple columns based on the outer card grid; each platform's expanded state is kept in `sessionStorage` (current tab session only, surviving data/page refreshes and cleared on logout).
 
-### PWA（安装到桌面 / 离线查看）
+### PWA (install to desktop / offline viewing)
 
-仪表盘是一个 Progressive Web App：在浏览器地址栏安装（Chrome/Edge 安装图标）或
-iOS Safari「添加到主屏幕」后，以独立窗口（standalone）运行。四个页面均内联注册
-Service Worker（`/sw.js`，根作用域）：
+The dashboard is a Progressive Web App: install it from the browser (Chrome/Edge install icon) or "Add to Home Screen" in iOS Safari, and it runs in a standalone window. All four pages register the Service Worker (`/sw.js`, root scope) inline:
 
-- **离线兜底与隐私**：页面导航网络优先，失败时回退页面缓存；`/api/*`
-  （含 `/api/usage`）始终直连网络，不写入或回退 Service Worker 缓存，服务端
-  同时返回 `Cache-Control: no-store`。断网时用量请求报错，已打开页面保留
-  现有卡片但不会从缓存恢复用量数据；重新打开离线页面只能读取页面外壳。
-  恢复联网后继续轮询。
-- **免登录资产**：`/manifest.webmanifest`（应用名/图标/standalone）、
-  `/icons/icon-192.png`、`/icons/icon-512.png`、`/icons/apple-touch-icon.png`
-  无需登录即可获取（登录页也要能安装）；主题色固定深色 `#16181d`。
-- **缓存版本**：修改 `static/sw.js` 后必须递增文件头部的 `CACHE` 版本号，
-  客户端才会淘汰旧缓存。
+- **Offline fallback and privacy**: page navigation is network-first with a page-cache fallback; `/api/*` (including `/api/usage`) always goes directly to the network and is never written to or served from the Service Worker cache, while the server also returns `Cache-Control: no-store`. Offline usage requests fail; open pages keep their existing cards but never restore usage data from cache; reopening an offline page only loads the page shell. Polling resumes when the network returns.
+- **Unauthenticated assets**: `/manifest.webmanifest` (app name/icons/standalone), `/icons/icon-192.png`, `/icons/icon-512.png`, and `/icons/apple-touch-icon.png` are available without login (so the login page can be installed too); the theme color is always dark `#16181d`.
+- **Cache versioning**: after editing `static/sw.js`, bump the `CACHE` version at the top of the file so clients evict old caches.
 
 ```bash
 llm-usage web --host 127.0.0.1 --port 8765 --interval 60
 ```
 
-未安装 web extra 时执行 `llm-usage web` 会提示安装 `pip install llm-usage[web]`。
+Without the web extra, `llm-usage web` prints a hint to install `pip install llm-usage[web]`.
 
-### 登录与用户管理
+### Login and user management
 
-Web 端所有页面和 API 都需要登录。首次启动（尚无用户）访问任意页面会进入
-初始化流程，创建首个**管理员**账号并自动登录；之后访问 `/login` 登录。
-会话 Cookie 有效期 7 天（`httponly`、`samesite=lax`），重启服务不失效。
+Every Web page and API requires login. On first launch (no users), visiting any page starts setup: create the first **admin** account and sign in automatically; afterwards use `/login`. Session cookies last 7 days (`httponly`, `samesite=lax`) and survive service restarts.
 
-- **管理员**：仪表盘头部的「用户管理」可列出/新增/删除用户、重置他人密码
-  （不能删除自己；系统**只存在一个管理员**——「新增用户」一律创建普通用户，
-  管理员账号只能由首次初始化创建）；「供应商配置」见下文。
-- **普通用户**：仪表盘只显示自己启用的平台（见下文「多用户用量隔离」）；
-  「供应商配置」页与管理员同构（凭证槽 + gateway base_url/组 + 可见性），
-  写入自己的 `user_configs`（存 `history.db`），无「用户管理」入口；仪表盘
-  ⋯ 菜单的「供应商配置」入口对普通用户同样显示（开关关闭时隐藏）。
-- **用户配置开关**：管理员可在「用户管理」页关闭**允许普通用户自行添加/编辑
-  自己的供应商**（站点开关，默认开启；状态持久化在 `history.db` 的
-  `settings` 表）；关闭后普通用户的「供应商配置」页显示提示、仪表盘 ⋯ 菜单
-  的「供应商配置」入口隐藏、`/api/my/*` API 返回 403，只读用量展示不受影响。
-- **开放注册**：管理员在「用户管理」页勾选「允许访客在登录页注册账号」后，
-  登录页出现「没有账号?注册」入口；自助注册的账号永远是**普通用户**，
-  注册成功即自动登录。开关默认关闭，状态持久化在 `history.db` 的
-  `settings` 表（重启不丢失）；关闭后注册入口消失，注册 API 返回 403。
-- **用户名规则**：注册 / 创建账号的用户名限 1–64 位字母、数字、下划线、点或连字符（`[A-Za-z0-9_.-]`）。
-- **关于**：仪表盘 ⋯ 菜单里的「关于」会弹出面板，显示当前版本号和**功能更新日志**
-  （按版本倒序，最新版本带「当前版本」徽标；日志过长时面板内可滚动）。
-  版本由 `src/llm_usage/version.py` 统一解析：优先 `llm_usage.__version__`
-  （与 `pyproject.toml` 的 `version` 同步），该属性缺失或为空时才回退安装包
-  元数据，两者皆无则显示 `未知`——任何情况下都不会抛异常，
-  因此 `llm-usage --version` 与面板始终一致、前端不硬编码。
-  日志数据在 `src/llm_usage/changelog.py`，随包分发，
-  因此 Docker 镜像内同样可用。面板可用「关闭」按钮、Esc 或点击遮罩关闭。
-  接口不可用时版本显示「未知」、日志区提示「更新日志加载失败」，面板不会打不开。
+- **Admin**: the dashboard header's "User management" lists/adds/deletes users and resets others' passwords (you cannot delete yourself; the system supports **only one admin** — "Add user" always creates a regular user, and the admin can only be created by initial setup). See "Provider configuration" below.
+- **Regular user**: the dashboard shows only their own enabled platforms (see "Multi-user usage isolation" below); the "Provider configuration" page mirrors the admin UI (credential slots + gateway base_url/groups + visibility) and writes to their own `user_configs` (in `history.db`), with no "User management" entry. The "Provider configuration" entry in the dashboard ⋯ menu is also shown to regular users (hidden when the site toggle is off).
+- **User-config toggle**: the admin can disable **allowing regular users to add/edit their own providers** on the "User management" page (site setting, enabled by default; persisted in the `settings` table in `history.db`). When disabled, regular users see a notice on "Provider configuration", the ⋯ menu entry is hidden, and `/api/my/*` returns 403; read-only usage views are unaffected.
+- **Open registration**: after the admin enables "Allow visitors to register on the login page", the login page shows "No account? Register"; self-registered users are always **regular users** and are signed in immediately. The setting is off by default and persisted in the `settings` table (survives restarts); when disabled the entry disappears and the registration API returns 403.
+- **Username rules**: registration/creation usernames are 1–64 characters from letters, digits, underscore, dot, or hyphen (`[A-Za-z0-9_.-]`).
+- **About**: the dashboard ⋯ menu's "About" opens a panel with the current version and a **release-notes log** (newest first, with a "Current version" badge; scrollable when long). The version is resolved by `src/llm_usage/version.py`: it prefers `llm_usage.__version__` (kept in sync with `pyproject.toml`'s `version`), falls back to installed package metadata only if missing/empty, and shows `Unknown` if neither exists — it never raises, so `llm-usage --version` and the panel always agree and the frontend never hardcodes it. The changelog data lives in `src/llm_usage/changelog.py` and ships with the package, so it is available inside the Docker image too. Close the panel with "Close", Esc, or by clicking the backdrop. If the API is unavailable, the version shows `Unknown`, the log area shows "Failed to load release notes", and the panel still opens.
 
-  发布新版本时改三处：`pyproject.toml` 的 `version`、`src/llm_usage/__init__.py`
-  的 `__version__`（两处须一致），以及在 `changelog.py` 的 `CHANGELOG` **顶部**
-  追加一条记录（`version` / `date` / `entries`，每条 `kind` 为
-  `feature` / `fix` / `breaking`）；`version.py` 只解析、无需修改。
-  测试会校验日志首条版本与包版本一致，漏改会直接失败。
-- 修改或重置密码后，该用户的其他登录会话立即失效。
+  To release a new version, change three places: `pyproject.toml`'s `version`, `src/llm_usage/__init__.py`'s `__version__` (they must match), and prepend a record to `CHANGELOG` in `changelog.py` (`version` / `date` / `entries`, with each entry's `kind` being `feature` / `fix` / `breaking`); `version.py` only parses and needs no change. Tests assert that the first log entry matches the package version, so a missed update fails immediately.
+- Changing or resetting a password invalidates that user's other sessions immediately.
 
-用户与会话存储在 `./history.db`（`users`/`sessions` 表）中，密码以
-PBKDF2-SHA256（60 万次迭代、随机盐）哈希存储，不落明文；站点级开关
-（如开放注册）存同一数据库的 `settings` 表。
-忘记全部管理员密码时，删除 `history.db` 中 `users` 表的行即可重新初始化。
+Users and sessions live in `./history.db` (`users` / `sessions` tables). Passwords are stored as PBKDF2-SHA256 hashes (600k iterations, random salt), never plaintext; site-level toggles (such as open registration) live in the same database's `settings` table. If all admin passwords are lost, delete rows from the `users` table in `history.db` to re-run setup.
 
-### 供应商配置
+### Provider configuration
 
-管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证
-（kimi/ollama/opencode-go/clinepass/commandcode 为 `api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`；
-sub2api 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode/opendesign
-以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
-命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
-（火山「添加 AK/SK」）追加新套餐槽。Sub2API 以**组**为单位编辑：
-默认一组「组1」，每组一个 API key 输入框 + 一个每日限额输入框（留空 = 用网关
-面板的日报额度；填了就覆盖该值，面板的周/月额度不受影响），
-组内可点「添加共享 Key」追加共享同一额度的 key，底部「添加组」新增分组；
-每个 Key 行还有一个可选的「Key 名称」输入框，名称会显示在仪表盘分组行的
-悬浮明细与 `show --keys` 的 Key 明细中（留空 = 保留现有名称）；
-同组 Key 的今日用量会合并计算。凭证永远不回显明文：已保存的值显示为掩码
-（如 `已设置 (sk-k…ey)`），`env:VARNAME` 引用原样显示；凭证值留空表示保留
-已保存的值，删除整个槽才会移除该凭证。保存立即写回 `./config.toml` 并使服务端
-用量缓存失效（下次刷新生效）：所有供应商统一写成各自 `[platforms.<供应商>]`
-表内的 `accounts` 数组，Sub2API 的每个分组保存为一个账号；旧凭证格式同时迁移。
-**取消勾选「启用」不会删除该平台的凭证**：只提交 `enabled` 时仅更新开关；网页上点
-「保存」会连同凭证槽/分组一起提交，但槽内留空表示保留既有值，因此凭证值、套餐槽、
-Sub2API 分组都保留（旧格式可能迁移为 `accounts` 数组，凭证值不变）。
-之后重新勾选「启用」即可继续使用，无需重新填写。禁用期间该平台不出现在仪表盘上
-（拉取时会跳过），但「供应商配置」页仍能看到并编辑它。
-Sub2API **一键导入 config.toml**：添加栏旁的「导入 config.toml」按钮可
-直接上传一个 TOML 文件（`POST /api/config/import`），**整体替换**当前配置——管理员替换
-`./config.toml`，普通用户替换自己在 `history.db` 的 `user_configs`（把本地
-配置同步到在线服务）。适合迁移新机器/新部署时免手工逐平台填写；导入前有
-确认对话框，需保留现有配置时请先自行备份。导入内容与现状相同则不会触发
-重新拉取（缓存按配置哈希驱动）。
+Admins can edit each platform's enabled flag and credentials on "Provider configuration" (`api_key` for kimi/ollama/opencode-go/clinepass/commandcode; `control_key` for OpenDesign; `access_key` + `secret_key` for the two Volcengine platforms; Sub2API has no top-level credential fields and uses group configuration). kimi/volcengine×2/ollama/opencode-go/clinepass/commandcode/opendesign are edited as **credential slots**: each slot is an independent billing plan (optional "Plan name"; empty becomes `套餐N`), with one credential input (two for Volcengine AK+SK); "Add credential" (or "Add AK/SK") appends a plan slot. Sub2API is edited as **groups**: one "Group 1" by default, each with an API-key input and a daily-limit input (empty = use the gateway's daily quota; a value overrides it without affecting weekly/monthly quotas); "Add shared key" appends a key sharing the group's quota, and "Add group" adds another group. Each key row also has an optional "Key name" shown in the dashboard's hover details and `show --keys` (empty = keep the existing name); keys in the same group have their daily usage summed. Credentials are never shown in plaintext: saved values appear masked (e.g. `Set (sk-k…ey)`) and `env:VARNAME` references pass through unchanged; an empty credential means "keep the saved value", and removing a whole slot is the only way to delete a credential. Saving writes immediately to `./config.toml` and invalidates the server usage cache (effective on the next refresh): every provider is written as an `accounts` array inside its `[platforms.<provider>]` table, with each Sub2API group saved as one account; legacy credential formats are migrated. **Unchecking "Enabled" never deletes credentials**: submitting only `enabled` updates just the flag; clicking "Save" on the Web page submits credential slots/groups too, but empty slots keep existing values, so credentials, plan slots, and Sub2API groups all survive (legacy formats may migrate to `accounts`, with values unchanged). Re-enable later without re-entering anything. A disabled platform does not appear on the dashboard (fetches skip it) but remains visible and editable on "Provider configuration". Sub2API also supports **one-click config.toml import**: the "Import config.toml" button next to the add bar uploads a TOML file (`POST /api/config/import`) and **replaces** the current configuration — admins replace `./config.toml`, regular users replace their `user_configs` in `history.db` (syncing local config to the online service). This is useful when migrating machines/deployments; a confirmation dialog appears, and you should back up existing config first. Importing identical content does not trigger a refetch (the cache is keyed by config hash).
 
-### 同类型供应商实例（多账号卡片）
+### Same-type provider instances (multi-account cards)
 
-同一类型可以添加多个**独立实例**（如第二个 Kimi 账号）：「供应商配置」页顶部
-的添加栏选类型后点「添加供应商」，即生成一张新卡（实例键形如 `kimi#2`，首个
-实例为裸基础键不动）。每个实例有独立凭证、独立显示名、独立可见性、独立仪表盘
-卡片；新实例默认**停用**，配好凭证后再勾选启用。管理员添加写入
-`./config.toml`（`POST /api/config/providers`），普通用户写入自己的
-`user_configs`（`POST /api/my/providers`）。删除走卡片上的「删除此供应商」
-按钮（确认框），该实例的共享设置一并级联移除；内置的 9 个基础平台不可删除。
-实例编号单调递增不复用（删除 `kimi#2` 后再添加得到 `kimi#3`），避免历史快照
-歧义。终端侧无需配置：实例随所在平台的配置自动抓取并显示。
+The same provider type can have multiple **independent instances** (for example a second Kimi account): choose a type in the add bar at the top of "Provider configuration" and click "Add provider" to create a new card (instance keys look like `kimi#2`; the first instance keeps the bare base key). Each instance has its own credentials, display name, visibility, and dashboard card; new instances are **disabled** by default — configure credentials and enable them. Admin additions write to `./config.toml` (`POST /api/config/providers`); regular users write to their `user_configs` (`POST /api/my/providers`). Delete an instance with the card's "Delete this provider" button (with confirmation); its shares are cascaded away. The nine built-in base platforms cannot be deleted. Instance numbers increase monotonically and are never reused (deleting `kimi#2` then adding again yields `kimi#3`), avoiding ambiguity in historical snapshots. Terminal usage needs no configuration: instances are fetched and displayed automatically with their platform's config.
 
-### 多用户用量隔离与可见性
+### Multi-user usage isolation and visibility
 
-用量信息默认**私有**：每个用户（含管理员）只在自己的仪表盘看到自己的平台配置。
-系统为**单管理员模型**——管理员（首个 setup 创建的账号）的平台配置存在
-`./config.toml`；普通用户（含自助注册）的平台配置存在 `./history.db` 的
-`user_configs` 表（JSON），与 `config.toml` 完全隔离。粒度是**平台级**
-（platform key）。
+Usage is **private** by default: every user (including the admin) sees only their own platform configuration on their dashboard. The system uses a **single-admin model** — the admin account (created by the first setup) keeps platform config in `./config.toml`; regular users (including self-registered ones) keep platform config in the `user_configs` table (JSON) in `./history.db`, completely isolated from `config.toml`. The granularity is **per platform key**.
 
-- **普通用户与管理员同样可配置全部供应商信息**：「供应商配置」页两模式同构
-  ——普通用户同样有凭证槽编辑器（kimi/ollama/opencode-go 的 `api_key`、火山×2
-  的 AK/SK，每槽一个计费套餐）与 Sub2API 的 `base_url` + 分组编辑器
-  （组、每日限额、共享 Key、Key 名称），字段级校验与 admin `/api/config` 完全
-  一致，保存后均使用统一的 `accounts` 格式。
-  唯一差异：普通用户保存写入自己的 `user_configs`（`/api/my/platforms`，
-  存 `history.db`），admin 写 `config.toml`（`/api/config`）；凭证一律不回显
-  明文（掩码/`env:`/未设置三态）。
-- **可见性三态**（「供应商配置」页每张平台卡上的下拉框）：
-  - **私有**（默认）：仅自己可见；
-  - **公开**：所有登录用户可见；
-  - **共享给指定用户**：勾选用户名后仅这些用户可见（不能共享给自己；
-    目标用户必须存在；重复勾选自动去重）。
-- **来源标注**：共享来的平台在卡片标题上追加 `(用户名)` 后缀
-  （如 `Kimi Code(alice)`），管理员公开的平台同样显示 `Sub2API(admin)`
-  （共享即标注来源，无例外）。
-- **自定义显示名称**：「供应商配置」页每张平台卡都有「显示名称」输入框
-  （全平台可用，留空 = 保留当前值，最长 64 字符）；改名后自己的仪表盘立即使用
-  新名称（终端 `show`/`tui` 同样生效），共享给他人时对方看到
-  `自定义名(用户名)`（如 `我的K(alice)`）。
-- **同名冲突（多来源并存）**：自己的平台保留裸名（自身来源，不参与冲突）；
-  共享来的同名平台每个来源都保留展示——`Kimi Code(admin)` 与
-  `Kimi Code(alice)` 是两张不同的卡，不覆盖、不丢弃。
-- **管理员仪表盘** = `config.toml` 全部平台 + 其他用户公开/共享给 admin 的平台
-  （共享给 admin 合法但无实际效果）；**普通用户仪表盘** = 自己的 DB 配置平台 +
-  admin 公开/共享给他的平台 + 其他用户公开/共享给他的平台。
-- **可见性存储**：写入 `history.db` 的 `user_shares` 表（owner/platform/target）；
-  删除用户时其配置与所有共享关系（作为 owner 或 target）一并级联删除；
-  删除一个供应商实例同样级联清掉它的全部共享行。
-- 后端按**配置内容哈希**为每个不同配置建立独立用量缓存条目（最多 32 个，
-  超出淘汰最旧），相同配置的用户共享同一条缓存，不会重复调用外部 API。
+- **Regular users can configure all provider details, just like admins**: the "Provider configuration" page is structurally identical — regular users also get credential-slot editors (`api_key` for kimi/ollama/opencode-go, AK/SK for Volcengine, one billing plan per slot) and the Sub2API `base_url` + group editor (groups, daily limit, shared keys, key names), with field-level validation identical to admin `/api/config`, saving the unified `accounts` format. The only difference: regular-user saves go to their own `user_configs` (`/api/my/platforms`, in `history.db`), while admin saves go to `config.toml` (`/api/config`); credentials are always masked (`env:` / not-set states are preserved).
+- **Three visibility states** (the dropdown on each platform card):
+  - **Private** (default): visible only to yourself;
+  - **Public**: visible to every signed-in user;
+  - **Shared with selected users**: visible only to the selected usernames (you cannot share with yourself; targets must exist; duplicates are removed automatically).
+- **Source labels**: shared platforms get a `(username)` suffix on the card title (e.g. `Kimi Code(alice)`); admin-public platforms likewise show `Sub2API(admin)` (sharing always labels the source, without exception).
+- **Custom display names**: every platform card has a "Display name" input (all platforms; empty = keep current, max 64 characters). A renamed platform uses the new name immediately on your dashboard (and in terminal `show`/`tui`); share targets see `custom name(username)` (e.g. `MyK(alice)`).
+- **Name collisions (multiple sources coexist)**: your own platform keeps the bare name (your own source, not part of collisions); shared platforms with the same name are all kept — `Kimi Code(admin)` and `Kimi Code(alice)` are two different cards, never overwritten or dropped.
+- **Admin dashboard** = all platforms in `config.toml` + platforms other users made public/shared with admin (sharing with admin is allowed but has no additional effect); **regular-user dashboard** = their own DB platforms + admin public/shared platforms + other users' public/shared platforms.
+- **Visibility storage**: rows in the `user_shares` table (`owner/platform/target`) in `history.db`; deleting a user cascades their config and all shares (as owner or target); deleting a provider instance cascades all of its share rows.
+- The backend keeps a separate usage-cache entry per **config hash** (up to 32 entries, oldest evicted); users with identical configs share one cache entry and do not call external APIs repeatedly.
 
-
-## 开发
+## Development
 
 ```bash
 pip install -e ".[test,dev]"
-python -m pytest tests/ -q          # 全量测试(无网络)
-ruff check src tests && mypy src    # lint + 类型检查
+python -m pytest tests/ -q          # full test suite (no network)
+ruff check src tests && mypy src    # lint + type check
 ```
 
-注：`show --plain` 参数当前未实现（声明保留，行为等同默认渲染）。
+Note: the `show --plain` flag is currently not implemented (reserved; behaves like the default rendering).
 
-## 时间显示
+## Time display
 
-`重置时间`（额度窗口重置时刻）、总览标题和历史时间戳均显示为机器**本地时区**。
-各平台返回的是 UTC 时间戳；存储值（`reset_at`、快照 `ts`）与 `--json` 输出保持
-原始 UTC ISO 8601 格式。机器切换时区时，显示会随之变化。
+`Reset time` (quota window reset), the overview title, and historical timestamps are displayed in the machine's **local timezone**. Platforms return UTC timestamps; stored values (`reset_at`, snapshot `ts`) and `--json` output keep the original UTC ISO 8601 format. Changing the machine timezone changes the display.
 
-`重置倒计时` 列显示距下一次重置的剩余时间（如 `2天3小时`、`5小时20分`、`32分`），
-基于**当前系统时钟**在每次渲染时计算——`llm-usage tui` 中每秒刷新；重置时刻已过
-显示 `已重置`，无重置时间显示 `-`。时间戳按语义区分：套餐到期（Sub2API 每月行）
-过期显示 `已到期`，网页端悬浮提示相应写作「到期时间」。该列与进度条百分比标签右对齐。
+The `Reset countdown` column shows the time until the next reset (e.g. `2d 3h`, `5h 20m`, `32m`), computed from the **current system clock** on every render — refreshed every second in `llm-usage tui`. An elapsed reset shows `Reset`; no reset time shows `-`. Timestamps are semantically distinguished: a plan expiry (Sub2API's Monthly row) shows `Expired` once passed, and the Web hover tooltip says "expiry time". The column is right-aligned with the progress-bar percentage label.
 
-Web 仪表盘同理：服务端 API 返回 UTC ISO 时间戳，浏览器端转换为本地时区显示，
-重置倒计时由前端每秒在客户端重算。
+The Web dashboard behaves the same way: the server API returns UTC ISO timestamps, the browser converts them to local time, and the frontend recomputes the reset countdown every second.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

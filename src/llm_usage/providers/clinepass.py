@@ -80,6 +80,18 @@ def _parse_percent(value: Any) -> float | None:
     return round(max(min(pct, 100.0), 0.0), 1)
 
 
+def _no_plan_response(resp: httpx.Response) -> bool:
+    """Recognize Cline's app-level 404 for an account without ClinePass."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    return isinstance(error, str) and "no plan history" in error.lower()
+
+
 def _parse_usage_payload(
     payload: dict[str, Any], platform: str
 ) -> list[UsageEntry]:
@@ -148,6 +160,10 @@ class ClinePassProvider:
                 return PlatformResult(
                     platform_key, display_name,
                     error="认证失败(401)",
+                )
+            if resp.status_code == 404 and _no_plan_response(resp):
+                return PlatformResult(
+                    platform_key, display_name, error="无 ClinePass 订阅"
                 )
             if resp.status_code != 200:
                 return PlatformResult(

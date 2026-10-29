@@ -138,6 +138,37 @@ class TestKimiParsing:
         assert e5h.remaining == 32.0
         assert e5h.reset_at == "2026-08-19T10:48:27.482983Z"
 
+    def test_usages_ratio_fills_windows_when_legacy_block_missing(self) -> None:
+        payload = {
+            "usages": {
+                "limit_5h": {"used_ratio": 0.0002,
+                             "reset_time": "2026-10-29T06:48:26Z"},
+                "limit_7d": {"used_ratio": 0.25,
+                             "reset_time": "2026-11-04T16:48:26Z"},
+            }
+        }
+        entries = _parse_usage_payload(payload, "kimi")
+        assert [e.label for e in entries] == ["5小时", "每周"]
+        assert entries[0].percent == 0.0  # 0.02% rounds to 0.0
+        assert entries[1].percent == 25.0
+        for e in entries:
+            assert e.used == 0.0
+            assert e.limit is None
+            assert e.remaining is None
+            assert e.unit == "%"
+        assert entries[1].reset_at == "2026-11-04T16:48:26Z"
+
+    def test_usages_does_not_duplicate_legacy_windows(self) -> None:
+        payload = _kimi_payload_5h_and_week()
+        payload["usages"] = {
+            "limit_5h": {"used_ratio": 0.9},
+            "limit_7d": {"used_ratio": 0.9},
+        }
+        entries = _parse_usage_payload(payload, "kimi")
+        assert [e.label for e in entries] == ["5小时", "每周"]
+        assert entries[0].used == 80.0  # legacy absolute numbers still win
+        assert entries[1].used == 4500.0
+
     @pytest.mark.parametrize(
         ("duration", "unit", "label"),
         [
@@ -525,14 +556,16 @@ class TestOpenCodeGoHttp:
         assert len(res.entries) == 3
         labels = [e.label for e in res.entries]
         assert labels == ["5小时", "每周", "每月"]
-        # rolling: 3% of $12 = $0.36
+        # 新版 Go 计划额度按模型不同,$ 池不可推导 → 百分比行
         e = res.entries[0]
         assert e.percent == 3.0
-        assert e.limit == 12.0
-        assert e.used == 0.36
-        assert e.unit == "$"
+        assert e.limit is None
+        assert e.used == 0.0
+        assert e.remaining is None
+        assert e.unit == "%"
         assert e.is_manual is False
         assert e.reset_at == "2026-08-19T04:23:00.867Z"
+        assert [x.percent for x in res.entries] == [3.0, 25.0, 12.0]
 
     def test_fetch_401(self) -> None:
         def handler(req: httpx.Request) -> httpx.Response:
@@ -541,6 +574,52 @@ class TestOpenCodeGoHttp:
         res = provider.fetch({"api_key": "test-key", "display_name": "OpenCode Go"})
         assert not res.ok
         assert "401" in res.error
+
+    def test_expired_key_gets_regeneration_hint(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": {
+                "type": "authentication_error",
+                "code": "api_key_expired",
+                "message": "This API key has expired.",
+            }})
+        provider = OpenCodeGoProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "expired"})
+        assert not res.ok
+        assert res.error == "API key 已过期，请在 OpenCode Console 重新生成"
+
+    def test_403_means_not_subscribed(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"type": "AuthError"}})
+        provider = OpenCodeGoProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "未订阅 OpenCode Go"
+
+    def test_workspace_header_is_optional(self) -> None:
+        seen: list[str | None] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req.headers.get("x-opencode-org-id"))
+            return httpx.Response(200, json=_opencode_go_usage_payload())
+
+        provider = OpenCodeGoProvider(client=_mock_client(handler))
+        provider.fetch({"api_key": "k"})
+        provider.fetch({"api_key": "k", "workspace_id": "wrk_123"})
+        assert seen == [None, "wrk_123"]
+
+    def test_rate_limited_and_bad_percent(self) -> None:
+        payload = {"usage": {
+            "rolling": {"status": "rate-limited", "percent": 100,
+                        "resetsAt": "2026-08-19T04:23:00.867Z"},
+            "weekly": {"status": "ok", "percent": "abc"},
+            "monthly": {"status": "ok"},
+        }}
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+        provider = OpenCodeGoProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert res.ok
+        assert [(e.label, e.percent) for e in res.entries] == [("5小时", 100.0)]
 
     def test_no_key_returns_unconfigured(self) -> None:
         res = OpenCodeGoProvider().fetch({})
@@ -664,6 +743,26 @@ class TestClinePassHttp:
         assert not res.ok
         assert res.error == "认证失败(401)"
 
+    def test_no_plan_history_maps_to_subscription_hint(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={
+                "data": None,
+                "error": "no plan history found for user",
+                "success": False,
+            })
+        provider = ClinePassProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "无 ClinePass 订阅"
+
+    def test_plain_404_stays_http_error(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "Not Found"})
+        provider = ClinePassProvider(client=_mock_client(handler))
+        res = provider.fetch({"api_key": "k"})
+        assert not res.ok
+        assert res.error == "请求失败(HTTP 404)"
+
     def test_http_error_not_echoed(self) -> None:
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(503, json={"error": "upstream detail xyz"})
@@ -717,6 +816,10 @@ def _commandcode_credits_payload() -> dict:
             "weekly": {"used": 0.0033531085, "cap": 35, "exceeded": False,
                        "resetAt": 1790302975624},
         },
+        # Current API always includes Cloud fields; 0/0 must stay hidden.
+        "sandboxAccess": True,
+        "sandboxMinutes": {"usedMinutes": 0, "limitMinutes": 0,
+                           "overageUsd": 0, "resetAt": 1793491200000},
     }
 
 
@@ -807,6 +910,60 @@ class TestCommandCodeParsing:
             _commandcode_credits_payload(), {"data": "junk"}, "commandcode"
         )
         assert [e.label for e in entries] == ["5小时", "每周"]
+
+    def test_sandbox_minutes_row_with_monthly_quota(self) -> None:
+        payload = _commandcode_credits_payload()
+        payload["sandboxAccess"] = True
+        payload["sandboxMinutes"] = {
+            "usedMinutes": 12, "limitMinutes": 60,
+            "overageUsd": 0, "resetAt": 1793491200000,
+        }
+        entries = _parse_commandcode_payload(
+            payload, _commandcode_subscription()["data"], "commandcode"
+        )
+        assert [e.label for e in entries] == ["5小时", "每周", "每月", "云端分钟"]
+        sandbox = entries[-1]
+        assert sandbox.used == 12.0
+        assert sandbox.limit == 60.0
+        assert sandbox.remaining == 48.0
+        assert sandbox.percent == 20.0
+        assert sandbox.reset_at == "2026-11-01T00:00:00Z"
+        assert sandbox.unit == "分钟"
+
+    def test_sandbox_minutes_used_only_without_quota(self) -> None:
+        payload = _commandcode_credits_payload()
+        payload["sandboxAccess"] = True
+        payload["sandboxMinutes"] = {
+            "usedMinutes": 7.5, "limitMinutes": 0,
+            "overageUsd": 0.02, "resetAt": 1793491200000,
+        }
+        entries = _parse_commandcode_payload(
+            payload, _commandcode_subscription()["data"], "commandcode"
+        )
+        sandbox = entries[-1]
+        assert sandbox.label == "云端分钟"
+        assert sandbox.used == 7.5
+        assert sandbox.limit is None
+        assert sandbox.remaining is None
+        assert sandbox.percent is None
+        assert sandbox.reset_at is None
+        assert sandbox.unit == "分钟"
+
+    def test_sandbox_minutes_hidden_without_access_or_usage(self) -> None:
+        base = _commandcode_credits_payload()
+        cases = [
+            {**base, "sandboxAccess": True, "sandboxMinutes": {
+                "usedMinutes": 0, "limitMinutes": 0}},
+            {**base, "sandboxAccess": False, "sandboxMinutes": {
+                "usedMinutes": 5, "limitMinutes": 60}},
+            {**base, "sandboxAccess": True, "sandboxMinutes": "junk"},
+            base,
+        ]
+        for payload in cases:
+            entries = _parse_commandcode_payload(
+                payload, _commandcode_subscription()["data"], "commandcode"
+            )
+            assert [e.label for e in entries] == ["5小时", "每周", "每月"]
 
     def test_plan_monthly_credits_longest_prefix(self) -> None:
         assert _plan_monthly_credits("individual-pro-v1") == 80.0

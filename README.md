@@ -63,13 +63,13 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 
 | 平台 | 方式 | 说明 |
 |------|------|------|
-| Kimi Code (Moonshot Coding Plan) | 自动 API | `GET /coding/v1/usages`，Bearer |
+| Kimi Code (Moonshot Coding Plan) | 自动 API | `GET /coding/v1/usages`，Bearer；`limits/usage` 绝对值 + 新版 `usages` 比例兜底 |
 | 火山方舟 Coding Plan | 自动 API | Volcengine OpenAPI `GetCodingPlanUsage`，AK/SK + V4 签名 |
 | 火山方舟 Agent Plan | 自动 API | Volcengine OpenAPI `GetAFPUsage`，AK/SK + V4 签名 |
 | Ollama Cloud | 自动 API | `GET /api/balance`，Bearer；legacy 计划 5小时/每周 百分比窗口，credits 计划每月 `$` 额度池 |
-| OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer |
-| ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口 |
-| Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 |
+| OpenCode Go | 自动 API | `GET /zen/go/v1/usage`，Bearer Console key；5小时/每周/每月 百分比窗口（Go/Plus/Teams 额度按模型不同） |
+| ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口；无订阅返回明确提示 |
+| Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 + 可选云端分钟 |
 | OpenDesign | 自动 API | `GET /api/v1/workspaces/current` + `/api/v1/workspaces/{id}/billing/preflight`，Bearer 控制密钥；credits 配额窗口 + 美元余额 |
 | Sub2API | 自动 API | `GET /v1/usage`，Bearer；读 `subscription` 出 每日/每周/每月 三行（旧版回退今日 `actual_cost`） |
 

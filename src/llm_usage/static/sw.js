@@ -1,6 +1,6 @@
 var CACHE_PREFIX = "llm-usage-";
-var CACHE = "llm-usage-v2";
-var SHELL = ["/", "/login", "/manifest.webmanifest",
+var CACHE = "llm-usage-v3";
+var SHELL = ["/", "/login", "/manifest.webmanifest", "/i18n.js", "/i18n.css",
              "/icons/icon-192.png", "/icons/icon-512.png"];
 
 self.addEventListener("install", function (e) {

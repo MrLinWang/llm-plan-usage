@@ -193,7 +193,19 @@
       <div class="head-nav">
         <a class="pill-btn" href="/">仪表盘</a>
         <a class="pill-btn" href="/config">供应商配置</a>
-        <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+        <div class="nav-menu">
+        <button id="more-menu-btn" class="pill-btn more-btn" type="button" title="更多选项" aria-label="更多选项" aria-controls="more-dropdown" aria-expanded="false">⋯</button>
+        <div id="more-dropdown" class="dropdown" role="menu" hidden>
+          <button id="theme-toggle" type="button" title="切换浅色/深色主题">浅色</button>
+          <div class="menu-separator"></div>
+          <button id="language-toggle" type="button" data-i18n="nav.language"
+                    aria-haspopup="menu" aria-expanded="false" aria-controls="language-submenu">语言</button>
+            <div id="language-submenu" class="submenu" role="menu" hidden>
+              <button type="button" data-lang="en" data-lang-label="English">English</button>
+              <button type="button" data-lang="zh-CN" data-lang-label="简体中文">简体中文</button>
+            </div>
+        </div>
+      </div>
       </div>
     </div>
   </div>
@@ -266,14 +278,7 @@ function syncThemeButton() {
   document.getElementById("theme-toggle").textContent = light ? "深色" : "浅色";
 }
 
-document.getElementById("theme-toggle").addEventListener("click", function () {
-  var light = document.documentElement.dataset.theme === "light";
-  var next = light ? "dark" : "light";
-  document.documentElement.dataset.theme = next;
-  try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
-  syncThemeButton();
-});
-syncThemeButton();
+// theme/menu/language are wired by /i18n.js
 
 // ---- 工具 ----
 var me = null;  // 当前登录用户名(用于隐藏自己行的删除按钮)

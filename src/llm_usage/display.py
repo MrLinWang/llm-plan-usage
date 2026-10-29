@@ -18,6 +18,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from llm_usage import i18n
 from llm_usage.models import PlatformResult, UsageEntry, compute_percent
 
 # Percent thresholds for color coding.
@@ -75,6 +76,7 @@ def _fmt_value(value: float | None, unit: str) -> str:
         return f"{value:g}%"
     if unit == "tokens":
         return f"{value:g} tokens"
+    unit = i18n.translate_unit(unit)
     if float(value).is_integer():
         return f"{int(value)} {unit}".strip()
     return f"{value:g} {unit}".strip()
@@ -102,7 +104,11 @@ def _pad(s: str, width: int, align: str) -> str:
 def _make_header() -> Text:
     """Build the column header line."""
     parts: list[tuple[str, str]] = []
-    for i, (_, header, width, align) in enumerate(COLS):
+    for i, (key, header, width, align) in enumerate(COLS):
+        if key in ("platform", "plan", "percent", "time"):
+            header = i18n.t(f"display.{key}")
+        else:
+            header = i18n.translate_text(header)
         parts.append((_pad(header, width, align), "bold dim"))
         if i < N_COLS - 1:
             parts.append((" " * COL_GAP, "bold dim"))
@@ -161,15 +167,15 @@ def _fmt_countdown(
     now = now or datetime.now(timezone.utc)
     secs = int((dt - now).total_seconds())
     if secs <= 0:
-        return "已到期" if kind == "expires" else "已重置"
+        return i18n.translate_text("已到期" if kind == "expires" else "已重置")
     days, rem = divmod(secs, 86400)
     hours, rem = divmod(rem, 3600)
     minutes = rem // 60
     if days:
-        return f"{days}天{hours}小时"
+        return i18n.translate_text(f"{days}天{hours}小时")
     if hours:
-        return f"{hours}小时{minutes}分"
-    return f"{minutes}分"
+        return i18n.translate_text(f"{hours}小时{minutes}分")
+    return i18n.translate_text(f"{minutes}分")
 
 
 def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status: str) -> Text:
@@ -191,7 +197,7 @@ def _make_data_line(entry: UsageEntry, is_first: bool, display_name: str, status
     reset = _to_local_time(entry.reset_at) or "-"
     countdown = _fmt_countdown(entry.reset_at, kind=entry.reset_kind)
 
-    label = "余额用量" if entry.label == "余额" else entry.label
+    label = i18n.translate_label("余额用量" if entry.label == "余额" else entry.label)
     values = [name, label, used, limit, remaining, reset, countdown, status]
     styles = ["bold" if is_first else "", "", "", "", "", "dim", "dim", ""]
     parts: list[tuple[str, str]] = []
@@ -246,7 +252,7 @@ def _make_error_line(display_name: str, error: str) -> Text:
     name = _pad(display_name, PLATFORM_W, "left")
     return Text.assemble(
         (name, "bold red"),
-        (error, "red"),
+        (i18n.translate_message(error), "red"),
     )
 
 
@@ -269,12 +275,12 @@ def build_overview(results: list[PlatformResult], width: int | None = None) -> P
             continue
         if not res.entries:
             name = _pad(res.display_name, PLATFORM_W, "left")
-            lines.append(Text.assemble((name, "bold"), ("无数据", "dim")))
+            lines.append(Text.assemble((name, "bold"), (i18n.t("common.no_data"), "dim")))
             continue
 
         if res.warning:
-            lines.append(Text.assemble((" " * (PLATFORM_W + COL_GAP), ""),
-                                        (f"提示：{res.warning}", "yellow")))
+            warning = f"{i18n.t('common.warning')}: {i18n.translate_message(res.warning)}"
+            lines.append(Text.assemble((" " * (PLATFORM_W + COL_GAP), ""), (warning, "yellow")))
 
         prev_plan: str | None = None
         for i, entry in enumerate(res.entries):
@@ -286,7 +292,7 @@ def build_overview(results: list[PlatformResult], width: int | None = None) -> P
             lines.append(_make_bar_line(entry.percent))
             prev_plan = entry.plan
 
-    title = f"LLM 用量总览 ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+    title = f"{i18n.t('dashboard.title')} ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
     return Panel(Group(*lines), title=title, border_style="cyan")
 
 
@@ -318,12 +324,12 @@ def render_key_breakdown(results: list[PlatformResult], console: Console | None 
                     status = "[green]OK[/green]"
                 else:
                     used = "-"
-                    error = item.get("error") or "失败"
+                    error = i18n.translate_message(item.get("error") or "失败")
                     status = f"[red]{error}[/red]"
                 table.add_row(number, name, used, status)
             console.print(table)
     if not any_rows:
-        console.print("[dim]没有多 Key 分组的用量明细[/dim]")
+        console.print(f"[dim]{i18n.t('display.no_breakdown')}[/dim]")
 
 
 def render_results(
@@ -341,15 +347,26 @@ def render_results(
     console.print(build_overview(results, width=TOTAL_WIDTH + 4))
 
 
-def results_to_dict(results: list[PlatformResult]) -> dict[str, Any]:
-    """Serialize results to a plain dict (web API + JSON output share this shape)."""
+def results_to_dict(
+    results: list[PlatformResult], *, localize_errors: bool = False
+) -> dict[str, Any]:
+    """Serialize results to a plain dict (web API + JSON output share this shape).
+
+    Labels/units stay canonical for the web dashboard's period/balance logic;
+    ``localize_errors`` localizes provider error/warning text for Web display.
+    """
+    def _msg(value: str | None) -> str | None:
+        if value is None or not localize_errors:
+            return value
+        return i18n.translate_message(value)
+
     return {
         "platforms": [
             {
                 "name": res.platform,
                 "display_name": res.display_name,
-                "error": res.error,
-                "warning": res.warning,
+                "error": _msg(res.error),
+                "warning": _msg(res.warning),
                 "entries": [
                     {
                         "label": e.label,
@@ -362,7 +379,16 @@ def results_to_dict(results: list[PlatformResult]) -> dict[str, Any]:
                         "unit": e.unit,
                         "is_manual": e.is_manual,
                         "plan": e.plan,
-                        "key_breakdown": e.key_breakdown,
+                        "key_breakdown": (
+                            [
+                                {
+                                    **item,
+                                    "error": _msg(item.get("error")),
+                                }
+                                for item in e.key_breakdown
+                            ]
+                            if e.key_breakdown else e.key_breakdown
+                        ),
                     }
                     for e in res.entries
                 ],
@@ -381,18 +407,18 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
     """Render snapshot rows with progress bars."""
     console = console or Console()
     if not rows:
-        console.print("[yellow]无历史记录[/yellow]")
+        console.print(f"[yellow]{i18n.t('display.no_history')}[/yellow]")
         return
 
-    table = Table(title="LLM 用量历史")
-    table.add_column("时间", style="dim")
-    table.add_column("平台")
-    table.add_column("套餐")
-    table.add_column("窗口")
-    table.add_column("已用", justify="right")
-    table.add_column("限额", justify="right")
-    table.add_column("剩余", justify="right")
-    table.add_column("百分比", justify="right")
+    table = Table(title=i18n.t('display.history_title'))
+    table.add_column(i18n.t("display.time"), style="dim")
+    table.add_column(i18n.t("display.platform"))
+    table.add_column(i18n.t("display.plan"))
+    table.add_column(i18n.t("dashboard.window"))
+    table.add_column(i18n.t("dashboard.used"), justify="right")
+    table.add_column(i18n.t("dashboard.limit"), justify="right")
+    table.add_column(i18n.t("dashboard.remaining"), justify="right")
+    table.add_column(i18n.t("display.percent"), justify="right")
 
     for r in reversed(rows):
         ts = _to_local_time(str(r.get("ts", ""))) or ""
@@ -419,7 +445,7 @@ def render_history(rows: list[dict[str, Any]], console: Console | None = None) -
             ts,
             str(r.get("platform", "")),
             str(r.get("plan") or "-"),
-            "余额用量" if label == "余额" else label,
+            i18n.translate_label("余额用量" if label == "余额" else label),
             used_str,
             limit_str,
             remaining_str,

@@ -1,16 +1,17 @@
 # llm-usage configuration
-# 每个供应商只写一个 [platforms.<type>] 表:平台设置与 accounts 账号列表都在表内,
-# 不再使用 [[platforms.<type>.accounts]] 子表。accounts 写成数组,一个账号一行。
-# 账号 name 可选;凭证使用 env:VARNAME 引用环境变量,也可直接填写密钥。
-# 旧顶层凭证、credentials、groups 与子表格式仍可读取,保存时统一为本格式。
+# Each provider uses exactly one [platforms.<type>] table: platform settings and
+# the accounts list live in the same table (no [[platforms.<type>.accounts]] child table).
+# accounts is an array with one account per line. name is optional.
+# Credentials may use env:VARNAME or literal secrets. Legacy top-level credentials,
+# credentials, groups and child-table forms are still readable and are normalized on save.
 
-# 平台显示顺序(可选):
+# Optional platform display order:
 # platform_order = [
 #     "kimi", "volcengine-coding", "volcengine-agent", "ollama",
 #     "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
 # ]
-# 自动重试:首次失败后的额外尝试次数,默认 3;0 关闭,最多 10。
-# 仅重试网络错误、HTTP 408/429/5xx 等瞬时故障,指数退避 0.5s→1s→2s。
+# Automatic retry: extra attempts after the first failure, default 3; 0 disables, max 10.
+# Only transient failures are retried with exponential backoff 0.5s → 1s → 2s.
 # max_retries = 3
 
 [platforms.kimi]
@@ -26,7 +27,7 @@ plan_type = "coding"
 tier = "pro"  # lite | pro
 # limits = { session = 6000, weekly = 45000, monthly = 90000 }
 accounts = [
-    # 火山使用 AccessKey/SecretKey + V4 签名,不是 Bearer API key。
+    # Volcengine uses AccessKey/SecretKey + V4 signing, not a Bearer API key.
     { access_key = "env:VOLCENGINE_ACCESS_KEY", secret_key = "env:VOLCENGINE_SECRET_KEY" },
 ]
 
@@ -66,20 +67,20 @@ accounts = [
 [platforms.opendesign]
 enabled = true
 base_url = "https://amr-link.open-design.ai/v1"
-# 模型服务地址会自动映射到 OpenDesign 官方用量接口。
-# workspace_id = "工作区 ID"  # 可选;默认当前工作区
-# max_balance = 100  # 可选;美元余额用量的显示上限,0/未设置时不显示进度条
+# The model service URL is mapped to OpenDesign's control-plane usage API.
+# workspace_id = "workspace ID"  # optional; defaults to the current workspace
+# max_balance = 100  # optional display scale for the USD balance; 0/unset hides the bar
 accounts = [
-    # 也可通过 Web「供应商配置」中的网页登录授权自动保存。
-    { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_,非 sk-amr- 模型密钥
+    # Web "Provider configuration" can also save this through browser login authorization.
+    { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_, not an sk-amr- model key
 ]
 
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
 accounts = [
-    # 一个账号对应一组共享额度的 Key;增加 Key 不增加账号。
-    # 账号内可加 daily_limit = 100,覆盖面板日报额度(不影响周/月额度)。
-    # api_keys 每项可写名字:{ name = "主 Key", value = "env:SUB2API_API_KEY" }。
-    { name = "组1", api_keys = ["env:SUB2API_API_KEY"] },
+    # One account is one shared-quota key group; adding keys does not add an account.
+    # daily_limit = 100 overrides the panel daily quota (weekly/monthly are unaffected).
+    # api_keys entries may be named: { name = "Primary", value = "env:SUB2API_API_KEY" }.
+    { name = "Group 1", api_keys = ["env:SUB2API_API_KEY"] },
 ]

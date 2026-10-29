@@ -10,7 +10,7 @@ RUN useradd --create-home --uid 1000 app \
     && chown app:app /data
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 RUN pip install --no-cache-dir ".[web]"
 

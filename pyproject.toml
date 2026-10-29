@@ -28,7 +28,7 @@ llm-usage = "llm_usage.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-llm_usage = ["static/*.html", "static/*.js", "static/*.webmanifest", "static/icons/*.png"]
+llm_usage = ["static/*.html", "static/*.js", "static/*.css", "static/*.webmanifest", "static/icons/*.png", "locales/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

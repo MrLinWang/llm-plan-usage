@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# CI passes the source commit for the About panel.
+ARG LLM_USAGE_COMMIT
+
 # tzdata：让 -e TZ=Asia/Shanghai 生效（Web/终端显示按容器本地时区转换 UTC 时间戳）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
@@ -18,6 +21,7 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENV LLM_USAGE_CONFIG=/data/config.toml \
     LLM_USAGE_DB=/data/history.db \
+    LLM_USAGE_COMMIT=${LLM_USAGE_COMMIT} \
     PORT=8765
 
 EXPOSE 8765

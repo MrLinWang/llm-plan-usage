@@ -861,7 +861,8 @@ function setAboutOpen(open) {
         if (!r.ok) throw new Error("HTTP " + r.status);
         return r.json();
       }).then(function (data) {
-        aboutVersionEl.textContent = "v" + data.version;
+        aboutVersionEl.textContent = "v" + data.version
+          + (data.commit ? " (" + data.commit + ")" : "");
         renderAboutLog(data.changelog, data.version);
       }).catch(function () {
         aboutVersionEl.textContent = "未知";  // 取不到版本不阻断面板

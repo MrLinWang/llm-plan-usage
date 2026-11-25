@@ -176,6 +176,9 @@
     "添加组": "Add group",
     "添加供应商": "Add provider",
     "导入 config.toml": "Import config.toml",
+    "导出 config.toml": "Export config.toml",
+    "下载完整的 config.toml，可能含明文凭证，仅管理员可用": "Download the complete config.toml. Admins only. The file may contain plaintext credentials.",
+    "已导出 config.toml（可能含明文凭证，请妥善保管）": "Exported config.toml. Keep it secure as it may contain plaintext credentials.",
     "网页登录授权": "Web login authorization",
     "取消授权": "Cancel authorization",
     "打开 OpenDesign 登录并授权 ↗": "Open OpenDesign login and authorize ↗",
@@ -384,6 +387,8 @@
     "不能删除当前登录用户": "You cannot delete the currently signed-in user",
     "至少保留一个管理员": "At least one admin is required",
     "系统只存在一个管理员：不能创建新的管理员账号": "The system supports only one admin; cannot create another admin",
+    "config.toml 不存在": "config.toml does not exist",
+    "无法读取 config.toml": "Could not read config.toml",
     "配置文件不存在，请先运行 llm-usage config --init": "Config file does not exist; run `llm-usage config --init` first",
     "未配置任何平台。运行 `llm-usage config --init` 生成模板。": "No platforms configured. Run `llm-usage config --init` to generate a template."
   }

@@ -37,6 +37,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from llm_usage import i18n, store
 from llm_usage.changelog import changelog
 from llm_usage.config import (
+    config_path,
     get_platform_config,
     get_platform_order,
     load_config,
@@ -69,7 +70,7 @@ from llm_usage.providers import (
     split_instance_key,
 )
 from llm_usage.providers.opendesign import parse_max_balance
-from llm_usage.version import app_version
+from llm_usage.version import app_commit, app_version
 
 logger = logging.getLogger(__name__)
 
@@ -1286,8 +1287,12 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
     def app_version_endpoint(
         user: dict[str, Any] = Depends(api_user),
     ) -> dict[str, Any]:
-        """版本号与更新日志(仪表盘「关于」面板)。需要登录,与其它 /api/* 一样不缓存。"""
-        return {"version": app_version(), "changelog": changelog()}
+        """为「关于」面板返回版本号、短提交 SHA 和更新日志。"""
+        return {
+            "version": app_version(),
+            "commit": app_commit(),
+            "changelog": changelog(),
+        }
 
     # ---- 用户管理 API ----
     # GET 放开到任意登录用户(普通用户配置页需要共享目标列表);写操作保持管理员。
@@ -1855,6 +1860,21 @@ def create_app(config: dict[str, Any], interval: float = 60.0) -> FastAPI:
         imported = _parse_import_body(body)
         save_config(imported)
         return _import_summary(imported)
+
+    @app.get("/api/config/export", dependencies=[Depends(api_admin)])
+    def config_export() -> Response:
+        """下载管理员配置的原始字节，保留注释、格式和凭证。"""
+        try:
+            content = config_path().read_bytes()
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="config.toml 不存在") from None
+        except OSError:
+            raise HTTPException(status_code=500, detail="无法读取 config.toml") from None
+        return Response(
+            content=content,
+            media_type="application/toml; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="config.toml"'},
+        )
 
     @app.delete("/api/config/platforms/{key}")
     def config_delete_provider(

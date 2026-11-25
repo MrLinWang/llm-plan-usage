@@ -219,6 +219,7 @@
   .add-provider {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
     grid-column: 1 / -1;
   }
@@ -1265,6 +1266,32 @@ async function buildAddProviderRow(isAdmin) {
   });
   row.appendChild(importBtn);
   row.appendChild(fileInput);
+  if (isAdmin) {
+    var exportBtn = el("button", "btn", "导出 config.toml");
+    exportBtn.type = "button";
+    exportBtn.title = "下载完整的 config.toml，可能含明文凭证，仅管理员可用";
+    exportBtn.addEventListener("click", async function () {
+      exportBtn.disabled = true;
+      try {
+        var r = await api("/api/config/export");
+        if (!r.ok) { statusEl.textContent = "导出失败: " + (await detailOf(r)); return; }
+        var url = URL.createObjectURL(await r.blob());
+        var link = document.createElement("a");
+        link.href = url;
+        link.download = "config.toml";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        statusEl.textContent = "已导出 config.toml（可能含明文凭证，请妥善保管）";
+      } catch (e) {
+        if (e && e.message !== "未登录") statusEl.textContent = String(e.message || e);
+      } finally {
+        exportBtn.disabled = false;
+      }
+    });
+    row.appendChild(exportBtn);
+  }
   try {
     var r = await api("/api/provider-types");
     if (!r.ok) throw new Error(await detailOf(r));

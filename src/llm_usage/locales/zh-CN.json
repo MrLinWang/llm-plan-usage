@@ -176,6 +176,9 @@
     "添加组": "添加组",
     "添加供应商": "添加供应商",
     "导入 config.toml": "导入 config.toml",
+    "导出 config.toml": "导出 config.toml",
+    "下载完整的 config.toml，可能含明文凭证，仅管理员可用": "下载完整的 config.toml，可能含明文凭证，仅管理员可用",
+    "已导出 config.toml（可能含明文凭证，请妥善保管）": "已导出 config.toml（可能含明文凭证，请妥善保管）",
     "网页登录授权": "网页登录授权",
     "取消授权": "取消授权",
     "打开 OpenDesign 登录并授权 ↗": "打开 OpenDesign 登录并授权 ↗",
@@ -384,6 +387,8 @@
     "不能删除当前登录用户": "不能删除当前登录用户",
     "至少保留一个管理员": "至少保留一个管理员",
     "系统只存在一个管理员：不能创建新的管理员账号": "系统只存在一个管理员：不能创建新的管理员账号",
+    "config.toml 不存在": "config.toml 不存在",
+    "无法读取 config.toml": "无法读取 config.toml",
     "配置文件不存在，请先运行 llm-usage config --init": "配置文件不存在，请先运行 llm-usage config --init",
     "未配置任何平台。运行 `llm-usage config --init` 生成模板。": "未配置任何平台。运行 `llm-usage config --init` 生成模板。"
   }

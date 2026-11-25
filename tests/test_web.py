@@ -224,18 +224,20 @@ class TestWeb:
 
 
 class TestVersionEndpoint:
-    """「关于」面板:版本号取包内 __version__,更新日志取自包内 changelog 模块。"""
+    """「关于」面板读取版本号、短提交 SHA 和发布日志。"""
 
     def test_version_endpoint_returns_package_version_and_changelog(
         self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path
     ) -> None:
         import llm_usage
 
+        monkeypatch.setattr("llm_usage.web.app_commit", lambda: "1234567")
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         resp = client.get("/api/version")
         assert resp.status_code == 200
         data = resp.json()
         assert data["version"] == llm_usage.__version__
+        assert data["commit"] == "1234567"
         assert isinstance(data["changelog"], list) and data["changelog"]
         # 面板显示 vX.Y.Z 时日志最高必须也是 X.Y.Z,否则会出现「版本更高但无记录」
         assert data["changelog"][0]["version"] == data["version"]
@@ -257,6 +259,13 @@ class TestVersionEndpoint:
 
         monkeypatch.setattr(version_mod, "distribution_version", lambda _name: "0.0.0-stale")
         assert version_mod.app_version() == llm_usage.__version__
+
+    def test_about_displays_a_short_commit_after_the_version(self) -> None:
+        """关于面板使用接口中的独立 commit 字段，而非拼进版本号。"""
+        html = Path(__file__).resolve().parents[1].joinpath(
+            "src", "llm_usage", "static", "index.html"
+        ).read_text(encoding="utf-8")
+        assert '(data.commit ? " (" + data.commit + ")" : "")' in html
 
     def test_app_version_falls_back_to_metadata_without_package_version(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1483,6 +1492,58 @@ api_key = "sk-ollama-imported"
         client, _ = _auth_client(monkeypatch, tmp_db_path)
         html = client.get("/config").text
         assert "导入 config.toml" in html
+
+
+class TestConfigExport:
+    """管理员可导出原始 config.toml；接口不得向普通用户泄露凭证。"""
+
+    def test_admin_exports_original_bytes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        original = (
+            "# 凭证示例\r\n"
+            "[platforms.kimi]\r\n"
+            'accounts = [{api_key = "synthetic-test-value"}, {api_key = "env:KIMI_API_KEY"}]\r\n'
+        ).encode()
+        tmp_config_path.write_bytes(original)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        response = client.get("/api/config/export")
+        assert response.status_code == 200
+        assert response.content == original
+        assert response.headers["Content-Disposition"] == 'attachment; filename="config.toml"'
+        assert response.headers["Content-Type"].startswith("application/toml")
+        assert response.headers["Cache-Control"] == "no-store"
+
+    def test_export_requires_admin_and_existing_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        init_config(tmp_config_path)
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        anonymous = TestClient(client.app)
+        assert anonymous.get("/api/config/export").status_code == 401
+        alice, _ = _auth_client(
+            monkeypatch, tmp_db_path, username="alice", admin=False
+        )
+        assert alice.get("/api/config/export").status_code == 403
+        tmp_config_path.unlink()
+        missing = client.get("/api/config/export?lang=en")
+        assert missing.status_code == 404
+        assert missing.json() == {"detail": "config.toml does not exist"}
+        tmp_config_path.mkdir()
+        unreadable = client.get("/api/config/export?lang=en")
+        assert unreadable.status_code == 500
+        assert unreadable.json() == {"detail": "Could not read config.toml"}
+
+    def test_config_page_has_admin_only_export_hook(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_db_path: Path,
+    ) -> None:
+        client, _ = _auth_client(monkeypatch, tmp_db_path)
+        html = client.get("/config").text
+        assert 'if (isAdmin) {\n    var exportBtn = el("button", "btn", ' in html
+        assert '"导出 config.toml");' in html
+        assert '/api/config/export' in html
 
 
 class TestRegistration:

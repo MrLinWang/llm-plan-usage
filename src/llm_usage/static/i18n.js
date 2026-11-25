@@ -61,6 +61,7 @@
       [/^已导入 (.*)$/, "Imported $1"],
       [/^添加失败: (.*)$/, "Add failed: $1"],
       [/^导入失败: (.*)$/, "Import failed: $1"],
+      [/^导出失败: (.*)$/, "Export failed: $1"],
       [/^顺序保存失败: (.*)$/, "Failed to save order: $1"],
       [/^设置刷新间隔失败: (.*)$/, "Failed to set refresh interval: $1"],
       [/^网络错误: (.*)$/, "Network error: $1"],

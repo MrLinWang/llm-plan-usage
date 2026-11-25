@@ -340,6 +340,7 @@
   "labels": {
     "5小时": "5 hours",
     "每周": "Weekly",
+    "每周（高级模型）": "Weekly (premium models)",
     "每月": "Monthly",
     "每日": "Daily",
     "余额用量": "Balance",
@@ -367,6 +368,7 @@
     "响应不是有效 JSON": "Response is not valid JSON",
     "无订阅或未找到用量数据": "No subscription or usage data",
     "无 ClinePass 订阅": "No ClinePass subscription",
+    "无 DevPass 订阅": "No DevPass subscription",
     "未订阅 OpenCode Go": "OpenCode Go subscription required",
     "API key 已过期，请在 OpenCode Console 重新生成": "API key expired; regenerate it in OpenCode Console",
     "已启用共享额度分组模式，但未配置任何分组": "Shared-quota group mode is enabled but no groups are configured",

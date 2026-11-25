@@ -5,6 +5,7 @@ All live providers are exercised with ``httpx.MockTransport`` (no network):
   - Volcengine: OpenAPI V4 signing, GetCodingPlanUsage (percent-only) + GetAFPUsage
   - Ollama: dual-shape /api/balance parsing (legacy windows + credits pool)
   - OpenCode Go / ClinePass / Command Code: window parsing + neutral errors
+  - DevPass: monthly, daily and premium weekly USD allowances
   - Sub2API: ``actual_cost`` extraction, groups, sanitized per-key errors
   - Registry: dispatch, credential fan-out, instance keys, error isolation
 """
@@ -1494,7 +1495,7 @@ class TestRegistry:
     def test_all_providers_registered(self) -> None:
         assert set(PROVIDERS.keys()) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
         }
 
     def test_env_prefix_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:

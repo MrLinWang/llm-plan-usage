@@ -28,6 +28,7 @@ class TestConfigInit:
         assert "[platforms.ollama]" in text
         assert "[platforms.opencode-go]" in text
         assert "[platforms.opendesign]" in text
+        assert "[platforms.devpass]" in text
         assert "[platforms.sub2api]" in text
         # 每个供应商只有一个表,accounts 写在表内,不使用子表
         assert "accounts = [" in text
@@ -94,7 +95,7 @@ class TestConfigLoadSave:
         assert C.to_runtime_config(tomllib.loads(text)) == original
 
     def test_every_provider_keeps_accounts_in_its_own_platform_table(self) -> None:
-        """9 个供应商(含实例)都只占一个表:无子表头,accounts 在表内。"""
+        """10 个供应商(含实例)都只占一个表:无子表头,accounts 在表内。"""
         original = {"platforms": {
             "kimi": {"enabled": True, "api_key": "env:KIMI"},
             "kimi#2": {"enabled": False, "credentials": [
@@ -113,6 +114,7 @@ class TestConfigLoadSave:
             "commandcode": {"api_key": "env:COMMAND"},
             "opendesign": {"enabled": True, "max_balance": 300,
                            "credentials": [{"name": "套餐1", "control_key": "vela_ctrl_x"}]},
+            "devpass": {"enabled": True, "api_key": "env:DEVPASS_API_KEY"},
             "sub2api": {"enabled": True, "base_url": "https://g.test", "groups": [
                 {"name": "组A", "api_keys": ["k1", "k2"]},
                 {"name": "组B", "daily_limit": 20, "api_keys": [

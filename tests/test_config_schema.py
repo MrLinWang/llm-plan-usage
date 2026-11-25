@@ -26,6 +26,7 @@ def _config(section: dict[str, Any], provider: str = "kimi") -> dict[str, Any]:
     ("clinepass", {"api_key": "cline-example"}),
     ("commandcode", {"api_key": "command-example"}),
     ("opendesign", {"control_key": "env:CONTROL_KEY", "api_key": "sk-amr-example"}),
+    ("devpass", {"api_key": "env:DEVPASS_API_KEY"}),
 ])
 def test_single_credentials_use_the_same_accounts_shape(provider, credentials) -> None:
     runtime = _config({

@@ -79,9 +79,10 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 | ClinePass | 自动 API | `GET /api/v1/users/me/plan/usage-limits`，Bearer；5小时/每周/每月 百分比窗口；无订阅返回明确提示 |
 | Command Code | 自动 API | `GET /alpha/billing/credits` + `/subscriptions`，Bearer；5小时/每周 `$` 窗口 + 每月额度 + 可选云端分钟 |
 | OpenDesign | 自动 API | `GET /api/v1/workspaces/current` + `/api/v1/workspaces/{id}/billing/preflight`，Bearer 控制密钥；credits 配额窗口 + 美元余额 |
+| DevPass | 自动 API | `GET https://api.llmgateway.io/v1/key`，Bearer；每月额度 + 每日限额 + 高级模型每周额度（美元） |
 | Sub2API | 自动 API | `GET /v1/usage`，Bearer；读 `subscription` 出 每日/每周/每月 三行（旧版回退今日 `actual_cost`） |
 
-以上 9 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
+以上 10 类为内置平台键；每类还可添加多个**独立实例**（多账号卡片，键形如
 `kimi#2`），见下方「同类型供应商实例」。
 
 ## 配置
@@ -93,7 +94,7 @@ docker run -d --name llm-usage -p 8765:8765 -v llm-usage-data:/data \
 
 所有供应商统一使用「一个供应商一个表」：平台设置和 `accounts` 账号列表都写在
 **同一个** `[platforms.供应商]` 表里，不再拆出 `[[platforms.供应商.accounts]]` 子表。
-九种供应商（含 Sub2API 的多个共享 Key 组、`kimi#2` 这类实例）版式完全一致：
+十种供应商（含 Sub2API 的多个共享 Key 组、`kimi#2` 这类实例）版式完全一致：
 
 ```toml
 [platforms.kimi]
@@ -120,10 +121,15 @@ accounts = [
 ]
 ```
 
+DevPass 使用常规 LLM Gateway API Key（`llmgtwy_...`），在 `[platforms.devpass]`
+的 `accounts` 中填写 `api_key`；`base_url` 默认为 `https://api.llmgateway.io`。
+接口文档：https://docs.llmgateway.io/developers/devpass-usage 。非 DevPass 的按量
+付费 Key 会显示「无 DevPass 订阅」。
+
 - `[platforms.供应商]`：`enabled`、`display_name`、`base_url`、`tier`、`limits`、
   `max_balance` 等平台设置，以及 `accounts` 数组。
 - `accounts` 数组：每项一个账号，**一项一行**。`name` 可选，凭证按供应商取
-  `api_key`（kimi / ollama / opencode-go / clinepass / commandcode）、`control_key`
+  `api_key`（kimi / ollama / opencode-go / clinepass / commandcode / DevPass）、`control_key`
   （OpenDesign）或 `access_key` + `secret_key`（火山）。Sub2API 的一个账号对应
   一个共享 Key 组，使用 `name`、可选 `daily_limit` 和 `api_keys`；`api_keys` 每项
   可以是密钥字符串，也可以是带名字的 `{ name = "主 Key", value = "sk-…" }`。
@@ -264,7 +270,7 @@ accounts = [
 `groups` 列表仍可读取；Web 端会把当前生效的配置当作账号分组展示，
 保存时统一迁移为 `accounts`。新配置不需要设置 `use_groups`。
 
-### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass / commandcode / opendesign）
+### 多计费套餐（kimi / 火山 ×2 / ollama / opencode-go / clinepass / commandcode / opendesign / devpass）
 
 除 Sub2API 外，其余平台也支持**多凭证**：同一平台下不同凭证 = 该供应商的
 **不同计费套餐**。每个凭证彼此完全独立——各自 fetch、各自展示、无共享限额、
@@ -274,7 +280,7 @@ accounts = [
 `name = "套餐1"`）与旧的顶层单 Key 形态展示完全一致；两个及以上凭证才按
 套餐分区。
 
-Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass/commandcode 为
+Web「供应商配置」页每个平台默认一个凭证槽（kimi/ollama/opencode-go/clinepass/commandcode/devpass 为
 `api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`），点「添加凭证」
 （火山为「添加 AK/SK」）即可增加新套餐；「套餐名」留空时服务端自动命名
 `套餐1`、`套餐2`…。凭证值留空 = 保留已保存的值；保存后统一写回平台表内的
@@ -443,8 +449,8 @@ PBKDF2-SHA256（60 万次迭代、随机盐）哈希存储，不落明文；站�
 ### 供应商配置
 
 管理员在「供应商配置」页可直接编辑各平台的启用开关与凭证
-（kimi/ollama/opencode-go/clinepass/commandcode 为 `api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`；
-sub2api 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode/opendesign
+（kimi/ollama/opencode-go/clinepass/commandcode/devpass 为 `api_key`；OpenDesign 为 `control_key`；火山两个平台为 `access_key` + `secret_key`；
+sub2api 无顶层凭证字段，改为分组配置）。kimi/火山×2/ollama/opencode-go/clinepass/commandcode/opendesign/devpass
 以**凭证槽**为单位编辑：每个槽 = 一个独立计费套餐（「套餐名」可选，留空自动
 命名 `套餐N`），槽内一个凭证输入框（火山为 AK+SK 两个），点「添加凭证」
 （火山「添加 AK/SK」）追加新套餐槽。Sub2API 以**组**为单位编辑：
@@ -478,7 +484,7 @@ Sub2API **一键导入 config.toml**：添加栏旁的「导入 config.toml」�
 卡片；新实例默认**停用**，配好凭证后再勾选启用。管理员添加写入
 `./config.toml`（`POST /api/config/providers`），普通用户写入自己的
 `user_configs`（`POST /api/my/providers`）。删除走卡片上的「删除此供应商」
-按钮（确认框），该实例的共享设置一并级联移除；内置的 9 个基础平台不可删除。
+按钮（确认框），该实例的共享设置一并级联移除；内置的 10 个基础平台不可删除。
 实例编号单调递增不复用（删除 `kimi#2` 后再添加得到 `kimi#3`），避免历史快照
 歧义。终端侧无需配置：实例随所在平台的配置自动抓取并显示。
 

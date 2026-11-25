@@ -23,6 +23,7 @@ from llm_usage.platform_keys import canonical_platform_key, normalize_platform_c
 from llm_usage.providers.base import Provider
 from llm_usage.providers.clinepass import ClinePassProvider
 from llm_usage.providers.commandcode import CommandCodeProvider
+from llm_usage.providers.devpass import DevPassProvider
 from llm_usage.providers.kimi import KimiProvider
 from llm_usage.providers.ollama import OllamaProvider
 from llm_usage.providers.opencode_go import OpenCodeGoProvider
@@ -71,6 +72,7 @@ PROVIDERS: dict[str, Provider] = {
     "clinepass": ClinePassProvider(),
     "commandcode": CommandCodeProvider(),
     "opendesign": OpenDesignProvider(),
+    "devpass": DevPassProvider(),
     "sub2api": Sub2ApiProvider(),
 }
 
@@ -155,6 +157,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "clinepass": "ClinePass",
     "commandcode": "Command Code",
     "opendesign": "OpenDesign",
+    "devpass": "DevPass",
     "sub2api": "Sub2API",
 }
 

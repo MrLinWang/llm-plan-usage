@@ -88,6 +88,7 @@ CREDENTIAL_FIELDS: dict[str, list[str]] = {
     "clinepass": ["api_key"],
     "commandcode": ["api_key"],
     "opendesign": ["control_key"],
+    "devpass": ["api_key"],
     "sub2api": [],  # 纯组式:凭证以 groups[].api_keys 配置,无顶层凭证字段
 }
 

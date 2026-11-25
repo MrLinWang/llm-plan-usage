@@ -1325,7 +1325,7 @@ class TestWebConfig:
         assert calls[0] == 1
         new_order = [
             "opencode-go", "ollama", "volcengine-agent", "volcengine-coding", "kimi",
-            "clinepass", "commandcode", "opendesign", "sub2api",
+            "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
         ]
         resp = client.put("/api/config/order", json={"order": new_order})
         assert resp.status_code == 200
@@ -1352,7 +1352,7 @@ class TestWebConfig:
         assert resp.status_code == 200
         assert resp.json()["order"] == [
             "ollama", "kimi", "volcengine-coding", "volcengine-agent", "opencode-go",
-            "clinepass", "commandcode", "opendesign", "sub2api",
+            "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
         ]
 
 class TestConfigImport:
@@ -1800,7 +1800,7 @@ class TestUserIsolation:
         admin_names = [p["name"] for p in client.get("/api/usage").json()["platforms"]]
         assert set(admin_names) == {
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
         }
         assert calls[0] == 2  # alice 空配置 + admin 配置,各自缓存条目
 
@@ -2171,7 +2171,7 @@ class TestUserIsolation:
         keys = [p["key"] for p in data["platforms"]]
         assert keys == [
             "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-            "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
+            "opencode-go", "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
         ]
         for p in data["platforms"]:
             assert p["visibility"] == {"type": "private", "targets": []}
@@ -2184,7 +2184,7 @@ class TestUserIsolation:
                 assert p["groups"] == []  # 无凭证/无 legacy 单 key → 空组列表
             elif p["key"] in ("kimi", "volcengine-coding", "volcengine-agent",
                               "ollama", "opencode-go", "clinepass",
-                              "commandcode", "opendesign"):
+                              "commandcode", "opendesign", "devpass"):
                 expected_fields = {
                     "key", "type", "display_name", "enabled", "visibility",
                     "credential_slots",
@@ -3083,7 +3083,7 @@ class TestProviderInstances:
         client.post("/api/config/providers", json={"type": "kimi"})
         order = ["kimi#2", "kimi", "volcengine-coding", "volcengine-agent",
                  "ollama", "opencode-go", "clinepass", "commandcode", "opendesign",
-                 "sub2api"]
+                 "devpass", "sub2api"]
         resp = client.put("/api/config/order", json={"order": order})
         assert resp.status_code == 200
         assert resp.json()["order"] == order  # 实例键不被过滤

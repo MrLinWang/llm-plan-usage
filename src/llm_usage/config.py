@@ -260,7 +260,7 @@ EXAMPLE_CONFIG = """\
 # Optional platform display order:
 # platform_order = [
 #     "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-#     "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
+#     "opencode-go", "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
 # ]
 # Automatic retry: extra attempts after the first failure, default 3; 0 disables, max 10.
 # Only transient failures are retried with exponential backoff 0.5s → 1s → 2s.
@@ -327,6 +327,13 @@ accounts = [
     { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_, not an sk-amr- model key
 ]
 
+[platforms.devpass]
+enabled = true
+base_url = "https://api.llmgateway.io"
+accounts = [
+    { api_key = "env:DEVPASS_API_KEY" },
+]
+
 [platforms.sub2api]
 enabled = true
 base_url = "http://127.0.0.1:18080"
@@ -349,7 +356,7 @@ EXAMPLE_CONFIG_ZH = """\
 # 平台显示顺序(可选):
 # platform_order = [
 #     "kimi", "volcengine-coding", "volcengine-agent", "ollama",
-#     "opencode-go", "clinepass", "commandcode", "opendesign", "sub2api",
+#     "opencode-go", "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
 # ]
 # 自动重试:首次失败后的额外尝试次数,默认 3;0 关闭,最多 10。
 # 仅重试网络错误、HTTP 408/429/5xx 等瞬时故障,指数退避 0.5s→1s→2s。
@@ -414,6 +421,13 @@ base_url = "https://amr-link.open-design.ai/v1"
 accounts = [
     # 也可通过 Web「供应商配置」中的网页登录授权自动保存。
     { control_key = "env:OPENDESIGN_CONTROL_KEY" },  # vela_ctrl_,非 sk-amr- 模型密钥
+]
+
+[platforms.devpass]
+enabled = true
+base_url = "https://api.llmgateway.io"
+accounts = [
+    { api_key = "env:DEVPASS_API_KEY" },
 ]
 
 [platforms.sub2api]

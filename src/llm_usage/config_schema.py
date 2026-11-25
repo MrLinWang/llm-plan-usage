@@ -18,7 +18,7 @@ from llm_usage.platform_keys import normalize_platform_config
 
 _PROVIDER_KEYS = frozenset({
     "kimi", "volcengine-coding", "volcengine-agent", "ollama", "opencode-go",
-    "clinepass", "commandcode", "opendesign", "sub2api",
+    "clinepass", "commandcode", "opendesign", "devpass", "sub2api",
 })
 _CREDENTIAL_FIELDS = ("api_key", "control_key", "access_key", "secret_key")
 _OLD_FIELDS = frozenset((*_CREDENTIAL_FIELDS, "credentials", "groups"))
